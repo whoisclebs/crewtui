@@ -359,7 +359,8 @@ impl<'a> Input<'a> {
         self
     }
 
-    /// Text shown while the input is empty.
+    /// Text shown while the input is empty. It is borrowed for the frame, so
+    /// a `String` in the app's state works: `.placeholder(&self.hint)`.
     pub fn placeholder(mut self, placeholder: &'a str) -> Self {
         self.placeholder = placeholder;
         self
