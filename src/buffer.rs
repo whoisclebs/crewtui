@@ -279,13 +279,22 @@ impl Buffer {
         }
     }
 
-    /// Layers `style` on every cell of `area`, clipped to the buffer.
+    /// Layers `style` on every cell of `area`, clipped to the buffer. A
+    /// terminal can't style the two halves of a wide glyph differently, so
+    /// touching either half styles the whole glyph.
     pub fn set_style(&mut self, area: Rect, style: Style) {
         let area = self.area.intersection(area);
         for y in area.y..area.bottom() {
             for x in area.x..area.right() {
-                if let Some(cell) = self.get_mut(x, y) {
-                    cell.patch_style(style);
+                let other = match self.get(x, y) {
+                    Some(c) if c.is_continuation() => x.checked_sub(1),
+                    Some(_) if self.get(x + 1, y).is_some_and(Cell::is_continuation) => Some(x + 1),
+                    _ => None,
+                };
+                for x in std::iter::once(x).chain(other) {
+                    if let Some(cell) = self.get_mut(x, y) {
+                        cell.patch_style(style);
+                    }
                 }
             }
         }
@@ -506,6 +515,18 @@ mod tests {
         assert_eq!(row_text(&b, 0), "ab  ");
         b.set_string(0, 0, "a\t\u{202e}b", Style::new());
         assert_eq!(row_text(&b, 0), "ab  ");
+    }
+
+    #[test]
+    fn set_style_on_half_a_wide_glyph_styles_both_halves() {
+        for x in [0, 1] {
+            let mut b = Buffer::new(Rect::new(0, 0, 4, 1));
+            b.set_string(0, 0, "中a", Style::new());
+            b.set_style(Rect::new(x, 0, 1, 1), Style::new().bold());
+            assert_eq!(b.get(0, 0).unwrap().style(), Style::new().bold());
+            assert_eq!(b.get(1, 0).unwrap().style(), Style::new().bold());
+            assert_eq!(b.get(2, 0).unwrap().style(), Style::new());
+        }
     }
 
     #[test]
