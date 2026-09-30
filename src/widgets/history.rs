@@ -206,11 +206,12 @@ impl HistoryState {
             }
             // A `\r` that ended one chunk is dropped when the `\n` after it
             // arrives, whichever chunk that is in.
-            if i + 1 < parts.len()
-                && let Some(span) = line.spans.last_mut()
-                && span.content.ends_with('\r')
-            {
-                span.content.to_mut().pop();
+            if i + 1 < parts.len() {
+                if let Some(span) = line.spans.last_mut() {
+                    if span.content.ends_with('\r') {
+                        span.content.to_mut().pop();
+                    }
+                }
             }
         }
     }
