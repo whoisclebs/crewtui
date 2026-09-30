@@ -122,6 +122,14 @@ impl<'a> Span<'a> {
     pub fn width(&self) -> usize {
         width(&self.content)
     }
+
+    /// The same span, owning its text.
+    pub fn into_owned(self) -> Span<'static> {
+        Span {
+            content: Cow::Owned(self.content.into_owned()),
+            style: self.style,
+        }
+    }
 }
 
 impl<'a> From<&'a str> for Span<'a> {
@@ -170,6 +178,15 @@ impl<'a> Line<'a> {
     /// Columns the whole line takes.
     pub fn width(&self) -> usize {
         self.spans.iter().map(Span::width).sum()
+    }
+
+    /// The same line, owning its text.
+    pub fn into_owned(self) -> Line<'static> {
+        Line {
+            spans: self.spans.into_iter().map(Span::into_owned).collect(),
+            style: self.style,
+            alignment: self.alignment,
+        }
     }
 }
 
@@ -270,6 +287,15 @@ impl<'a> Text<'a> {
     pub fn width(&self) -> usize {
         self.lines.iter().map(Line::width).max().unwrap_or(0)
     }
+
+    /// The same text, owning all of it, so it can outlive what it was
+    /// built from.
+    pub fn into_owned(self) -> Text<'static> {
+        Text {
+            lines: self.lines.into_iter().map(Line::into_owned).collect(),
+            style: self.style,
+        }
+    }
 }
 
 impl<'a> From<&'a str> for Text<'a> {
@@ -314,6 +340,25 @@ mod tests {
 
     const FAMILY: &str = "👨‍👩‍👧‍👦";
     const FLAG: &str = "🇧🇷";
+
+    #[test]
+    fn into_owned_keeps_everything_and_drops_the_borrow() {
+        let source = String::from("one\ntwo");
+        let styled = Style::new().bold();
+        let mut text = Text::raw(source.as_str()).style(styled);
+        text.lines[1] = Line::from(vec![Span::styled(&source[4..], styled)])
+            .style(styled)
+            .align(HorizontalAlign::Right);
+        let expected = text.clone();
+        let owned: Text<'static> = text.into_owned();
+        assert_eq!(owned, expected);
+        assert!(
+            owned
+                .lines
+                .iter()
+                .all(|l| { l.spans.iter().all(|s| matches!(s.content, Cow::Owned(_))) })
+        );
+    }
 
     #[test]
     fn width_of_common_text() {
