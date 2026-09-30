@@ -74,13 +74,15 @@ impl Edges {
     /// `area` with these distances taken off each side. The result is
     /// empty, and stays inside `area`, when they don't leave any room.
     pub fn shrink(self, area: Rect) -> Rect {
+        // `Rect` has public fields, so the area may reach past `u16::MAX`.
+        let area = Rect::new(area.x, area.y, area.width, area.height);
         let horizontal = u32::from(self.left) + u32::from(self.right);
         let vertical = u32::from(self.top) + u32::from(self.bottom);
         let width = u32::from(area.width).saturating_sub(horizontal) as u16;
         let height = u32::from(area.height).saturating_sub(vertical) as u16;
         Rect {
-            x: area.x + self.left.min(area.width),
-            y: area.y + self.top.min(area.height),
+            x: area.x.saturating_add(self.left.min(area.width)),
+            y: area.y.saturating_add(self.top.min(area.height)),
             width,
             height,
         }
@@ -129,6 +131,12 @@ pub struct Layout {
     margin: Edges,
     padding: Edges,
     alignment: Alignment,
+}
+
+/// Sum of the sizes. A layout with tens of thousands of items can go past
+/// `u32::MAX`, so this is a `u64`.
+fn total(sizes: &[u32]) -> u64 {
+    sizes.iter().map(|&s| u64::from(s)).sum()
 }
 
 impl Layout {
@@ -189,17 +197,18 @@ impl Layout {
         if n == 0 {
             return Vec::new();
         }
+        let area = Rect::new(area.x, area.y, area.width, area.height);
         let inner = self.margin.shrink(area);
         let length = u32::from(if self.vertical {
             inner.height
         } else {
             inner.width
         });
-        let gaps = u32::from(self.gap) * (n as u32 - 1);
+        let gaps = (u64::from(self.gap) * (n as u64 - 1)).min(u64::from(u32::MAX)) as u32;
         let available = length.saturating_sub(gaps);
 
         let sizes = self.sizes(available);
-        let used: u32 = sizes.iter().sum();
+        let used = total(&sizes) as u32;
         let spare = available.saturating_sub(used);
 
         let (start, extra_gap, extra_first) = self.place(spare, n);
@@ -210,13 +219,17 @@ impl Layout {
             let slot = if self.vertical {
                 Rect {
                     x: inner.x,
-                    y: inner.y + pos.min(u32::from(inner.height)) as u16,
+                    y: inner
+                        .y
+                        .saturating_add(pos.min(u32::from(inner.height)) as u16),
                     width: inner.width,
                     height: main_len.min(u32::from(inner.height)) as u16,
                 }
             } else {
                 Rect {
-                    x: inner.x + pos.min(u32::from(inner.width)) as u16,
+                    x: inner
+                        .x
+                        .saturating_add(pos.min(u32::from(inner.width)) as u16),
                     y: inner.y,
                     width: main_len.min(u32::from(inner.width)) as u16,
                     height: inner.height,
@@ -258,18 +271,18 @@ impl Layout {
             .collect();
 
         // Too much asked for: the last items give way first.
-        let mut over = sizes.iter().sum::<u32>().saturating_sub(available);
+        let mut over = total(&sizes).saturating_sub(u64::from(available));
         for size in sizes.iter_mut().rev() {
             if over == 0 {
                 break;
             }
-            let cut = over.min(*size);
+            let cut = over.min(u64::from(*size)) as u32;
             *size -= cut;
-            over -= cut;
+            over -= u64::from(cut);
         }
 
         // Share what is left among the flexible items, in whole cells.
-        let mut remaining = available - sizes.iter().sum::<u32>();
+        let mut remaining = available - total(&sizes) as u32;
         let mut open: Vec<usize> = (0..n)
             .filter(|&i| {
                 !matches!(
@@ -557,6 +570,47 @@ mod tests {
             .constraints([Fixed(u16::MAX), Fixed(u16::MAX)])
             .split(Rect::new(0, 0, u16::MAX, u16::MAX));
         assert_eq!(big[0].width as u32 + big[1].width as u32, u16::MAX as u32);
+    }
+
+    #[test]
+    fn an_area_built_by_hand_past_the_end_of_u16_does_not_overflow() {
+        // `Rect`'s fields are public, so nothing forces the clamp in `new`.
+        let area = Rect {
+            x: 65_000,
+            y: 65_000,
+            width: 1_000,
+            height: 1_000,
+        };
+        let r = Layout::row()
+            .constraints([Fixed(600), Fixed(600)])
+            .split(area);
+        // `right()` saturates, so check the real sum.
+        assert!(
+            r.iter()
+                .all(|r| u32::from(r.x) + u32::from(r.width) <= u32::from(u16::MAX))
+        );
+        let m = Layout::column()
+            .constraints([Fixed(600), Fixed(600)])
+            .margin(Edges {
+                left: 600,
+                top: 600,
+                ..Edges::default()
+            })
+            .split(area);
+        assert_eq!(m.len(), 2);
+        let shrunk = Edges::all(700).shrink(area);
+        assert!(u32::from(shrunk.x) + u32::from(shrunk.width) <= u32::from(u16::MAX));
+    }
+
+    #[test]
+    fn a_huge_number_of_items_does_not_overflow_the_sums() {
+        let items = vec![Fixed(u16::MAX); 70_000];
+        let r = Layout::row()
+            .constraints(items)
+            .gap(u16::MAX)
+            .split(Rect::new(0, 0, 100, 1));
+        assert_eq!(r.len(), 70_000);
+        assert!(r.iter().all(|r| r.right() <= 100));
     }
 
     #[test]
