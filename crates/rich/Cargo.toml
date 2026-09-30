@@ -1,0 +1,18 @@
+[package]
+name = "crewtui-rich"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Markdown, code and diff text for CrewTUI, built on its Text and widgets."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/whoisclebs/crewtui"
+
+[dependencies]
+crewtui = { path = "../..", version = "0.1.0" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"

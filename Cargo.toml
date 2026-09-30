@@ -7,6 +7,9 @@ description = "A small terminal UI framework built around state, messages, updat
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/whoisclebs/crewtui"
 
+[workspace]
+members = ["crates/rich"]
+
 [dependencies]
 libc = "0.2.189"
 unicode-segmentation = "1.13.3"
