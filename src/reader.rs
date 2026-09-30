@@ -258,7 +258,7 @@ fn read_loop<M>(
 mod tests {
     use super::*;
     use crate::signals::serial;
-    use crate::{Event, KeyCode, KeyEvent, Modifiers};
+    use crate::{Event, KeyCode, KeyEvent, KeyModifiers};
     use std::sync::mpsc::{Receiver, channel};
     use std::time::{Duration, Instant};
 
@@ -316,7 +316,7 @@ mod tests {
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent {
             code,
-            modifiers: Modifiers::NONE,
+            modifiers: KeyModifiers::NONE,
         })
     }
 

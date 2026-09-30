@@ -88,6 +88,7 @@ fn window_size(fd: RawFd) -> io::Result<(u16, u16)> {
 /// Which terminal modes [`Terminal::enter`] turns on. Raw mode is always
 /// enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TerminalOptions {
     /// Draw on the alternate screen, so the shell's scrollback is untouched.
     pub alternate_screen: bool,
@@ -99,6 +100,38 @@ pub struct TerminalOptions {
     pub focus_events: bool,
     /// Deliver pasted text as one event instead of as typed keys.
     pub bracketed_paste: bool,
+}
+
+impl TerminalOptions {
+    /// Draws on the alternate screen, or on the normal one.
+    pub fn alternate_screen(mut self, on: bool) -> Self {
+        self.alternate_screen = on;
+        self
+    }
+
+    /// Hides the cursor while the app runs, or leaves it showing.
+    pub fn hide_cursor(mut self, on: bool) -> Self {
+        self.hide_cursor = on;
+        self
+    }
+
+    /// Reports mouse presses, releases, drags and the wheel, or doesn't.
+    pub fn mouse(mut self, on: bool) -> Self {
+        self.mouse = on;
+        self
+    }
+
+    /// Reports when the terminal gains or loses focus, or doesn't.
+    pub fn focus_events(mut self, on: bool) -> Self {
+        self.focus_events = on;
+        self
+    }
+
+    /// Delivers pasted text as one event, or as typed keys.
+    pub fn bracketed_paste(mut self, on: bool) -> Self {
+        self.bracketed_paste = on;
+        self
+    }
 }
 
 impl Default for TerminalOptions {

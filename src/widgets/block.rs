@@ -44,6 +44,7 @@ impl BitOrAssign for Borders {
 
 /// The line characters a [`Block`] draws its border with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum BorderType {
     /// `┌─┐│└┘`
     #[default]

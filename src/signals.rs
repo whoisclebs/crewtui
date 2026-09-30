@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// A signal the framework cares about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Signal {
     /// SIGINT, sent from outside. Typing Ctrl+C in raw mode doesn't produce
     /// it; that arrives as a key event.

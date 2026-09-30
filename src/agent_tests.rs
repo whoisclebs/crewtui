@@ -5,20 +5,21 @@
 use crate::agent_example::{Agent, Msg, Pace, Status};
 use crate::testing::Screen;
 use crate::{
-    App, Buffer, Event, Frame, KeyCode, KeyEvent, Modifiers, MouseEvent, MouseKind, Rect, Renderer,
+    App, Buffer, Event, Frame, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseKind, Rect,
+    Renderer,
 };
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent {
         code,
-        modifiers: Modifiers::NONE,
+        modifiers: KeyModifiers::NONE,
     }
 }
 
 fn ctrl(c: char) -> KeyEvent {
     KeyEvent {
         code: KeyCode::Char(c),
-        modifiers: Modifiers::CTRL,
+        modifiers: KeyModifiers::CTRL,
     }
 }
 
@@ -160,7 +161,7 @@ fn the_wheel_scrolls_the_history_and_ignores_the_rest_of_the_mouse() {
             kind,
             column: 3,
             row: 3,
-            modifiers: Modifiers::NONE,
+            modifiers: KeyModifiers::NONE,
         })
     };
     press(&mut a, wheel(MouseKind::ScrollUp));
