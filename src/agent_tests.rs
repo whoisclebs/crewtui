@@ -282,3 +282,27 @@ fn every_fifth_second_a_background_note_lands_in_the_history() {
     assert!(history_text(&a).contains("background: indexed"));
     assert_eq!(a.uptime, 5);
 }
+
+#[test]
+fn a_background_note_in_the_middle_of_an_answer_does_not_swallow_the_tokens() {
+    let mut a = agent();
+    a.update(Msg::Submit("go".into()));
+    a.update(Msg::Token("Hello ".into()));
+    for _ in 0..5 {
+        a.update(Msg::Clock);
+    }
+    a.update(Msg::Token("world".into()));
+    let text = history_text(&a);
+    assert!(text.contains("indexed 105 files\n"), "{text:?}");
+    assert!(
+        !text.contains("fileswworld") && !text.contains("filesworld"),
+        "{text:?}"
+    );
+    let last = a.history.entry(a.history.len() - 1).unwrap();
+    assert_eq!(last.lines[0].spans.last().unwrap().content, "world");
+    assert_ne!(
+        last.lines[0].spans.last().unwrap().style,
+        crate::agent_example::dim(),
+        "the answer picked up the note's dim style"
+    );
+}

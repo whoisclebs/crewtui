@@ -347,7 +347,7 @@ mod tests {
     fn wait_for_row(s: &mut Scenario, screen: &mut crate::testing::Screen, text: &str) {
         let deadline = std::time::Instant::now() + LIMIT;
         loop {
-            let out = s.pty.output();
+            let out = s.pty.output_within(std::time::Duration::from_millis(500));
             s.seen.extend_from_slice(&out);
             screen.feed(&out);
             if (0..30).any(|y| screen.row(y).contains(text)) {
@@ -377,7 +377,8 @@ mod tests {
             "behavior you're after is already there",
         );
         wait_for_row(&mut s, &mut screen, "\u{2713} run_tests");
-        wait_for_row(&mut s, &mut screen, "ready");
+        // The status line, not a word that happens to be in the answer.
+        wait_for_row(&mut s, &mut screen, "ready \u{b7} Enter sends");
         // Ctrl+C is a key in raw mode, and the app quits on it.
         s.type_bytes(&[0x03]);
         let status = s.finish();

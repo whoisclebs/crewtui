@@ -93,7 +93,7 @@ pub(crate) struct Agent {
 const SPIN_EVERY: Duration = Duration::from_millis(80);
 const SIDE_WIDTH: u16 = 26;
 
-fn dim() -> Style {
+pub(crate) fn dim() -> Style {
     Style::new().fg(Color::BrightBlack)
 }
 
@@ -312,6 +312,14 @@ impl App for Agent {
                         format!("· background: indexed {} files", 100 + self.uptime),
                         dim(),
                     )));
+                    if self.is_busy() {
+                        // Tokens append to the last line, so the answer
+                        // needs a line of its own to keep going on.
+                        self.history.push(Line::from(vec![
+                            label("agent ▸ ", Color::Cyan),
+                            Span::raw(String::new()),
+                        ]));
+                    }
                 }
             }
         }

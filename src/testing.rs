@@ -325,6 +325,12 @@ impl Pty {
         drain_fd(self.master, 100)
     }
 
+    /// What the app has written, but for at most `limit` even if it keeps
+    /// writing.
+    pub(crate) fn output_within(&self, limit: Duration) -> Vec<u8> {
+        drain_fd_until(self.master, 100, Some(Instant::now() + limit))
+    }
+
     /// Reads output into `seen` until it contains `needle`. Returns false if
     /// `limit` passes first.
     pub(crate) fn read_until(&self, needle: &[u8], limit: Duration, seen: &mut Vec<u8>) -> bool {
@@ -458,8 +464,21 @@ pub(crate) fn same(a: &libc::termios, b: &libc::termios) -> bool {
 
 /// Reads what is available on `fd`, waiting up to `idle_ms` for more.
 pub(crate) fn drain_fd(fd: RawFd, idle_ms: libc::c_int) -> Vec<u8> {
+    drain_fd_until(fd, idle_ms, None)
+}
+
+/// Like `drain_fd`, but also returns once `deadline` has passed, so a child
+/// that never stops writing can't keep the caller here forever.
+pub(crate) fn drain_fd_until(
+    fd: RawFd,
+    idle_ms: libc::c_int,
+    deadline: Option<Instant>,
+) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return out;
+        }
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
