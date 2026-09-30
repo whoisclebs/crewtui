@@ -132,7 +132,7 @@ pub struct Layout {
     gap: u16,
     margin: Edges,
     padding: Edges,
-    alignment: Justify,
+    justify: Justify,
 }
 
 /// Sum of the sizes. A layout with tens of thousands of items can go past
@@ -159,7 +159,7 @@ impl Layout {
             gap: 0,
             margin: Edges::default(),
             padding: Edges::default(),
-            alignment: Justify::Start,
+            justify: Justify::Start,
         }
     }
 
@@ -189,7 +189,7 @@ impl Layout {
 
     /// Where items go when they don't use up all the room.
     pub fn justify(mut self, justify: Justify) -> Self {
-        self.alignment = justify;
+        self.justify = justify;
         self
     }
 
@@ -259,7 +259,7 @@ impl Layout {
             .unwrap_or_else(|_| panic!("expected {N} constraints, the layout has {len}"))
     }
 
-    /// The length of each item along the main axis, before alignment.
+    /// The length of each item along the main axis, before the space is placed.
     fn sizes(&self, available: u32) -> Vec<u32> {
         let n = self.constraints.len();
         let mut sizes: Vec<u32> = self
@@ -347,7 +347,7 @@ impl Layout {
     /// Where the first item starts, the extra space added to every gap and
     /// the number of gaps that get one more cell.
     fn place(&self, spare: u32, n: usize) -> (u32, u32, u32) {
-        match self.alignment {
+        match self.justify {
             Justify::Start => (0, 0, 0),
             Justify::Center => (spare / 2, 0, 0),
             Justify::End => (spare, 0, 0),
@@ -640,7 +640,7 @@ mod tests {
         assert!(a.intersection(gone).area() == 0 || gone.x >= a.x && gone.x <= a.right());
     }
 
-    /// Random constraints, gaps, margins, paddings and alignments: every
+    /// Random constraints, gaps, margins, paddings and justifications: every
     /// rectangle stays inside the area, no two overlap and the count matches.
     #[test]
     fn random_layouts_stay_inside_the_area_and_never_overlap() {
@@ -662,7 +662,7 @@ mod tests {
                     _ => Max(next(60)),
                 })
                 .collect();
-            let alignment = [
+            let justify = [
                 Justify::Start,
                 Justify::Center,
                 Justify::End,
@@ -673,7 +673,7 @@ mod tests {
                 .gap(next(6))
                 .margin(Edges::symmetric(next(4), next(4)))
                 .padding(Edges::symmetric(next(3), next(3)))
-                .justify(alignment);
+                .justify(justify);
             let layout = if next(2) == 0 {
                 layout
             } else {

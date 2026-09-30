@@ -33,7 +33,7 @@ pub enum Event {
 pub struct KeyEvent {
     /// Which key.
     pub code: KeyCode,
-    /// KeyModifiers held.
+    /// Modifier keys held.
     pub modifiers: KeyModifiers,
 }
 
@@ -127,7 +127,7 @@ pub struct MouseEvent {
     pub column: u16,
     /// Row, counted from 0.
     pub row: u16,
-    /// KeyModifiers held.
+    /// Modifier keys held.
     pub modifiers: KeyModifiers,
 }
 

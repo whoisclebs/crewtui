@@ -406,6 +406,18 @@ impl std::fmt::Debug for Terminal {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn options_builders_set_one_field_each() {
+        let o = TerminalOptions::default()
+            .alternate_screen(false)
+            .hide_cursor(false)
+            .mouse(true)
+            .focus_events(true)
+            .bracketed_paste(false);
+        assert!(!o.alternate_screen && !o.hide_cursor && !o.bracketed_paste);
+        assert!(o.mouse && o.focus_events);
+    }
+
     use super::*;
     use crate::testing::{Pty, same};
 
