@@ -57,6 +57,15 @@ impl ListState {
         ListState::default()
     }
 
+    /// A state with row `index` selected, scrolled to the top. Passing
+    /// `None` selects nothing.
+    pub fn with_selected(index: impl Into<Option<usize>>) -> Self {
+        ListState {
+            selected: index.into(),
+            ..ListState::default()
+        }
+    }
+
     /// The selected item's index.
     pub fn selected(&self) -> Option<usize> {
         self.selected
@@ -288,6 +297,13 @@ mod tests {
         let mut buf = Buffer::new(area);
         list.render(area, &mut buf, state);
         rows_of(&buf)
+    }
+
+    #[test]
+    fn a_state_can_start_with_a_selection() {
+        assert_eq!(ListState::with_selected(3).selected(), Some(3));
+        assert_eq!(ListState::with_selected(None).selected(), None);
+        assert_eq!(ListState::with_selected(3).offset(), 0);
     }
 
     fn items(n: usize) -> Vec<String> {

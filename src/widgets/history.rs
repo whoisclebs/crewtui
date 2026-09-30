@@ -122,6 +122,15 @@ impl HistoryState {
         }
     }
 
+    /// A state holding `entries`, following the end.
+    pub fn with_entries<'a, T: Into<Text<'a>>>(entries: impl IntoIterator<Item = T>) -> Self {
+        let mut state = HistoryState::new();
+        for entry in entries {
+            state.push(entry);
+        }
+        state
+    }
+
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -163,7 +172,8 @@ impl HistoryState {
     /// tokens arrive. Text after a `\n` starts a new line of the same entry,
     /// and text keeps the style of what it follows. With no entries yet it
     /// starts one. Only the line being added to is measured again.
-    pub fn append(&mut self, chunk: &str) {
+    pub fn append(&mut self, chunk: impl AsRef<str>) {
+        let chunk = chunk.as_ref();
         if chunk.is_empty() {
             return;
         }
@@ -964,6 +974,24 @@ mod tests {
     }
 
     #[test]
+    fn a_state_can_be_built_from_entries_and_takes_owned_or_borrowed_chunks() {
+        let mut s = HistoryState::with_entries(["one", "two"]);
+        assert_eq!(s.len(), 2);
+        assert!(s.is_following());
+        s.append("!");
+        s.append(String::from("?"));
+        let tail = String::from(".");
+        s.append(&tail);
+        let _ = &tail;
+        let text: String = s.entry(1).unwrap().lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "two!?.");
+    }
+
+    #[test]
     fn counting_the_whole_transcript_is_spread_over_calls() {
         let mut s = HistoryState::new();
         for i in 0..2_000 {
@@ -1356,7 +1384,7 @@ mod tests {
         };
         let mut s = HistoryState::new();
         s.push("agent:");
-        s.append(&"a line of streamed text\n".repeat(50_000));
+        s.append("a line of streamed text\n".repeat(50_000));
         // Counting it after a change of width is paid once.
         let first = pieces(&mut || {
             draw(&s, 10, 20);

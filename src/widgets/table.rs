@@ -60,6 +60,15 @@ impl TableState {
         TableState::default()
     }
 
+    /// A state with row `index` selected, scrolled to the top. Passing
+    /// `None` selects nothing.
+    pub fn with_selected(index: impl Into<Option<usize>>) -> Self {
+        TableState {
+            selected: index.into(),
+            ..TableState::default()
+        }
+    }
+
     /// The selected row's index.
     pub fn selected(&self) -> Option<usize> {
         self.selected
@@ -598,6 +607,12 @@ mod tests {
             4,
             2,
         );
+    }
+
+    #[test]
+    fn a_state_can_start_with_a_selection() {
+        assert_eq!(TableState::with_selected(2).selected(), Some(2));
+        assert_eq!(TableState::with_selected(None).selected(), None);
     }
 
     #[test]
