@@ -1,0 +1,67 @@
+name: release
+on:
+  push:
+    branches: [develop]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve the version to publish
+        id: version
+        run: |
+          base=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          rich=$(grep -m1 '^version = ' crates/rich/Cargo.toml | cut -d'"' -f2)
+          if [ "$base" != "$rich" ]; then
+            echo "crewtui is at $base but crewtui-rich is at $rich"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "$base" != "${GITHUB_REF_NAME#v}" ]; then
+              echo "Cargo.toml is at $base but the tag is $GITHUB_REF_NAME"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "$GITHUB_REF_NAME does not point at a commit on main"
+              exit 1
+            fi
+            echo "version=$base" >> "$GITHUB_OUTPUT"
+            echo "snapshot=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$base-snapshot.$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "snapshot=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stamp the snapshot version
+        if: steps.version.outputs.snapshot == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i "0,/^version = .*/s//version = \"$VERSION\"/" Cargo.toml crates/rich/Cargo.toml
+          sed -i "s|^\(crewtui = { path = \"../..\", version = \)\"[^\"]*\"|\1\"=$VERSION\"|" crates/rich/Cargo.toml
+          cargo update --workspace
+
+      - run: cargo test --workspace --all-features
+
+      - name: Publish crewtui
+        run: cargo publish -p crewtui --allow-dirty
+      - name: Publish crewtui-rich
+        run: cargo publish -p crewtui-rich --allow-dirty
+
+      - name: Create the GitHub release
+        if: steps.version.outputs.snapshot == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
