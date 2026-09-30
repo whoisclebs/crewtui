@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use super::paragraph::draw_line;
 use super::{Block, StatefulWidget, Widget};
 use crate::text::{HorizontalAlign, Text, width};
@@ -39,13 +41,14 @@ impl<'a, T: Into<Text<'a>>> From<T> for ListItem<'a> {
 
 /// Which item is selected and which is at the top: the state of a [`List`].
 ///
-/// The app owns it. Rendering the list moves the offset just far enough to
-/// keep the selected item in view, so keep passing the same state to the
-/// next frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The app owns it. The selection is changed in `update`. The offset is
+/// worked out while drawing, moved just far enough to keep the selected item
+/// in view, and kept in a `Cell` so that drawing from `App::view`, which only
+/// has `&self`, still remembers it for the next frame.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ListState {
     selected: Option<usize>,
-    offset: usize,
+    offset: Cell<usize>,
 }
 
 impl ListState {
@@ -66,7 +69,7 @@ impl ListState {
 
     /// The index of the item at the top of the last frame drawn.
     pub fn offset(&self) -> usize {
-        self.offset
+        self.offset.get()
     }
 
     /// Selects the next item of `len`, stopping at the last, or the first
@@ -100,7 +103,7 @@ impl ListState {
 /// let mut buf = Buffer::new(area);
 /// let mut state = ListState::new();
 /// state.select(Some(4));
-/// List::new(["a", "b", "c", "d", "e", "f"]).render(area, &mut buf, &mut state);
+/// List::new(["a", "b", "c", "d", "e", "f"]).render(area, &mut buf, &state);
 /// assert_eq!(state.offset(), 2); // scrolled so item 4 is in view
 /// ```
 ///
@@ -187,7 +190,7 @@ fn offset_for(items: &[ListItem<'_>], selected: usize, rows: usize) -> usize {
 impl StatefulWidget for List<'_> {
     type State = ListState;
 
-    fn render(self, area: Rect, buf: &mut Buffer, state: &mut ListState) {
+    fn render(self, area: Rect, buf: &mut Buffer, state: &ListState) {
         let area = area.intersection(buf.area());
         if area.is_empty() {
             return;
@@ -206,24 +209,24 @@ impl StatefulWidget for List<'_> {
         buf.set_style(area, self.style);
 
         if self.items.is_empty() {
-            state.offset = 0;
+            state.offset.set(0);
             return;
         }
         let last = self.items.len() - 1;
-        if let Some(selected) = &mut state.selected {
-            *selected = (*selected).min(last);
-        }
+        // A selection past the end counts as the last item.
+        let selected = state.selected.map(|s| s.min(last));
         let rows = usize::from(area.height);
-        state.offset = state.offset.min(last);
-        if let Some(selected) = state.selected {
-            if selected < state.offset {
-                state.offset = selected;
+        let mut offset = state.offset.get().min(last);
+        if let Some(selected) = selected {
+            if selected < offset {
+                offset = selected;
             } else {
                 // Move down only as far as needed, never back up past where
                 // the list already is.
-                state.offset = state.offset.max(offset_for(&self.items, selected, rows));
+                offset = offset.max(offset_for(&self.items, selected, rows));
             }
         }
+        state.offset.set(offset);
 
         let symbol_width = width(self.highlight_symbol).min(usize::from(area.width)) as u16;
         let content = Rect {
@@ -232,8 +235,8 @@ impl StatefulWidget for List<'_> {
             ..area
         };
         let mut y = area.y;
-        'items: for (i, item) in self.items.iter().enumerate().skip(state.offset) {
-            let selected = state.selected == Some(i);
+        'items: for (i, item) in self.items.iter().enumerate().skip(offset) {
+            let selected = selected == Some(i);
             let style = if selected {
                 self.style.patch(item.style).patch(self.highlight_style)
             } else {
@@ -290,7 +293,7 @@ mod tests {
             .collect()
     }
 
-    fn draw(list: List<'_>, state: &mut ListState, w: u16, h: u16) -> Vec<String> {
+    fn draw(list: List<'_>, state: &ListState, w: u16, h: u16) -> Vec<String> {
         let area = Rect::new(0, 0, w, h);
         let mut buf = Buffer::new(area);
         list.render(area, &mut buf, state);
@@ -303,9 +306,9 @@ mod tests {
 
     #[test]
     fn items_are_drawn_from_the_top_with_room_for_the_highlight_symbol() {
-        let mut state = ListState::new();
+        let state = ListState::new();
         assert_eq!(
-            draw(List::new(["a", "b", "c"]), &mut state, 6, 4),
+            draw(List::new(["a", "b", "c"]), &state, 6, 4),
             ["  a   ", "  b   ", "  c   ", "      "]
         );
     }
@@ -319,7 +322,7 @@ mod tests {
         let two_lines = ListItem::new("x\ny");
         List::new([ListItem::new("a"), two_lines, ListItem::new("c")])
             .highlight_style(Style::new().bg(Color::Blue))
-            .render(area, &mut buf, &mut state);
+            .render(area, &mut buf, &state);
         assert_eq!(
             rows_of(&buf),
             ["  a     ", "> x     ", "  y     ", "  c     "]
@@ -349,7 +352,7 @@ mod tests {
         ])
         .style(Style::new().bg(Color::Black))
         .highlight_style(Style::new().bold())
-        .render(area, &mut buf, &mut state);
+        .render(area, &mut buf, &state);
         assert_eq!(
             buf.get(2, 0).unwrap().style(),
             Style::new().bg(Color::Black).fg(Color::Green).bold()
@@ -365,20 +368,15 @@ mod tests {
         let mut state = ListState::new();
         state.select(Some(0));
         assert_eq!(
-            draw(
-                List::new(["a", "b"]).highlight_symbol("→ "),
-                &mut state,
-                5,
-                2
-            ),
+            draw(List::new(["a", "b"]).highlight_symbol("→ "), &state, 5, 2),
             ["→ a  ", "  b  "]
         );
         assert_eq!(
-            draw(List::new(["a", "b"]).highlight_symbol(""), &mut state, 3, 2),
+            draw(List::new(["a", "b"]).highlight_symbol(""), &state, 3, 2),
             ["a  ", "b  "]
         );
         assert_eq!(
-            draw(List::new(["a"]).highlight_symbol("中"), &mut state, 4, 1),
+            draw(List::new(["a"]).highlight_symbol("中"), &state, 4, 1),
             ["中a "]
         );
     }
@@ -387,7 +385,7 @@ mod tests {
     fn selecting_below_the_view_scrolls_just_far_enough() {
         let mut state = ListState::new();
         state.select(Some(4));
-        let rows = draw(List::new(items(10)), &mut state, 8, 3);
+        let rows = draw(List::new(items(10)), &state, 8, 3);
         assert_eq!(state.offset(), 2);
         assert_eq!(rows, ["  item 2", "  item 3", "> item 4"]);
     }
@@ -398,7 +396,7 @@ mod tests {
         let mut offsets = Vec::new();
         for i in [0, 1, 2, 3, 4, 3, 2, 1, 0] {
             state.select(Some(i));
-            draw(List::new(items(10)), &mut state, 8, 3);
+            draw(List::new(items(10)), &state, 8, 3);
             offsets.push(state.offset());
         }
         assert_eq!(offsets, [0, 0, 0, 1, 2, 2, 2, 1, 0]);
@@ -408,12 +406,12 @@ mod tests {
     fn the_offset_persists_between_frames_and_a_selection_above_it_scrolls_up() {
         let mut state = ListState::new();
         state.select(Some(9));
-        draw(List::new(items(10)), &mut state, 8, 3);
+        draw(List::new(items(10)), &state, 8, 3);
         assert_eq!(state.offset(), 7);
-        draw(List::new(items(10)), &mut state, 8, 3);
+        draw(List::new(items(10)), &state, 8, 3);
         assert_eq!(state.offset(), 7);
         state.select(Some(2));
-        draw(List::new(items(10)), &mut state, 8, 3);
+        draw(List::new(items(10)), &state, 8, 3);
         assert_eq!(state.offset(), 2);
     }
 
@@ -422,7 +420,7 @@ mod tests {
         let mut state = ListState::new();
         state.select(Some(2));
         let list = List::new(["a\nb\nc", "d\ne", "f\ng", "h"]);
-        let rows = draw(list, &mut state, 6, 4);
+        let rows = draw(list, &state, 6, 4);
         // Rows: a b c | d e | f g | h. Item 2 needs rows 5-6, so item 1 leads.
         assert_eq!(state.offset(), 1);
         assert_eq!(rows, ["  d   ", "  e   ", "> f   ", "  g   "]);
@@ -430,9 +428,9 @@ mod tests {
 
     #[test]
     fn the_last_item_may_be_cut_off_by_the_bottom() {
-        let mut state = ListState::new();
+        let state = ListState::new();
         assert_eq!(
-            draw(List::new(["a\nb", "c\nd"]), &mut state, 4, 3),
+            draw(List::new(["a\nb", "c\nd"]), &state, 4, 3),
             ["  a ", "  b ", "  c "]
         );
     }
@@ -441,7 +439,7 @@ mod tests {
     fn an_item_taller_than_the_view_shows_its_top_when_selected() {
         let mut state = ListState::new();
         state.select(Some(1));
-        let rows = draw(List::new(["x", "1\n2\n3\n4", "y"]), &mut state, 5, 2);
+        let rows = draw(List::new(["x", "1\n2\n3\n4", "y"]), &state, 5, 2);
         assert_eq!(state.offset(), 1);
         assert_eq!(rows, ["> 1  ", "  2  "]);
     }
@@ -450,9 +448,9 @@ mod tests {
     fn shrinking_the_view_keeps_the_selection_visible() {
         let mut state = ListState::new();
         state.select(Some(5));
-        draw(List::new(items(10)), &mut state, 8, 6);
+        draw(List::new(items(10)), &state, 8, 6);
         assert_eq!(state.offset(), 0);
-        let rows = draw(List::new(items(10)), &mut state, 8, 2);
+        let rows = draw(List::new(items(10)), &state, 8, 2);
         assert_eq!(state.offset(), 4);
         assert_eq!(rows, ["  item 4", "> item 5"]);
     }
@@ -461,13 +459,14 @@ mod tests {
     fn a_selection_past_the_end_is_pulled_back_and_an_empty_list_is_fine() {
         let mut state = ListState::new();
         state.select(Some(50));
-        draw(List::new(items(3)), &mut state, 8, 2);
-        assert_eq!(state.selected(), Some(2));
+        let rows = draw(List::new(items(3)), &state, 8, 2);
+        // It counts as the last item, which is highlighted and in view.
+        assert_eq!(rows, ["  item 1", "> item 2"]);
         assert_eq!(state.offset(), 1);
         let mut state = ListState::new();
         state.select(Some(0));
         assert_eq!(
-            draw(List::new(Vec::<String>::new()), &mut state, 4, 2),
+            draw(List::new(Vec::<String>::new()), &state, 4, 2),
             ["    ", "    "]
         );
         assert_eq!(state.offset(), 0);
@@ -475,9 +474,9 @@ mod tests {
 
     #[test]
     fn text_is_cut_by_columns_after_the_symbol() {
-        let mut state = ListState::new();
+        let state = ListState::new();
         assert_eq!(
-            draw(List::new(["abcdef", "中文字"]), &mut state, 6, 2),
+            draw(List::new(["abcdef", "中文字"]), &state, 6, 2),
             ["  abcd", "  中文"]
         );
     }
@@ -490,7 +489,7 @@ mod tests {
         ]);
         let area = Rect::new(0, 0, 6, 1);
         let mut buf = Buffer::new(area);
-        List::new([ListItem::new(line)]).render(area, &mut buf, &mut ListState::new());
+        List::new([ListItem::new(line)]).render(area, &mut buf, &ListState::new());
         assert_eq!(buf.get(3, 0).unwrap().style().fg, Some(Color::Red));
     }
 
@@ -499,7 +498,7 @@ mod tests {
         let mut state = ListState::new();
         state.select(Some(3));
         let list = List::new(items(6)).block(Block::bordered().title("t"));
-        let rows = draw(list, &mut state, 10, 4);
+        let rows = draw(list, &state, 10, 4);
         assert_eq!(
             rows,
             ["┌t───────┐", "│  item 2│", "│> item 3│", "└────────┘"]
@@ -508,23 +507,49 @@ mod tests {
 
     #[test]
     fn empty_areas_and_areas_beyond_the_buffer_are_fine() {
-        let mut state = ListState::new();
+        let state = ListState::new();
         let mut buf = Buffer::new(Rect::new(0, 0, 4, 3));
         for area in [
             Rect::new(0, 0, 0, 0),
             Rect::new(0, 0, 4, 0),
             Rect::new(9, 9, 3, 3),
         ] {
-            List::new(items(4)).render(area, &mut buf, &mut state);
+            List::new(items(4)).render(area, &mut buf, &state);
         }
         assert!(buf.cells().iter().all(|c| c.symbol() == " "));
         // A symbol wider than the area leaves no room for text but doesn't panic.
         draw(
             List::new(items(2)).highlight_symbol("wide symbol"),
-            &mut state,
+            &state,
             3,
             2,
         );
+    }
+
+    /// `App::view` only has `&self`, so a list has to be drawable from
+    /// shared state, and its scroll has to survive to the next frame.
+    #[test]
+    fn a_list_can_be_drawn_from_a_shared_reference_and_remembers_its_scroll() {
+        struct Screen {
+            list: ListState,
+        }
+        impl Screen {
+            fn view(&self, buf: &mut Buffer) {
+                let area = buf.area();
+                Frame::new(buf).render_stateful_widget(List::new(items(10)), area, &self.list);
+            }
+        }
+        let mut screen = Screen {
+            list: ListState::new(),
+        };
+        screen.list.select(Some(6));
+        let mut buf = Buffer::new(Rect::new(0, 0, 8, 3));
+        screen.view(&mut buf);
+        assert_eq!(screen.list.offset(), 4);
+        // Moving up inside the page doesn't scroll, because the offset stuck.
+        screen.list.select(Some(5));
+        screen.view(&mut buf);
+        assert_eq!(screen.list.offset(), 4);
     }
 
     #[test]
@@ -553,11 +578,11 @@ mod tests {
     #[test]
     fn frame_render_stateful_widget_clips_to_the_frame() {
         let mut buf = Buffer::new(Rect::new(0, 0, 6, 2));
-        let mut state = ListState::new();
+        let state = ListState::new();
         Frame::new(&mut buf).render_stateful_widget(
             List::new(["a", "b"]),
             Rect::new(0, 0, 40, 40),
-            &mut state,
+            &state,
         );
         assert_eq!(rows_of(&buf), ["  a   ", "  b   "]);
     }
@@ -588,12 +613,7 @@ mod tests {
             let mut state = ListState::new();
             for _ in 0..8 {
                 state.select(Some(next(n as u64 + 3) as usize));
-                let rows = draw(
-                    List::new(texts.iter().map(String::as_str)),
-                    &mut state,
-                    12,
-                    h,
-                );
+                let rows = draw(List::new(texts.iter().map(String::as_str)), &state, 12, h);
                 let selected = state.selected().unwrap();
                 assert!(state.offset() <= selected);
                 assert!(

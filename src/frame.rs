@@ -34,7 +34,7 @@ impl<'a> Frame<'a> {
         &mut self,
         widget: W,
         area: Rect,
-        state: &mut W::State,
+        state: &W::State,
     ) {
         widget.render(area.intersection(self.buffer.area()), self.buffer, state);
     }
