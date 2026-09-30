@@ -22,7 +22,8 @@ pub struct Renderer {
     out: Vec<u8>,
     /// Where the cursor was last placed, and whether it is showing.
     cursor: Option<(u16, u16)>,
-    cursor_shown: bool,
+    /// `None` when a cut write or a reset terminal left it unknown.
+    cursor_shown: Option<bool>,
 }
 
 impl Renderer {
@@ -35,7 +36,7 @@ impl Renderer {
             known: false,
             out: Vec::new(),
             cursor: None,
-            cursor_shown: false,
+            cursor_shown: Some(false),
         }
     }
 
@@ -97,18 +98,18 @@ impl Renderer {
         let wrote = !self.out.is_empty();
         match want {
             Some((x, y)) => {
-                if wrote || self.cursor != want || !self.cursor_shown {
+                if wrote || self.cursor != want || self.cursor_shown != Some(true) {
                     let _ = write!(self.out, "\x1b[{};{}H", y + 1, x + 1);
                 }
-                if !self.cursor_shown {
+                if self.cursor_shown != Some(true) {
                     self.out.extend_from_slice(b"\x1b[?25h");
-                    self.cursor_shown = true;
+                    self.cursor_shown = Some(true);
                 }
             }
             None => {
-                if self.cursor_shown {
+                if self.cursor_shown != Some(false) {
                     self.out.extend_from_slice(b"\x1b[?25l");
-                    self.cursor_shown = false;
+                    self.cursor_shown = Some(false);
                 }
             }
         }
@@ -118,7 +119,7 @@ impl Renderer {
     /// Forgets whether the terminal's cursor is showing, after something
     /// reset the terminal modes behind the renderer's back.
     pub(crate) fn cursor_was_reset(&mut self) {
-        self.cursor_shown = false;
+        self.cursor_shown = None;
         self.cursor = None;
     }
 
@@ -161,6 +162,10 @@ impl Renderer {
     /// process that took over the terminal. Resizing does it implicitly.
     pub fn invalidate(&mut self) {
         self.known = false;
+        // A frame that was cut may or may not have got its cursor commands
+        // through, so the next one says explicitly what it wants.
+        self.cursor_shown = None;
+        self.cursor = None;
     }
 }
 
@@ -439,7 +444,10 @@ mod tests {
         let first = text(&mut r, &["ab中", "c"]);
         assert!(text(&mut r, &["ab中", "c"]).is_empty());
         r.invalidate();
-        assert_eq!(text(&mut r, &["ab中", "c"]), first);
+        // The one difference: it can't assume the cursor is hidden.
+        let mut again = first.clone();
+        again.extend_from_slice(b"\x1b[?25l");
+        assert_eq!(text(&mut r, &["ab中", "c"]), again);
         assert!(text(&mut r, &["ab中", "c"]).is_empty());
     }
 
@@ -733,5 +741,48 @@ mod tests {
         r.cursor_was_reset();
         screen.feed(&with_cursor(&mut r, &["ab"], Some((2, 0))));
         assert_eq!(screen.cursor(), ((2, 0), true));
+    }
+
+    #[test]
+    fn a_frame_cut_before_its_cursor_commands_is_repaired() {
+        // Cut at every byte, with the cursor wanted on and off, so the cut
+        // lands before, inside and after the show and hide commands.
+        for want in [Some((2u16, 0u16)), None] {
+            for prior in [Some((1u16, 1u16)), None] {
+                let mut probe = Renderer::new(6, 2);
+                let mut all = Vec::new();
+                with_cursor(&mut probe, &["ab"], prior);
+                probe.invalidate();
+                all.extend(with_cursor(&mut probe, &["cd"], want));
+                for limit in 0..=all.len() {
+                    let mut r = Renderer::new(6, 2);
+                    let mut screen = Screen::new(6, 2);
+                    // The terminal hides the cursor when it is entered.
+                    screen.feed(b"\x1b[?25l");
+                    screen.feed(&with_cursor(&mut r, &["ab"], prior));
+                    let mut cut = Cut {
+                        sent: Vec::new(),
+                        limit,
+                    };
+                    let _ = r.present_frame(&mut cut, |f| {
+                        f.buffer_mut().set_string(0, 0, "cd", Style::new());
+                        if let Some((x, y)) = want {
+                            f.set_cursor(x, y);
+                        }
+                    });
+                    screen.feed(&cut.sent);
+                    // The next frame is the same one, and must fix the screen.
+                    screen.feed(&with_cursor(&mut r, &["cd"], want));
+                    match want {
+                        Some((x, y)) => assert_eq!(
+                            screen.cursor(),
+                            ((x as usize, y as usize), true),
+                            "limit {limit}"
+                        ),
+                        None => assert!(!screen.cursor().1, "limit {limit}"),
+                    }
+                }
+            }
+        }
     }
 }
