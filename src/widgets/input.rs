@@ -3,7 +3,7 @@ use std::cell::Cell;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{Block, StatefulWidget, Widget};
-use crate::input::{KeyCode, KeyEvent, Modifiers};
+use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use crate::text::{grapheme_width, truncate, width};
 use crate::{Buffer, Rect, Style};
 
@@ -270,8 +270,8 @@ impl InputState {
     /// the end, Ctrl+U to the start, and Ctrl+W or Alt+Backspace for the word
     /// before the cursor.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
-        let ctrl = key.modifiers.contains(Modifiers::CTRL);
-        let alt = key.modifiers.contains(Modifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CTRL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char(c) if !ctrl && !alt => self.insert_char(c),
             KeyCode::Char('a') if ctrl => self.home(),
@@ -463,20 +463,20 @@ mod tests {
     use super::*;
     use crate::{Color, Frame};
 
-    fn key(code: KeyCode, modifiers: Modifiers) -> KeyEvent {
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent { code, modifiers }
     }
 
     fn plain(c: char) -> KeyEvent {
-        key(KeyCode::Char(c), Modifiers::NONE)
+        key(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
     fn ctrl(c: char) -> KeyEvent {
-        key(KeyCode::Char(c), Modifiers::CTRL)
+        key(KeyCode::Char(c), KeyModifiers::CTRL)
     }
 
     fn alt(c: char) -> KeyEvent {
-        key(KeyCode::Char(c), Modifiers::ALT)
+        key(KeyCode::Char(c), KeyModifiers::ALT)
     }
 
     fn rows_of(buf: &Buffer) -> Vec<String> {
@@ -667,35 +667,35 @@ mod tests {
         assert_eq!(s.cursor(), 7);
         assert!(s.handle_key(alt('b')));
         assert_eq!(s.cursor(), 4);
-        assert!(s.handle_key(key(KeyCode::Left, Modifiers::CTRL)));
+        assert!(s.handle_key(key(KeyCode::Left, KeyModifiers::CTRL)));
         assert_eq!(s.cursor(), 0);
-        assert!(s.handle_key(key(KeyCode::Right, Modifiers::ALT)));
+        assert!(s.handle_key(key(KeyCode::Right, KeyModifiers::ALT)));
         assert_eq!(s.cursor(), 3);
         assert!(s.handle_key(alt('f')));
         assert_eq!(s.cursor(), 7);
-        assert!(s.handle_key(key(KeyCode::Backspace, Modifiers::NONE)));
+        assert!(s.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE)));
         assert_eq!(s.text(), "one tw");
         assert!(s.handle_key(ctrl('w')));
         assert_eq!(s.text(), "one ");
-        assert!(s.handle_key(key(KeyCode::Backspace, Modifiers::ALT)));
+        assert!(s.handle_key(key(KeyCode::Backspace, KeyModifiers::ALT)));
         assert_eq!(s.text(), "");
         s.set_text("abcd");
-        assert!(s.handle_key(key(KeyCode::Home, Modifiers::NONE)));
-        assert!(s.handle_key(key(KeyCode::Delete, Modifiers::NONE)));
+        assert!(s.handle_key(key(KeyCode::Home, KeyModifiers::NONE)));
+        assert!(s.handle_key(key(KeyCode::Delete, KeyModifiers::NONE)));
         assert!(s.handle_key(ctrl('f')));
         assert!(s.handle_key(ctrl('b')));
         assert!(s.handle_key(ctrl('d')));
         assert_eq!(s.text(), "cd");
-        assert!(s.handle_key(key(KeyCode::End, Modifiers::NONE)));
+        assert!(s.handle_key(key(KeyCode::End, KeyModifiers::NONE)));
         assert!(s.handle_key(ctrl('h')));
         assert!(s.handle_key(ctrl('u')));
         assert!(s.is_empty());
         for other in [
-            key(KeyCode::Enter, Modifiers::NONE),
-            key(KeyCode::Esc, Modifiers::NONE),
-            key(KeyCode::Tab, Modifiers::NONE),
-            key(KeyCode::Up, Modifiers::NONE),
-            key(KeyCode::F(5), Modifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            key(KeyCode::Up, KeyModifiers::NONE),
+            key(KeyCode::F(5), KeyModifiers::NONE),
             ctrl('c'),
             ctrl('z'),
             alt('x'),
@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn a_shifted_letter_is_typed_like_any_other() {
         let mut s = InputState::new();
-        assert!(s.handle_key(key(KeyCode::Char('A'), Modifiers::SHIFT)));
+        assert!(s.handle_key(key(KeyCode::Char('A'), KeyModifiers::SHIFT)));
         assert_eq!(s.text(), "A");
     }
 

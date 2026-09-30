@@ -22,7 +22,7 @@ use crewtui::widgets::{
     Block, History, HistoryState, Input, InputState, List, ListState, Paragraph, Scrollbar, Spinner,
 };
 use crewtui::{
-    App, Cmd, Color, Constraint, Event, Frame, KeyCode, KeyEvent, Layout, Modifiers, MouseKind,
+    App, Cmd, Color, Constraint, Event, Frame, KeyCode, KeyEvent, KeyModifiers, Layout, MouseKind,
     Program, Rect, Sender, Style, TerminalOptions,
 };
 
@@ -252,7 +252,7 @@ impl App for Agent {
 
     fn event(&self, event: Event) -> Option<Msg> {
         match event {
-            Event::Key(key) if key.modifiers.contains(Modifiers::CTRL) => match key.code {
+            Event::Key(key) if key.modifiers.contains(KeyModifiers::CTRL) => match key.code {
                 KeyCode::Char('c') => Some(Msg::Quit),
                 KeyCode::Char('l') => Some(Msg::Repaint),
                 _ => Some(Msg::Key(key)),
@@ -265,7 +265,7 @@ impl App for Agent {
                 MouseKind::ScrollDown => Some(Msg::Scroll(3)),
                 _ => None,
             },
-            Event::FocusGained | Event::FocusLost => None,
+            _ => None,
         }
     }
 
@@ -437,10 +437,7 @@ pub(crate) fn run(pace: Pace, stress: bool) -> io::Result<()> {
     if stress {
         agent = agent.with_history(20_000);
     }
-    let options = TerminalOptions {
-        mouse: true,
-        ..TerminalOptions::default()
-    };
+    let options = TerminalOptions::default().mouse(true);
     let program = Program::new(agent).terminal_options(options);
 
     // Background events: a clock, and in the stress run a request every

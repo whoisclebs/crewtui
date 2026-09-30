@@ -9,6 +9,7 @@ use crate::Rect;
 
 /// How much of the main axis one item takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Constraint {
     /// Exactly this many cells.
     Fixed(u16),
@@ -24,7 +25,8 @@ pub enum Constraint {
 
 /// What to do with space no item wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Alignment {
+#[non_exhaustive]
+pub enum Justify {
     /// Items sit at the start; the space is left at the end.
     #[default]
     Start,
@@ -118,7 +120,7 @@ impl From<u16> for Edges {
 /// 3. What remains is shared by `Fill`, `Min` (weight 1) and `Max` (weight
 ///    1, up to its cap) in proportion to their weights. Whole cells only:
 ///    the cells that don't divide evenly go one each to the earliest items.
-/// 4. Space nobody wanted is placed according to the [`Alignment`].
+/// 4. Space nobody wanted is placed according to the [`Justify`].
 /// 5. Each slot is shrunk by the padding.
 ///
 /// Every rectangle lies inside the area, none overlap, and nothing panics
@@ -130,7 +132,7 @@ pub struct Layout {
     gap: u16,
     margin: Edges,
     padding: Edges,
-    alignment: Alignment,
+    justify: Justify,
 }
 
 /// Sum of the sizes. A layout with tens of thousands of items can go past
@@ -157,7 +159,7 @@ impl Layout {
             gap: 0,
             margin: Edges::default(),
             padding: Edges::default(),
-            alignment: Alignment::Start,
+            justify: Justify::Start,
         }
     }
 
@@ -186,8 +188,8 @@ impl Layout {
     }
 
     /// Where items go when they don't use up all the room.
-    pub fn align(mut self, alignment: Alignment) -> Self {
-        self.alignment = alignment;
+    pub fn justify(mut self, justify: Justify) -> Self {
+        self.justify = justify;
         self
     }
 
@@ -257,7 +259,7 @@ impl Layout {
             .unwrap_or_else(|_| panic!("expected {N} constraints, the layout has {len}"))
     }
 
-    /// The length of each item along the main axis, before alignment.
+    /// The length of each item along the main axis, before the space is placed.
     fn sizes(&self, available: u32) -> Vec<u32> {
         let n = self.constraints.len();
         let mut sizes: Vec<u32> = self
@@ -345,15 +347,15 @@ impl Layout {
     /// Where the first item starts, the extra space added to every gap and
     /// the number of gaps that get one more cell.
     fn place(&self, spare: u32, n: usize) -> (u32, u32, u32) {
-        match self.alignment {
-            Alignment::Start => (0, 0, 0),
-            Alignment::Center => (spare / 2, 0, 0),
-            Alignment::End => (spare, 0, 0),
-            Alignment::SpaceBetween if n > 1 => {
+        match self.justify {
+            Justify::Start => (0, 0, 0),
+            Justify::Center => (spare / 2, 0, 0),
+            Justify::End => (spare, 0, 0),
+            Justify::SpaceBetween if n > 1 => {
                 let gaps = n as u32 - 1;
                 (0, spare / gaps, spare % gaps)
             }
-            Alignment::SpaceBetween => (0, 0, 0),
+            Justify::SpaceBetween => (0, 0, 0),
         }
     }
 }
@@ -433,29 +435,29 @@ mod tests {
         let place = |a| {
             Layout::row()
                 .constraints([Max(4), Max(4)])
-                .align(a)
+                .justify(a)
                 .split(Rect::new(0, 0, 20, 1))
                 .iter()
                 .map(|r| r.x)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(place(Alignment::Start), vec![0, 4]);
-        assert_eq!(place(Alignment::Center), vec![6, 10]);
-        assert_eq!(place(Alignment::End), vec![12, 16]);
-        assert_eq!(place(Alignment::SpaceBetween), vec![0, 16]);
+        assert_eq!(place(Justify::Start), vec![0, 4]);
+        assert_eq!(place(Justify::Center), vec![6, 10]);
+        assert_eq!(place(Justify::End), vec![12, 16]);
+        assert_eq!(place(Justify::SpaceBetween), vec![0, 16]);
     }
 
     #[test]
     fn space_between_spreads_the_rest_over_the_gaps() {
         let r = Layout::row()
             .constraints([Fixed(2), Fixed(2), Fixed(2)])
-            .align(Alignment::SpaceBetween)
+            .justify(Justify::SpaceBetween)
             .split(Rect::new(0, 0, 13, 1));
         // 7 spare cells over 2 gaps: 4 then 3.
         assert_eq!(r.iter().map(|r| r.x).collect::<Vec<_>>(), vec![0, 6, 11]);
         let one = Layout::row()
             .constraints([Fixed(2)])
-            .align(Alignment::SpaceBetween)
+            .justify(Justify::SpaceBetween)
             .split(Rect::new(0, 0, 13, 1));
         assert_eq!(one[0].x, 0);
     }
@@ -638,7 +640,7 @@ mod tests {
         assert!(a.intersection(gone).area() == 0 || gone.x >= a.x && gone.x <= a.right());
     }
 
-    /// Random constraints, gaps, margins, paddings and alignments: every
+    /// Random constraints, gaps, margins, paddings and justifications: every
     /// rectangle stays inside the area, no two overlap and the count matches.
     #[test]
     fn random_layouts_stay_inside_the_area_and_never_overlap() {
@@ -660,18 +662,18 @@ mod tests {
                     _ => Max(next(60)),
                 })
                 .collect();
-            let alignment = [
-                Alignment::Start,
-                Alignment::Center,
-                Alignment::End,
-                Alignment::SpaceBetween,
+            let justify = [
+                Justify::Start,
+                Justify::Center,
+                Justify::End,
+                Justify::SpaceBetween,
             ][next(4) as usize];
             let layout = Layout::row()
                 .constraints(constraints.clone())
                 .gap(next(6))
                 .margin(Edges::symmetric(next(4), next(4)))
                 .padding(Edges::symmetric(next(3), next(3)))
-                .align(alignment);
+                .justify(justify);
             let layout = if next(2) == 0 {
                 layout
             } else {

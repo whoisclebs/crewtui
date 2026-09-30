@@ -57,7 +57,7 @@ The pool is bounded, timers share one thread, and everything that hasn't started
 
 ## Widgets
 
-A widget is a value built inside `view` and consumed by drawing it into a rectangle of the buffer: `Paragraph::new(text)`, `List::new(items)`, `Block::bordered()`. `Frame::render_widget` takes the widget and an area, and `Layout` splits an area into pieces with fixed, fill, percentage, min and max constraints, plus padding, margin, gap and alignment. Widgets never see the terminal.
+A widget is a value built inside `view` and consumed by drawing it into a rectangle of the buffer: `Paragraph::new(text)`, `List::new(items)`, `Block::bordered()`. `Frame::render_widget` takes the widget and an area, and `Layout` splits an area into pieces with fixed, fill, percentage, min and max constraints, plus padding, margin, gap and `Justify` for leftover space. Widgets never see the terminal.
 
 State that has to outlive a frame stays with the app. `List` takes a `ListState` holding the selection, `Input` an `InputState` with the text and cursor, `History` a `HistoryState` with the entries. What the app decides is plain data changed in `update`. What only drawing can know, like the scroll offset that keeps the selection visible, is derived while drawing and kept in a `Cell` inside the state. See [ADR 5](adr/0005-widget-ownership.md).
 
