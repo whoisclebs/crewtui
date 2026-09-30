@@ -93,6 +93,8 @@ pub struct Span<'a> {
     pub content: Cow<'a, str>,
     /// The style applied to it.
     pub style: Style,
+    /// The hyperlink the text belongs to, if any. See [`Span::link`].
+    pub link: Option<Cow<'a, str>>,
 }
 
 impl<'a> Span<'a> {
@@ -101,6 +103,7 @@ impl<'a> Span<'a> {
         Span {
             content: content.into(),
             style: Style::new(),
+            link: None,
         }
     }
 
@@ -109,12 +112,33 @@ impl<'a> Span<'a> {
         Span {
             content: content.into(),
             style,
+            link: None,
         }
     }
 
     /// The same text with `style` layered over its current one.
     pub fn style(mut self, style: Style) -> Self {
         self.style = self.style.patch(style);
+        self
+    }
+
+    /// The same text as a hyperlink to `url`, which terminals that support
+    /// OSC 8 make clickable. The URL is not part of the text and takes no
+    /// room. One that is empty, longer than 2,048 bytes, or has anything but
+    /// printable ASCII in it is ignored when drawn; see
+    /// [`Buffer::set_link`](crate::Buffer::set_link).
+    ///
+    /// ```
+    /// use crewtui::text::{Line, Span};
+    ///
+    /// let line = Line::from(vec![
+    ///     Span::raw("read the "),
+    ///     Span::raw("docs").link("https://example.com/docs"),
+    /// ]);
+    /// assert_eq!(line.width(), 13);
+    /// ```
+    pub fn link(mut self, url: impl Into<Cow<'a, str>>) -> Self {
+        self.link = Some(url.into());
         self
     }
 
@@ -128,6 +152,7 @@ impl<'a> Span<'a> {
         Span {
             content: Cow::Owned(self.content.into_owned()),
             style: self.style,
+            link: self.link.map(|l| Cow::Owned(l.into_owned())),
         }
     }
 }

@@ -35,6 +35,8 @@ Who calls it:
 - The runtime does after SIGCONT.
 - Applications ask for it with `Cmd::repaint` (Ctrl+L in the example app), for instance after a child process used the terminal.
 
+Hyperlinks (OSC 8) are not part of a cell. A `Buffer` keeps them as runs of cells on a row, `Buffer::set_link` adds one, and `Span::link` gives text a link that any widget draws. The diff treats a change of link like a change of text, opens the link before the first cell that has it and closes it before the first cell that doesn't, and always closes it at the end of a frame. A repaint starts by closing whatever a cut frame may have left open. A URL with anything but printable ASCII in it is refused, since an escape sequence in it could end the OSC and run the text after it as commands. URLs take no columns, because they are never part of the text that is measured.
+
 The tests cut a frame at every possible byte, including inside an escape sequence, feed the pieces to a small terminal model, and check that the next frame leaves the screen equal to the buffer.
 
 ## The loop

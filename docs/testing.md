@@ -4,7 +4,7 @@ Most of the crate is tested with plain unit tests. The parts that talk to a term
 
 ## The terminal model
 
-`Screen` applies the escape sequences the renderer emits and exposes the grid. It handles cursor moves, colors and attributes, clearing, the pending wrap after the last column, and erasing the other half of a wide glyph that gets overwritten. It parses like a real terminal: sequences can arrive in pieces, an ESC inside a CSI sequence aborts it, and invalid UTF-8 prints U+FFFD. Anything it doesn't model panics, so a new escape sequence in the output fails a test instead of being ignored.
+`Screen` applies the escape sequences the renderer emits and exposes the grid. It handles cursor moves, colors and attributes, hyperlinks (OSC 8, kept apart from the cells), clearing, the pending wrap after the last column, and erasing the other half of a wide glyph that gets overwritten. It parses like a real terminal: sequences can arrive in pieces, an ESC inside a CSI or OSC sequence aborts it, and invalid UTF-8 prints U+FFFD. Anything it doesn't model panics, so a new escape sequence in the output fails a test instead of being ignored.
 
 Use it to check what a program put on screen: feed it bytes, then read `row(y)` or compare `to_buffer()` with the buffer the app drew.
 

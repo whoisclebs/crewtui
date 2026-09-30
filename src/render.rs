@@ -2,6 +2,7 @@
 
 use std::io::{self, Write};
 
+use crate::buffer::LinkRun;
 use crate::{Buffer, Color, Frame, Modifier, Rect, Style};
 
 /// Keeps the previous frame and produces the bytes that move the terminal
@@ -78,7 +79,7 @@ impl Renderer {
         }
         self.out.clear();
         if !self.known {
-            self.out.extend_from_slice(b"\x1b[0m\x1b[2J");
+            self.out.extend_from_slice(b"\x1b[0m\x1b]8;;\x1b\\\x1b[2J");
             self.previous.reset();
             self.known = true;
         }
@@ -164,23 +165,45 @@ fn diff(previous: &Buffer, current: &Buffer, out: &mut Vec<u8>) {
     let width = area.width as usize;
     let mut cursor: Option<(usize, usize)> = None;
     let mut style = Style::new();
+    let mut link: Option<&str> = None;
 
     for y in 0..area.height as usize {
         let row = y * width;
-        if current.cells()[row..row + width] == previous.cells()[row..row + width] {
+        let want_links = current.row_links(y as u16);
+        let had_links = previous.row_links(y as u16);
+        if current.cells()[row..row + width] == previous.cells()[row..row + width]
+            && want_links == had_links
+        {
             continue;
         }
+        // Where each row's link runs are being walked, left to right.
+        let (mut wi, mut hi) = (0, 0);
         for x in 0..width {
             let cell = &current.cells()[row + x];
             if cell.is_continuation() {
                 continue;
             }
+            let x16 = x as u16;
+            while wi < want_links.len() && want_links[wi].end() <= x16 {
+                wi += 1;
+            }
+            while hi < had_links.len() && had_links[hi].end() <= x16 {
+                hi += 1;
+            }
+            let want = want_links
+                .get(wi)
+                .filter(|r| r.covers(x16))
+                .map(LinkRun::url);
+            let had = had_links
+                .get(hi)
+                .filter(|r| r.covers(x16))
+                .map(LinkRun::url);
             let wide = x + 1 < width && current.cells()[row + x + 1].is_continuation();
             let cols = if wide { 2 } else { 1 };
             // A wide glyph is drawn from its left half, so a change to
             // either half means drawing the whole glyph again.
-            let dirty =
-                (0..cols).any(|k| current.cells()[row + x + k] != previous.cells()[row + x + k]);
+            let dirty = want != had
+                || (0..cols).any(|k| current.cells()[row + x + k] != previous.cells()[row + x + k]);
             if !dirty {
                 continue;
             }
@@ -189,15 +212,32 @@ fn diff(previous: &Buffer, current: &Buffer, out: &mut Vec<u8>) {
                 write_style(out, cell.style());
                 style = cell.style();
             }
+            if want != link {
+                write_link(out, want);
+                link = want;
+            }
             out.extend_from_slice(cell.symbol().as_bytes());
             // A write in the last column leaves the cursor pending a wrap
             // whose position terminals disagree about, so treat it as lost.
             cursor = (x + cols < width).then_some((x + cols, y));
         }
     }
+    if link.is_some() {
+        write_link(out, None);
+    }
     if style != Style::new() {
         out.extend_from_slice(b"\x1b[0m");
     }
+}
+
+/// Opens the hyperlink `url`, or closes the open one for `None`. Only
+/// `Buffer::set_link` puts a URL in a cell, and it has checked it.
+fn write_link(out: &mut Vec<u8>, url: Option<&str>) {
+    out.extend_from_slice(b"\x1b]8;;");
+    if let Some(url) = url {
+        out.extend_from_slice(url.as_bytes());
+    }
+    out.extend_from_slice(b"\x1b\\");
 }
 
 fn move_cursor(out: &mut Vec<u8>, cursor: &mut Option<(usize, usize)>, x: usize, y: usize) {
@@ -308,13 +348,16 @@ mod tests {
     #[test]
     fn first_frame_clears_then_paints_only_non_blank_cells() {
         let mut r = Renderer::new(5, 2);
-        assert_eq!(text(&mut r, &["hi", ""]), b"\x1b[0m\x1b[2J\x1b[1;1Hhi");
+        assert_eq!(
+            text(&mut r, &["hi", ""]),
+            b"\x1b[0m\x1b]8;;\x1b\\\x1b[2J\x1b[1;1Hhi"
+        );
     }
 
     #[test]
     fn blank_first_frame_is_just_the_clear() {
         let mut r = Renderer::new(5, 2);
-        assert_eq!(text(&mut r, &[]), b"\x1b[0m\x1b[2J");
+        assert_eq!(text(&mut r, &[]), b"\x1b[0m\x1b]8;;\x1b\\\x1b[2J");
     }
 
     #[test]
@@ -375,7 +418,7 @@ mod tests {
         let mut r = Renderer::new(8, 1);
         assert_eq!(
             text(&mut r, &["a中b"]),
-            "\x1b[0m\x1b[2J\x1b[1;1Ha中b".as_bytes()
+            "\x1b[0m\x1b]8;;\x1b\\\x1b[2J\x1b[1;1Ha中b".as_bytes()
         );
         assert_eq!(text(&mut r, &["a中c"]), b"\x1b[1;4Hc");
     }
@@ -408,7 +451,7 @@ mod tests {
         let mut r = Renderer::new(3, 2);
         assert_eq!(
             text(&mut r, &["abc", "d"]),
-            b"\x1b[0m\x1b[2J\x1b[1;1Habc\x1b[2;1Hd"
+            b"\x1b[0m\x1b]8;;\x1b\\\x1b[2J\x1b[1;1Habc\x1b[2;1Hd"
         );
     }
 
@@ -418,7 +461,10 @@ mod tests {
         text(&mut r, &["ab"]);
         r.resize(6, 2);
         assert_eq!(r.area(), Rect::new(0, 0, 6, 2));
-        assert_eq!(text(&mut r, &["ab"]), b"\x1b[0m\x1b[2J\x1b[1;1Hab");
+        assert_eq!(
+            text(&mut r, &["ab"]),
+            b"\x1b[0m\x1b]8;;\x1b\\\x1b[2J\x1b[1;1Hab"
+        );
     }
 
     #[test]
@@ -449,7 +495,7 @@ mod tests {
             .to_vec();
         assert_eq!(
             out,
-            b"\x1b[0m\x1b[2J\x1b[1;1H\x1b[0;3;4;38;5;200;104mx\x1b[0m"
+            b"\x1b[0m\x1b]8;;\x1b\\\x1b[2J\x1b[1;1H\x1b[0;3;4;38;5;200;104mx\x1b[0m"
         );
     }
 
@@ -512,10 +558,12 @@ mod tests {
         let draw1 = |b: &mut Buffer| {
             b.set_string(0, 0, "hello 中文 x", s1);
             b.set_string(1, 1, "😀ab", s2);
+            b.set_link(Rect::new(1, 0, 8, 1), Some("https://example.com/a?b=1"));
         };
         let draw2 = |b: &mut Buffer| {
             b.set_string(0, 0, "hEllo 字文 y", s2);
             b.set_string(0, 1, "👨‍👩‍👧‍👦 ab", s1);
+            b.set_link(Rect::new(3, 0, 6, 2), Some("https://example.com/other"));
         };
         let draw3 = |b: &mut Buffer| {
             b.set_string(2, 0, "final 中", s1);
@@ -612,6 +660,20 @@ mod tests {
             }
             for (x, y, st) in scene_styles {
                 scene.set_style(Rect::new(x, y, 1, 1), st);
+            }
+            if next() % 3 == 0 {
+                let urls = [
+                    Some("https://a.example/x"),
+                    Some("https://b.example/y"),
+                    None,
+                ];
+                let link_area = Rect::new(
+                    (next() % w as u64) as u16,
+                    (next() % h as u64) as u16,
+                    (next() % 5) as u16,
+                    (next() % 2 + 1) as u16,
+                );
+                scene.set_link(link_area, urls[(next() % 3) as usize]);
             }
             let bytes = r.draw_buf(|b| *b = scene.clone()).to_vec();
             screen.feed(&bytes);
@@ -799,5 +861,155 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Text of row `y` and the link of each cell, as `text` then `link|link`.
+    fn links_of(screen: &Screen, w: u16, y: u16) -> Vec<Option<String>> {
+        let b = screen.to_buffer();
+        (0..w).map(|x| b.link_at(x, y).map(str::to_owned)).collect()
+    }
+
+    #[test]
+    fn a_link_is_opened_before_its_text_and_closed_once_after_it() {
+        let mut r = Renderer::new(12, 1);
+        let out = r
+            .draw_buf(|b| {
+                b.set_string(0, 0, "see docs now", Style::new());
+                b.set_link(Rect::new(4, 0, 4, 1), Some("https://example.com/d"));
+            })
+            .to_vec();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            "\x1b[0m\x1b]8;;\x1b\\\x1b[2J\x1b[1;1Hsee\x1b[C\x1b]8;;https://example.com/d\x1b\\docs\x1b[C\x1b]8;;\x1b\\now"
+        );
+    }
+
+    #[test]
+    fn a_link_that_ends_a_row_of_changes_is_closed_at_the_end_of_the_frame() {
+        let mut r = Renderer::new(6, 1);
+        let out = r
+            .draw_buf(|b| {
+                b.set_string(0, 0, "abc", Style::new());
+                b.set_link(Rect::new(0, 0, 3, 1), Some("https://e.com"));
+            })
+            .to_vec();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.ends_with("abc\x1b]8;;\x1b\\"), "{text:?}");
+    }
+
+    #[test]
+    fn adding_a_link_to_text_that_is_already_there_rewrites_only_that_text() {
+        let mut r = Renderer::new(10, 1);
+        r.draw_buf(|b| {
+            b.set_string(0, 0, "abcdef", Style::new());
+        });
+        let out = r
+            .draw_buf(|b| {
+                b.set_string(0, 0, "abcdef", Style::new());
+                b.set_link(Rect::new(2, 0, 2, 1), Some("https://e.com"));
+            })
+            .to_vec();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b[1;3H\x1b]8;;https://e.com\x1b\\cd\x1b]8;;\x1b\\"
+        );
+        // Taking it off again rewrites the same two cells.
+        let out = r
+            .draw_buf(|b| {
+                b.set_string(0, 0, "abcdef", Style::new());
+            })
+            .to_vec();
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[1;3Hcd");
+    }
+
+    #[test]
+    fn two_links_next_to_each_other_switch_without_a_close_between() {
+        let mut r = Renderer::new(8, 1);
+        let out = r
+            .draw_buf(|b| {
+                b.set_string(0, 0, "aabb", Style::new());
+                b.set_link(Rect::new(0, 0, 2, 1), Some("https://a.com"));
+                b.set_link(Rect::new(2, 0, 2, 1), Some("https://b.com"));
+            })
+            .to_vec();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "\x1b]8;;https://a.com\x1b\\aa\x1b]8;;https://b.com\x1b\\bb\x1b]8;;\x1b\\"
+            ),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn the_screen_keeps_the_links_a_frame_wrote_including_on_wide_glyphs() {
+        let mut r = Renderer::new(10, 2);
+        let mut screen = Screen::new(10, 2);
+        let mut want = Buffer::new(r.area());
+        let draw = |b: &mut Buffer| {
+            b.set_string(0, 0, "a中b", Style::new());
+            b.set_link(Rect::new(1, 0, 2, 1), Some("https://e.com/w"));
+            b.set_string(0, 1, "xyz", Style::new());
+            b.set_link(Rect::new(0, 1, 3, 1), Some("https://e.com/z"));
+        };
+        draw(&mut want);
+        screen.feed(r.draw_buf(draw));
+        assert_eq!(screen.to_buffer(), want);
+        assert_eq!(
+            links_of(&screen, 4, 0),
+            [
+                None,
+                Some("https://e.com/w".to_owned()),
+                Some("https://e.com/w".to_owned()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn a_url_that_could_end_the_escape_sequence_is_never_written() {
+        let mut r = Renderer::new(10, 1);
+        for url in [
+            "https://e.com/\x1b]52;c;evil\x07",
+            "https://e.com/a\x07b",
+            "https://e.com/a b",
+            "https://e.com/é",
+            "",
+        ] {
+            let out = r
+                .draw_buf(|b| {
+                    b.set_string(0, 0, "abc", Style::new());
+                    b.set_link(Rect::new(0, 0, 3, 1), Some(url));
+                })
+                .to_vec();
+            let text = String::from_utf8(out).unwrap();
+            assert!(!text.contains("]8;;h"), "{url:?} was written: {text:?}");
+            assert!(!text.contains("evil"), "{text:?}");
+        }
+        let long = format!("https://e.com/{}", "a".repeat(2048));
+        let out = r
+            .draw_buf(|b| {
+                b.set_string(0, 0, "abd", Style::new());
+                b.set_link(Rect::new(0, 0, 3, 1), Some(&long));
+            })
+            .to_vec();
+        assert!(!String::from_utf8(out).unwrap().contains("]8;;h"));
+    }
+
+    #[test]
+    fn a_repaint_closes_a_link_a_cut_frame_may_have_left_open() {
+        let mut r = Renderer::new(6, 1);
+        r.draw_buf(|b| {
+            b.set_string(0, 0, "abc", Style::new());
+        });
+        r.invalidate();
+        let out = r
+            .draw_buf(|b| {
+                b.set_string(0, 0, "abc", Style::new());
+            })
+            .to_vec();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("\x1b[0m\x1b]8;;\x1b\\\x1b[2J"), "{text:?}");
     }
 }

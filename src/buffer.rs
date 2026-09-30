@@ -1,5 +1,7 @@
 //! Cells and the buffer widgets draw into.
 
+use std::sync::Arc;
+
 use crate::text::grapheme_width;
 use crate::{Rect, Style};
 use unicode_segmentation::UnicodeSegmentation;
@@ -38,6 +40,11 @@ impl Symbol {
             Symbol::Heap(s) => s,
         }
     }
+}
+
+/// Whether `url` can go into an OSC 8 sequence as it is.
+fn valid_link(url: &str) -> bool {
+    !url.is_empty() && url.len() <= 2048 && url.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
 fn is_bidi_control(c: char) -> bool {
@@ -133,6 +140,34 @@ impl std::fmt::Debug for Cell {
 pub struct Buffer {
     area: Rect,
     cells: Vec<Cell>,
+    /// Hyperlinks, as runs of cells on one row. Kept sorted by row and then
+    /// column, without overlaps, and with touching runs of the same URL
+    /// merged, so two buffers that link the same cells are equal. Most
+    /// frames have none, which keeps the common path free of them.
+    links: Vec<LinkRun>,
+}
+
+/// Cells `x0..x1` of row `y` that belong to the hyperlink `url`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct LinkRun {
+    y: u16,
+    x0: u16,
+    x1: u16,
+    url: Arc<str>,
+}
+
+impl LinkRun {
+    pub(crate) fn covers(&self, x: u16) -> bool {
+        self.x0 <= x && x < self.x1
+    }
+
+    pub(crate) fn end(&self) -> u16 {
+        self.x1
+    }
+
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
 }
 
 impl Buffer {
@@ -141,6 +176,7 @@ impl Buffer {
         Buffer {
             area,
             cells: vec![Cell::blank(); area.area()],
+            links: Vec::new(),
         }
     }
 
@@ -251,6 +287,9 @@ impl Buffer {
     /// buffer with room for `w` columns, and repairs any wide glyph it
     /// overlaps.
     fn put(&mut self, x: u16, y: u16, symbol: &str, w: usize, style: Style) {
+        if !self.links.is_empty() {
+            self.unlink(y, x, x + w as u16);
+        }
         for k in 0..w {
             self.free_cell(x + k as u16, y);
         }
@@ -280,6 +319,118 @@ impl Buffer {
         }
     }
 
+    /// Makes every cell of `area`, clipped to the buffer, part of the
+    /// hyperlink `url`, or of none for `None`. Text drawn over these cells
+    /// afterwards replaces the link, like it replaces the style. Both
+    /// halves of a wide glyph get it.
+    ///
+    /// The link is written as an OSC 8 sequence by the renderer, and is not
+    /// part of the text, so it doesn't count toward any width. A URL that is
+    /// empty, longer than 2,048 bytes, or has anything but printable ASCII
+    /// in it, spaces and control characters included, is ignored: an escape
+    /// sequence in it would end the OSC and let the text after it run as
+    /// terminal commands. Percent-encode what does not fit.
+    pub fn set_link(&mut self, area: Rect, url: Option<&str>) {
+        let link: Option<Arc<str>> = match url {
+            Some(url) if valid_link(url) => Some(Arc::from(url)),
+            Some(_) => return,
+            None => None,
+        };
+        let area = self.area.intersection(area);
+        if area.is_empty() || (link.is_none() && self.links.is_empty()) {
+            return;
+        }
+        for y in area.y..area.bottom() {
+            // A terminal can't link the two halves of a wide glyph
+            // differently, so touching either half links the whole glyph.
+            let mut x0 = area.x;
+            let mut x1 = area.right();
+            if self.get(x0, y).is_some_and(Cell::is_continuation) && x0 > self.area.x {
+                x0 -= 1;
+            }
+            if self.get(x1 - 1, y).is_some_and(|c| !c.is_continuation())
+                && self.get(x1, y).is_some_and(Cell::is_continuation)
+            {
+                x1 += 1;
+            }
+            self.unlink(y, x0, x1);
+            if let Some(url) = &link {
+                self.add_run(LinkRun {
+                    y,
+                    x0,
+                    x1,
+                    url: url.clone(),
+                });
+            }
+        }
+    }
+
+    /// The URL of the hyperlink the cell at `(x, y)` belongs to, if any.
+    pub fn link_at(&self, x: u16, y: u16) -> Option<&str> {
+        let row = self.row_links(y);
+        row.iter().find(|r| r.covers(x)).map(LinkRun::url)
+    }
+
+    /// The link runs of row `y`, left to right.
+    pub(crate) fn row_links(&self, y: u16) -> &[LinkRun] {
+        if self.links.is_empty() {
+            return &[];
+        }
+        let start = self.links.partition_point(|r| r.y < y);
+        let end = start + self.links[start..].partition_point(|r| r.y == y);
+        &self.links[start..end]
+    }
+
+    /// Takes cells `x0..x1` of row `y` out of any link, cutting the runs
+    /// that stick out of it.
+    fn unlink(&mut self, y: u16, x0: u16, x1: u16) {
+        let start = self.links.partition_point(|r| r.y < y);
+        let end = start + self.links[start..].partition_point(|r| r.y == y);
+        let mut kept = Vec::new();
+        for run in self.links.drain(start..end) {
+            if run.x1 <= x0 || run.x0 >= x1 {
+                kept.push(run);
+                continue;
+            }
+            if run.x0 < x0 {
+                kept.push(LinkRun {
+                    x1: x0,
+                    ..run.clone()
+                });
+            }
+            if run.x1 > x1 {
+                kept.push(LinkRun { x0: x1, ..run });
+            }
+        }
+        self.links.splice(start..start, kept);
+    }
+
+    /// Adds a run over cells that are in no link, keeping the runs sorted
+    /// and merging it with touching runs of the same URL.
+    fn add_run(&mut self, mut run: LinkRun) {
+        let at = self
+            .links
+            .partition_point(|r| (r.y, r.x0) < (run.y, run.x0));
+        if at > 0 {
+            let before = &self.links[at - 1];
+            if before.y == run.y && before.x1 == run.x0 && before.url == run.url {
+                run.x0 = before.x0;
+                self.links.remove(at - 1);
+                return self.add_run(run);
+            }
+        }
+        if let Some(after) = self.links.get(at) {
+            if after.y == run.y && after.x0 == run.x1 && after.url == run.url {
+                run.x1 = after.x1;
+                self.links.remove(at);
+            }
+        }
+        let at = self
+            .links
+            .partition_point(|r| (r.y, r.x0) < (run.y, run.x0));
+        self.links.insert(at, run);
+    }
+
     /// Layers `style` on every cell of `area`, clipped to the buffer. A
     /// terminal can't style the two halves of a wide glyph differently, so
     /// touching either half styles the whole glyph.
@@ -304,6 +455,7 @@ impl Buffer {
     /// Resets every cell to blank.
     pub(crate) fn reset(&mut self) {
         self.cells.iter_mut().for_each(Cell::reset);
+        self.links.clear();
     }
 
     /// Changes the covered area. The content is cleared, because keeping a
@@ -312,6 +464,7 @@ impl Buffer {
         self.area = area;
         self.cells.clear();
         self.cells.resize(area.area(), Cell::blank());
+        self.links.clear();
     }
 }
 
@@ -594,6 +747,50 @@ mod tests {
             b.set_string(x, y, &text, Style::new());
             assert_wide_invariant(&b);
         }
+    }
+
+    #[test]
+    fn set_link_marks_cells_and_text_written_over_them_replaces_the_link() {
+        let mut b = Buffer::new(Rect::new(0, 0, 8, 2));
+        b.set_string(0, 0, "abcdef", Style::new());
+        b.set_link(Rect::new(1, 0, 3, 1), Some("https://e.com"));
+        assert_eq!(b.link_at(0, 0), None);
+        assert_eq!(b.link_at(1, 0), Some("https://e.com"));
+        assert_eq!(b.link_at(3, 0), Some("https://e.com"));
+        assert_eq!(b.link_at(4, 0), None);
+        // The text is what it was.
+        let row: String = (0..6).map(|x| b.get(x, 0).unwrap().symbol()).collect();
+        assert_eq!(row, "abcdef");
+        b.set_string(2, 0, "XY", Style::new());
+        assert_eq!(b.link_at(1, 0), Some("https://e.com"));
+        assert_eq!(b.link_at(2, 0), None);
+        assert_eq!(b.link_at(3, 0), None);
+        b.set_link(Rect::new(0, 0, 8, 2), None);
+        assert!(b.links.is_empty());
+    }
+
+    #[test]
+    fn a_link_covers_both_halves_of_a_wide_glyph_even_when_the_area_touches_one() {
+        let mut b = Buffer::new(Rect::new(0, 0, 6, 1));
+        b.set_string(0, 0, "a中b", Style::new());
+        b.set_link(Rect::new(2, 0, 1, 1), Some("https://e.com"));
+        assert_eq!(b.link_at(1, 0), Some("https://e.com"));
+        assert_eq!(b.link_at(2, 0), Some("https://e.com"));
+        assert_eq!(b.link_at(3, 0), None);
+    }
+
+    #[test]
+    fn links_with_anything_but_printable_ascii_are_ignored_and_the_area_is_clipped() {
+        let mut b = Buffer::new(Rect::new(0, 0, 3, 1));
+        for url in ["", "a b", "a\x1bb", "a\x07b", "\u{7f}", "é", "a\nb"] {
+            b.set_link(Rect::new(0, 0, 3, 1), Some(url));
+            assert!(b.links.is_empty(), "{url:?}");
+        }
+        b.set_link(Rect::new(0, 0, 3, 1), Some(&"a".repeat(2049)));
+        assert!(b.links.is_empty());
+        b.set_link(Rect::new(2, 0, 50, 50), Some("https://e.com"));
+        assert_eq!(b.link_at(2, 0), Some("https://e.com"));
+        assert_eq!(b.link_at(1, 0), None);
     }
 
     #[test]

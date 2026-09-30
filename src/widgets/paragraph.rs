@@ -101,6 +101,7 @@ struct Piece<'a> {
     text: &'a str,
     width: usize,
     style: Style,
+    link: Option<&'a str>,
     whitespace: bool,
 }
 
@@ -134,6 +135,7 @@ fn pieces<'a>(line: &'a Line<'_>) -> Vec<Piece<'a>> {
                 text: g,
                 width,
                 style: span.style,
+                link: span.link.as_deref(),
                 whitespace: g.chars().all(is_breaking_space),
             });
         }
@@ -325,12 +327,26 @@ fn draw_pieces(
     let base = base.patch(line.style);
     let mut x = area.x.saturating_add(offset as u16);
     let right = area.right();
+    // The cells of a run of pieces with the same link are marked together.
+    let mut run: Option<(&str, u16)> = None;
+    let end_run = |buf: &mut Buffer, run: &mut Option<(&str, u16)>, x: u16| {
+        if let Some((url, from)) = run.take() {
+            buf.set_link(Rect::new(from, y, x - from, 1), Some(url));
+        }
+    };
     for p in &pieces[row.start..row.end] {
         if usize::from(x) + p.width > usize::from(right) {
             break;
         }
+        if run.is_some_and(|(url, _)| Some(url) != p.link) {
+            end_run(buf, &mut run, x);
+        }
+        if run.is_none() {
+            run = p.link.map(|url| (url, x));
+        }
         x = buf.set_string(x, y, p.text, base.patch(p.style));
     }
+    end_run(buf, &mut run, x);
 }
 
 /// How many screen rows `line` takes at `width` columns.
@@ -469,6 +485,61 @@ mod tests {
 
     /// The shortcut for a line with no more bytes than columns must agree with
     /// splitting the line, for every kind of text.
+    #[test]
+    fn a_span_with_a_link_marks_its_cells_across_wrapped_rows_and_takes_no_room() {
+        let area = Rect::new(0, 0, 6, 3);
+        let mut buf = Buffer::new(area);
+        let line = Line::from(vec![
+            Span::raw("go to "),
+            Span::raw("the docs page").link("https://e.com/docs"),
+            Span::raw(" now"),
+        ]);
+        Paragraph::new(line.clone())
+            .wrap(Wrap::Word)
+            .render(area, &mut buf);
+        let mut linked = Vec::new();
+        for y in 0..3 {
+            let row: String = (0..6).map(|x| buf.get(x, y).unwrap().symbol()).collect();
+            let marks: String = (0..6)
+                .map(|x| {
+                    if buf.link_at(x, y).is_some() {
+                        '#'
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            linked.push((row.trim_end().to_owned(), marks));
+        }
+        // "the docs page" is linked wherever it wraps, and the words around it are not.
+        assert_eq!(linked[0].0, "go to");
+        assert!(linked[0].1.chars().all(|c| c == '.'), "{linked:?}");
+        assert_eq!(linked[1].0, "the");
+        assert_eq!(&linked[1].1[..3], "###", "{linked:?}");
+        // The URL is not part of the text: the layout is the one without it.
+        let plain = Line::from(vec![Span::raw("go to the docs page now")]);
+        assert_eq!(
+            line_rows(&line, 6, Wrap::Word),
+            line_rows(&plain, 6, Wrap::Word)
+        );
+    }
+
+    #[test]
+    fn a_span_that_is_cut_by_the_area_links_only_what_is_drawn() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::new(area);
+        Paragraph::new(Line::from(Span::raw("abcdefgh").link("https://e.com")))
+            .render(area, &mut buf);
+        assert!((0..4).all(|x| buf.link_at(x, 0) == Some("https://e.com")));
+        assert_eq!(buf.cells().len(), 4);
+    }
+
+    #[test]
+    fn a_link_survives_into_owned() {
+        let span = Span::raw("x").link("https://e.com").into_owned();
+        assert_eq!(span.link.as_deref(), Some("https://e.com"));
+    }
+
     #[test]
     fn the_one_row_shortcut_agrees_with_splitting() {
         let pieces_of = [
