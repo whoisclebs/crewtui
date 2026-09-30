@@ -309,13 +309,21 @@ fn a_background_note_in_the_middle_of_an_answer_does_not_swallow_the_tokens() {
 
 /// The stress scenario from the design: a transcript of 20,000 lines with
 /// answers streaming into it, tool calls, a spinner, background notes, typing
-/// and resizes. A frame is drawn after every message, which is more often than
-/// the runtime does it.
+/// and resizes. The messages for one token, and then a frame, so a frame per
+/// token, which is more often than the runtime draws.
+///
+/// The frame sizes are deterministic, so the limits are set about a quarter
+/// above what the code writes today. A change that makes frames bigger on
+/// purpose has to raise them on purpose.
 #[test]
 fn a_long_transcript_with_streaming_never_repaints_the_screen_per_token() {
     const TRANSCRIPT: usize = 20_000;
     const REQUESTS: usize = 6;
     const TOKENS: usize = 400;
+    // Bytes per token frame, over all of them: the run measures a mean of 334
+    // and a median of 23.
+    const MEAN_LIMIT: usize = 420;
+    const MEDIAN_LIMIT: usize = 32;
     let mut a = agent().with_history(TRANSCRIPT);
     let mut renderer = Renderer::new(120, 40);
     let mut all_bytes = 0usize;
@@ -331,6 +339,7 @@ fn a_long_transcript_with_streaming_never_repaints_the_screen_per_token() {
 
     let mut token_frames = Vec::new();
     let mut times = Vec::new();
+    let mut resize_times = Vec::new();
     for request in 0..REQUESTS {
         a.update(Msg::Submit(format!("request {request}")));
         frame(&a, &mut renderer);
@@ -362,17 +371,19 @@ fn a_long_transcript_with_streaming_never_repaints_the_screen_per_token() {
             all_bytes += bytes;
         }
         a.update(Msg::Finished);
-        // A resize repaints on purpose. Every frame after it is small again.
-        let (w, h) = if request % 2 == 0 {
-            (90, 30)
-        } else {
-            (120, 40)
-        };
-        renderer.resize(w, h);
-        a.update(Msg::Resize(w, h));
-        let (bytes, _) = frame(&a, &mut renderer);
-        assert!(bytes > 1_000, "a resize should repaint, wrote {bytes}");
-        full_repaint_reference(&mut a, &mut renderer, &mut frame);
+        assert_unchanged_frame_is_empty(&a, &mut renderer, &mut frame);
+        // A resize repaints on purpose. Go to a smaller screen and back, so
+        // that every token frame is drawn at the size `full` was measured at.
+        for (w, h) in [(90, 30), (120, 40)] {
+            renderer.resize(w, h);
+            a.update(Msg::Resize(w, h));
+            let (bytes, took) = frame(&a, &mut renderer);
+            assert!(
+                bytes > 1_000,
+                "a resize to {w}x{h} should repaint, wrote {bytes}"
+            );
+            resize_times.push(took);
+        }
     }
 
     token_frames.sort_unstable();
@@ -381,31 +392,29 @@ fn a_long_transcript_with_streaming_never_repaints_the_screen_per_token() {
     let mean = all_bytes / count;
     eprintln!(
         "stress: {count} token frames, bytes mean {mean}, median {}, p99 {}, max {}; \
-         frame time median {:?}, p99 {:?}, max {:?}; full repaint {full}",
+         frame time median {:?}, p99 {:?}; resize frames {:?}; full repaint {full}",
         token_frames[count / 2],
         token_frames[count * 99 / 100],
         token_frames[count - 1],
         times[count / 2],
         times[count * 99 / 100],
-        times[count - 1],
+        resize_times,
     );
+    assert!(mean < MEAN_LIMIT, "a token cost {mean} bytes on average");
     assert!(
-        mean < full / 8,
-        "a token cost {mean} bytes on average; a full repaint is {full}"
-    );
-    assert!(
-        token_frames[count / 2] < 800,
+        token_frames[count / 2] < MEDIAN_LIMIT,
         "the typical token cost {} bytes",
         token_frames[count / 2]
     );
 }
 
 /// Draws twice with nothing changed in between: the second frame is empty.
-fn full_repaint_reference(
-    a: &mut Agent,
+fn assert_unchanged_frame_is_empty(
+    a: &Agent,
     renderer: &mut Renderer,
     frame: &mut impl FnMut(&Agent, &mut Renderer) -> (usize, std::time::Duration),
 ) {
+    frame(a, renderer);
     let (bytes, _) = frame(a, renderer);
     assert_eq!(bytes, 0, "an unchanged view still wrote to the terminal");
 }
