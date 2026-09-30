@@ -14,6 +14,7 @@ mod paragraph;
 mod progress;
 mod scrollbar;
 mod spinner;
+mod table;
 
 pub use block::{Block, BorderType, Borders};
 pub use history::{History, HistoryState};
@@ -23,9 +24,23 @@ pub use paragraph::{Paragraph, Wrap};
 pub use progress::Progress;
 pub use scrollbar::{Orientation, Scrollbar};
 pub use spinner::Spinner;
+pub use table::{Row, Table, TableState};
 
 use crate::text::{Line, Span, Text};
 use crate::{Buffer, Rect};
+
+/// The smallest offset that keeps item `selected` in a viewport of `rows`
+/// rows, walking up from it and no further than the viewport is tall.
+/// `height(i)` is how many rows item `i` takes.
+pub(crate) fn offset_for(height: impl Fn(usize) -> usize, selected: usize, rows: usize) -> usize {
+    let mut used = height(selected);
+    let mut offset = selected;
+    while offset > 0 && used + height(offset - 1) <= rows {
+        offset -= 1;
+        used += height(offset);
+    }
+    offset
+}
 
 /// Draws itself into a rectangle of a buffer.
 ///
