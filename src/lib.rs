@@ -4,6 +4,8 @@
 mod buffer;
 mod geometry;
 mod render;
+#[cfg(unix)]
+mod signals;
 mod style;
 #[cfg(unix)]
 mod terminal;
@@ -14,6 +16,8 @@ pub mod text;
 pub use buffer::{Buffer, Cell};
 pub use geometry::Rect;
 pub use render::Renderer;
+#[cfg(unix)]
+pub use signals::{Signal, Signals};
 pub use style::{Color, Modifier, Style};
 #[cfg(unix)]
 pub use terminal::{Terminal, TerminalOptions};
