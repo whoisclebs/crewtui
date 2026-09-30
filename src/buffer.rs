@@ -302,13 +302,13 @@ impl Buffer {
     }
 
     /// Resets every cell to blank.
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.cells.iter_mut().for_each(Cell::reset);
     }
 
     /// Changes the covered area. The content is cleared, because keeping a
     /// stale layout after a resize is a source of artifacts.
-    pub fn resize(&mut self, area: Rect) {
+    pub(crate) fn resize(&mut self, area: Rect) {
         self.area = area;
         self.cells.clear();
         self.cells.resize(area.area(), Cell::blank());
