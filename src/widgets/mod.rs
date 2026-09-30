@@ -7,12 +7,14 @@
 //! owns.
 
 mod block;
+mod list;
 mod paragraph;
 mod progress;
 mod scrollbar;
 mod spinner;
 
 pub use block::{Block, BorderType, Borders};
+pub use list::{List, ListItem, ListState};
 pub use paragraph::{Paragraph, Wrap};
 pub use progress::Progress;
 pub use scrollbar::{Orientation, Scrollbar};
@@ -28,6 +30,19 @@ use crate::{Buffer, Rect};
 pub trait Widget {
     /// Draws the widget.
     fn render(self, area: Rect, buf: &mut Buffer);
+}
+
+/// A widget that needs state that outlives the frame, such as a scroll
+/// position or a selection.
+///
+/// The state is a plain value the app owns and passes back each frame;
+/// rendering may update it, for instance to bring the selection into view.
+pub trait StatefulWidget {
+    /// The state this widget reads and updates.
+    type State;
+
+    /// Draws the widget.
+    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State);
 }
 
 impl Widget for Text<'_> {

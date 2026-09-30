@@ -279,6 +279,51 @@ fn word_rows(pieces: &[Piece<'_>], width: usize) -> Vec<Row> {
     rows
 }
 
+/// Draws one line on row `y` of `area` without wrapping: cut by columns and
+/// placed by `align`, unless the line has an alignment of its own. `base` is
+/// the style under the line's own and its spans'.
+pub(crate) fn draw_line(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    line: &Line<'_>,
+    base: Style,
+    align: HorizontalAlign,
+) {
+    let pieces = pieces(line);
+    let row = rows(&pieces, usize::from(area.width), Wrap::None).remove(0);
+    draw_pieces(buf, area, y, line, &pieces, &row, base, align);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_pieces(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    line: &Line<'_>,
+    pieces: &[Piece<'_>],
+    row: &Row,
+    base: Style,
+    align: HorizontalAlign,
+) {
+    let align = line.alignment.unwrap_or(align);
+    let free = usize::from(area.width).saturating_sub(row.width);
+    let offset = match align {
+        HorizontalAlign::Left => 0,
+        HorizontalAlign::Center => free / 2,
+        HorizontalAlign::Right => free,
+    };
+    let base = base.patch(line.style);
+    let mut x = area.x.saturating_add(offset as u16);
+    let right = area.right();
+    for p in &pieces[row.start..row.end] {
+        if usize::from(x) + p.width > usize::from(right) {
+            break;
+        }
+        x = buf.set_string(x, y, p.text, base.patch(p.style));
+    }
+}
+
 impl Paragraph<'_> {
     fn draw_row(
         &self,
@@ -289,22 +334,8 @@ impl Paragraph<'_> {
         pieces: &[Piece<'_>],
         row: &Row,
     ) {
-        let align = line.alignment.unwrap_or(self.align);
-        let free = usize::from(area.width).saturating_sub(row.width);
-        let offset = match align {
-            HorizontalAlign::Left => 0,
-            HorizontalAlign::Center => free / 2,
-            HorizontalAlign::Right => free,
-        };
-        let base = self.style.patch(self.text.style).patch(line.style);
-        let mut x = area.x.saturating_add(offset as u16);
-        let right = area.right();
-        for p in &pieces[row.start..row.end] {
-            if usize::from(x) + p.width > usize::from(right) {
-                break;
-            }
-            x = buf.set_string(x, y, p.text, base.patch(p.style));
-        }
+        let base = self.style.patch(self.text.style);
+        draw_pieces(buf, area, y, line, pieces, row, base, self.align);
     }
 }
 
