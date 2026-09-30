@@ -56,7 +56,7 @@ pub use input::{
 pub use layout::{Constraint, Edges, Justify, Layout};
 pub use render::Renderer;
 #[cfg(unix)]
-pub use runtime::{App, Cmd, Program};
+pub use runtime::{App, Cmd, Program, run};
 #[cfg(unix)]
 pub use signals::Signal;
 #[cfg(unix)]
@@ -64,3 +64,12 @@ pub(crate) use signals::Signals;
 pub use style::{Color, Modifier, Style};
 #[cfg(unix)]
 pub use terminal::{Terminal, TerminalOptions};
+
+/// The names most apps import, in one `use crewtui::prelude::*;`.
+pub mod prelude {
+    pub use crate::widgets::{Block, Paragraph, StatefulWidget, Widget};
+    #[cfg(unix)]
+    pub use crate::{App, Cmd, Program};
+    pub use crate::{Color, Constraint, Event, Frame, KeyCode, KeyEvent, KeyModifiers, Layout};
+    pub use crate::{Rect, Style};
+}

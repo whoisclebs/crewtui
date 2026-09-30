@@ -5,7 +5,7 @@ A terminal UI framework for Rust built around state, messages, update and view. 
 It is not React for the terminal: there is no virtual DOM, no hooks and no component lifecycle. It is not a port of Ratatui or Bubble Tea either. It borrows the drawing model of the first (widgets draw into a buffer) and the update loop of the second, and leaves the rest.
 
 ```rust,no_run
-use crewtui::{App, Cmd, Event, Frame, KeyCode, Program, Style};
+use crewtui::prelude::*;
 
 struct Counter(i32);
 
@@ -19,8 +19,8 @@ impl App for Counter {
 
     fn event(&self, event: Event) -> Option<Msg> {
         match event {
-            Event::Key(k) if k.code == KeyCode::Char('+') => Some(Msg::Up),
-            Event::Key(k) if k.code == KeyCode::Char('q') => Some(Msg::Quit),
+            Event::Key(k) if k.is(KeyCode::Char('+')) => Some(Msg::Up),
+            Event::Key(k) if k.is(KeyCode::Char('q')) => Some(Msg::Quit),
             _ => None,
         }
     }
@@ -37,12 +37,12 @@ impl App for Counter {
 
     fn view(&self, frame: &mut Frame) {
         let text = format!("count: {}  (+ to add, q to quit)", self.0);
-        frame.buffer_mut().set_string(0, 0, &text, Style::new());
+        frame.render_widget(Paragraph::new(text), frame.area());
     }
 }
 
 fn main() -> std::io::Result<()> {
-    Program::new(Counter(0)).run().map(|_| ())
+    crewtui::run(Counter(0))
 }
 ```
 
