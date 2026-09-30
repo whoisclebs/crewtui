@@ -324,19 +324,78 @@ fn draw_pieces(
     }
 }
 
-impl Paragraph<'_> {
-    fn draw_row(
-        &self,
-        buf: &mut Buffer,
-        area: Rect,
-        y: u16,
-        line: &Line<'_>,
-        pieces: &[Piece<'_>],
-        row: &Row,
-    ) {
-        let base = self.style.patch(self.text.style);
-        draw_pieces(buf, area, y, line, pieces, row, base, self.align);
+/// How many screen rows `text` takes at `width` columns.
+pub(crate) fn count_rows(text: &Text<'_>, width: usize, wrap: Wrap) -> usize {
+    if wrap == Wrap::None {
+        return text.lines.len();
     }
+    text.lines
+        .iter()
+        .map(|line| rows(&pieces(line), width, wrap).len())
+        .sum()
+}
+
+/// Draws `text` from its row `skip` down as far as `area` reaches, and says
+/// how many rows it drew. `base` goes under the text's own style.
+pub(crate) fn draw_text(
+    buf: &mut Buffer,
+    area: Rect,
+    text: &Text<'_>,
+    base: Style,
+    wrap: Wrap,
+    align: HorizontalAlign,
+    skip: usize,
+) -> usize {
+    let base = base.patch(text.style);
+    let width = usize::from(area.width);
+    let height = usize::from(area.height);
+    let mut drawn = 0;
+
+    if wrap == Wrap::None {
+        // One row per line, so the scroll offset is a jump, not a walk.
+        for line in text.lines.iter().skip(skip).take(height) {
+            let pieces = pieces(line);
+            let row = rows(&pieces, width, Wrap::None).remove(0);
+            draw_pieces(
+                buf,
+                area,
+                area.y + drawn as u16,
+                line,
+                &pieces,
+                &row,
+                base,
+                align,
+            );
+            drawn += 1;
+        }
+        return drawn;
+    }
+
+    let mut skip = skip;
+    for line in &text.lines {
+        let pieces = pieces(line);
+        for row in rows(&pieces, width, wrap) {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            draw_pieces(
+                buf,
+                area,
+                area.y + drawn as u16,
+                line,
+                &pieces,
+                &row,
+                base,
+                align,
+            );
+            drawn += 1;
+            if drawn >= height {
+                return drawn;
+            }
+        }
+    }
+    drawn
 }
 
 impl Widget for Paragraph<'_> {
@@ -357,36 +416,15 @@ impl Widget for Paragraph<'_> {
             return;
         }
         buf.set_style(area, self.style);
-        let width = usize::from(area.width);
-        let height = usize::from(area.height);
-        let mut y = area.y;
-
-        if self.wrap == Wrap::None {
-            // One row per line, so the scroll offset is a jump, not a walk.
-            for line in self.text.lines.iter().skip(self.scroll).take(height) {
-                let pieces = pieces(line);
-                let row = rows(&pieces, width, Wrap::None).remove(0);
-                self.draw_row(buf, area, y, line, &pieces, &row);
-                y += 1;
-            }
-            return;
-        }
-
-        let mut skip = self.scroll;
-        for line in &self.text.lines {
-            let pieces = pieces(line);
-            for row in rows(&pieces, width, self.wrap) {
-                if skip > 0 {
-                    skip -= 1;
-                    continue;
-                }
-                self.draw_row(buf, area, y, line, &pieces, &row);
-                y += 1;
-                if usize::from(y - area.y) >= height {
-                    return;
-                }
-            }
-        }
+        draw_text(
+            buf,
+            area,
+            &self.text,
+            self.style,
+            self.wrap,
+            self.align,
+            self.scroll,
+        );
     }
 }
 
