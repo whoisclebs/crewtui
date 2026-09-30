@@ -53,7 +53,7 @@ fn main() -> std::io::Result<()> {
 - Layout with fixed, fill, percentage, min and max constraints, plus padding, margin, gap and alignment.
 - Widgets: `Paragraph`, `Block`, `List`, `Input`, `Scrollbar`, `Progress`, `Spinner` and `History`, a scrollable transcript that stays cheap with tens of thousands of entries.
 - Keys, mouse, paste, focus and resize as typed events, and Unicode-aware width and wrapping.
-- Cleanup on normal exit, on an error, on a panic, on Ctrl+C and on SIGINT, SIGTERM and SIGHUP.
+- Cleanup of the terminal on normal exit, on an error, on a panic and on SIGINT, SIGTERM and SIGHUP. Ctrl+C typed in raw mode reaches the app as a key, so it quits when the app says so.
 
 ## Try it
 
@@ -62,7 +62,7 @@ cargo run --example agent
 cargo run --release --example agent -- --stress
 ```
 
-`agent` is a fake coding assistant. It exists to put the framework under load: a long scrollable history, streaming answers, tool calls, a spinner, an input line and background events. `--stress` starts it with 20,000 lines of history and a new request every few seconds.
+`agent` is a fake coding assistant. It exists to put the framework under load: a long scrollable history, streaming answers, tool calls, a spinner, an input line and background events. `--stress` starts it with 20,000 lines of history and sends a request every second; one that arrives while an answer is streaming is dropped.
 
 ## Documentation
 

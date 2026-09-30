@@ -18,12 +18,12 @@ Option 3. `view` draws into a `Frame`, which wraps a `Buffer` of `Cell`s. The `R
 
 The diff compares rows as slices first and only looks at cells in rows that differ. That was measured against comparing every cell: an unchanged frame goes from 202 to 128 µs and an empty one from 96 to 26 µs on a 200x60 screen, and a frame where everything changes costs the same. Dirty rectangles and per-widget change tracking were not tried; the numbers are in `docs/perf.md`.
 
-`previous` is a belief about the terminal, not a fact, so there is one recovery path, `Renderer::invalidate`. The next frame clears the screen and paints everything. The runtime calls it after a failed or short write, a resize, and SIGCONT, and apps can ask for it with `Cmd::repaint`.
+`previous` is a belief about the terminal, not a fact, so there is one recovery path, `Renderer::invalidate`. The next frame clears the screen and paints everything. `Renderer` calls it itself after a failed or short write and on a resize, the runtime calls it after SIGCONT, and apps can ask for it with `Cmd::repaint`.
 
 ## Consequences
 
 Drawing is a pure function of state into a buffer, so tests draw a view, feed the bytes to a terminal model and compare. No widget knows what is on the terminal.
 
-Every frame costs a full draw of the view, even when one cell changed. On a 120x40 screen that is around 200 µs for the reference app. An app whose view is expensive has to make it cheaper (`History` caches what it measured) since there is no partial redraw.
+Every frame costs a full draw of the view, even when one cell changed: about 400 µs for the typical layout in `docs/perf.md`. An app whose view is expensive has to make it cheaper (`History` caches what it measured), since there is no partial redraw.
 
 A change that moves many cells, like a scroll, rewrites all of them. A terminal scroll region could avoid that and is not used.

@@ -24,6 +24,6 @@ Option 3 is the browser model this crate stays away from: identity, reconciliati
 
 Two draws of the same state give the same frame, apart from caches that only make later frames cheaper.
 
-The state types have interior mutability, so they are not `Sync`, and their equality ignores the caches. A state shared between threads has to be cloned or wrapped by the app.
+The state types have interior mutability, so they are not `Sync`. A state shared between threads has to be cloned or wrapped by the app.
 
 Widgets that are expensive to build must keep the expensive part in their state, as `History` does with its measured rows. A widget built from scratch each frame from a large input would pay for it each frame.

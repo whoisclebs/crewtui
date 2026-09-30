@@ -18,7 +18,7 @@ Option 3. `Parser` turns bytes into `Event`: keys with modifiers, mouse, bracket
 
 A single reader thread waits on stdin, the signal pipe and a wake-up pipe together and sends into the channel the main loop blocks on. Effects send into the same channel. A lone Escape can't be told from the start of a sequence by the bytes alone, so the reader waits 50 ms for more input before it turns the Escape into a key.
 
-Ctrl+C in raw mode is a key event, and the app decides what it does. Signals that arrive from outside (SIGINT, SIGTERM, SIGHUP) end the run with an error carrying the signal, and the terminal is restored on the way out.
+Ctrl+C in raw mode is a key event and the app decides what it does. Signals from outside end the run instead; see the loop in `docs/architecture.md`.
 
 `event` returns `Option`, so an app that doesn't care about a mouse or a focus change never sees it in `update`.
 

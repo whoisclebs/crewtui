@@ -16,12 +16,9 @@ terminal bytes -> Parser -> Event -> App::event -> Message
 
 ## Renderer and recovery
 
-The renderer keeps two buffers. Each frame the view draws into `current`,
-the renderer diffs it against `previous`, returns the bytes that turn one
-into the other, and swaps them.
+The renderer keeps two buffers. Each frame the view draws into `current`, the renderer diffs it against `previous`, returns the bytes that turn one into the other, and swaps them.
 
-`previous` is a belief about what the terminal shows, not a fact. It stops
-being true when:
+`previous` is a belief about what the terminal shows, not a fact. It stops being true when:
 
 - a write fails or is cut short halfway through a frame;
 - another process writes to the tty, or a multiplexer redraws the screen;
@@ -29,31 +26,20 @@ being true when:
 - a child process takes over the terminal and gives it back;
 - the terminal is resized.
 
-A diff against a wrong `previous` doesn't fail, it just leaves garbage on
-screen that nothing ever corrects. So there is one recovery path:
-`Renderer::invalidate()`. The next frame starts with a clear screen and
-paints every non-blank cell, as if it were the first frame.
+A diff against a wrong `previous` doesn't fail, it just leaves garbage on screen that nothing ever corrects. So there is one recovery path: `Renderer::invalidate()`. The next frame starts with a clear screen and paints every non-blank cell, as if it were the first frame.
 
 Who calls it:
 
 - `Renderer::resize` does, by itself.
-- `Renderer::present` does when its write returns an error, whether or not
-  some bytes went through.
+- `Renderer::present` and `present_frame` do when their write returns an error, whether or not some bytes went through. That matters to code that drives a `Renderer` itself and carries on after the error. `Program` doesn't: a failed write ends the run.
 - The runtime does after SIGCONT.
-- Applications ask for it with `Cmd::repaint` (Ctrl+L in the example app),
-  for instance after a child process used the terminal.
+- Applications ask for it with `Cmd::repaint` (Ctrl+L in the example app), for instance after a child process used the terminal.
 
-The tests cut a frame at every possible byte, including inside an escape
-sequence, feed the pieces to a small terminal model, and check that the
-next frame leaves the screen equal to the buffer.
+The tests cut a frame at every possible byte, including inside an escape sequence, feed the pieces to a small terminal model, and check that the next frame leaves the screen equal to the buffer.
 
 ## The loop
 
-`Program::run` owns everything that touches the terminal: the raw-mode guard, a reader thread, the signal handlers and the renderer. The app only sees three methods.
-
-- `event` turns something the terminal reported into a message, or ignores it.
-- `update` changes state and returns a `Cmd`. It never touches the terminal.
-- `view` draws the state into a `Frame`. It only reads.
+Besides the three app methods, `Program::run` holds the raw-mode guard, a reader thread, the signal handlers and the renderer.
 
 The main thread blocks in one place, a channel receiver. The reader thread waits on stdin, the signal pipe and a wake-up pipe together, parses input with `Parser`, and sends events and signals into that channel. Work started by effects sends its messages into the same channel, so nothing wakes the loop by polling on a timer.
 
@@ -83,6 +69,6 @@ The unit of the buffer is a grapheme cluster, not a `char` or a byte, and its wi
 
 ## Terminal lifecycle
 
-`Terminal` enters raw mode and the modes selected in `TerminalOptions` (alternate screen, hidden cursor, mouse, focus reports, bracketed paste) and undoes them when it is dropped, so early returns and `?` restore the terminal too. Restoring is idempotent and reports the first error it hits without skipping the rest of the steps. A panic hook restores the terminal of the panicking thread before the message is printed, so the message lands on the normal screen and not the alternate one. SIGINT, SIGTERM and SIGHUP end the run with an error and the same restore. Ctrl+C typed in raw mode is a key event that goes to the app.
+`Terminal` enters raw mode and the modes selected in `TerminalOptions` (alternate screen, hidden cursor, mouse, focus reports, bracketed paste) and undoes them when it is dropped, so early returns and `?` restore the terminal too. Restoring is idempotent and reports the first error it hits without skipping the rest of the steps. A panic hook restores the terminal of the panicking thread before the message is printed, so the message lands on the normal screen and not the alternate one. SIGINT, SIGTERM and SIGHUP end the run with an error and the same restore (see the loop above).
 
 The tests for all of this run a real child process on a pty and check the terminal modes and the termios settings afterwards; see [testing](testing.md).
