@@ -32,17 +32,20 @@ pub trait Widget {
     fn render(self, area: Rect, buf: &mut Buffer);
 }
 
-/// A widget that needs state that outlives the frame, such as a scroll
-/// position or a selection.
+/// A widget that needs state that outlives the frame, such as a selection.
 ///
-/// The state is a plain value the app owns and passes back each frame;
-/// rendering may update it, for instance to bring the selection into view.
+/// The state is a value the app owns and passes back each frame. It is only
+/// borrowed shared, so a widget can be drawn from `App::view`, which can't
+/// change the app. What the app decides, such as which item is selected,
+/// is plain data changed in `update`. What only drawing can know, such as
+/// how far a list has scrolled to keep the selection in view, is kept in a
+/// `Cell` inside the state, so it is still there next frame.
 pub trait StatefulWidget {
-    /// The state this widget reads and updates.
+    /// The state this widget reads.
     type State;
 
     /// Draws the widget.
-    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State);
+    fn render(self, area: Rect, buf: &mut Buffer, state: &Self::State);
 }
 
 impl Widget for Text<'_> {
