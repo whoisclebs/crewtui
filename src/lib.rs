@@ -7,6 +7,7 @@ mod effects;
 mod frame;
 mod geometry;
 mod input;
+mod layout;
 #[cfg(all(test, unix))]
 mod pty_children;
 #[cfg(unix)]
@@ -29,6 +30,7 @@ pub use effects::{Closed, Sender};
 pub use frame::Frame;
 pub use geometry::Rect;
 pub use input::{Event, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind, Parser};
+pub use layout::{Alignment, Constraint, Edges, Layout};
 pub use render::Renderer;
 #[cfg(unix)]
 pub use runtime::{App, Cmd, Program};
