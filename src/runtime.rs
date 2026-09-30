@@ -561,6 +561,21 @@ mod tests {
         }
     }
 
+    /// Runs a test's driver thread. If it panics, the loop gets a failure so
+    /// the test fails instead of waiting forever for input that won't come.
+    fn spawn_driver<M: Send + 'static>(
+        tx: StdSender<Input<M>>,
+        body: impl FnOnce(&StdSender<Input<M>>) + Send + 'static,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&tx)));
+            if let Err(panic) = outcome {
+                let _ = tx.send(Input::Failed(io::Error::other("a test driver panicked")));
+                std::panic::resume_unwind(panic);
+            }
+        })
+    }
+
     fn key(c: char) -> Input<Msg> {
         Input::Event(Event::Key(KeyEvent {
             code: KeyCode::Char(c),
@@ -602,7 +617,7 @@ mod tests {
         let (tx, rx) = channel();
         let effects = Effects::new(tx.clone());
         let (app, frames) = Counter::with_frames();
-        let handle = thread::spawn(move || {
+        let handle = spawn_driver(tx.clone(), move |tx| {
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             for _ in 0..3 {
                 tx.send(key('+')).unwrap();
@@ -625,7 +640,7 @@ mod tests {
         let (tx, rx) = channel();
         let effects = Effects::new(tx.clone());
         let (app, frames) = Counter::with_frames();
-        let handle = thread::spawn(move || {
+        let handle = spawn_driver(tx.clone(), move |tx| {
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(key('p')).unwrap();
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -664,7 +679,7 @@ mod tests {
         let mut host = FakeHost::new(20, 3);
         let (tx, rx) = channel();
         let effects = Effects::new(tx.clone());
-        let handle = thread::spawn(move || {
+        let handle = spawn_driver(tx.clone(), move |tx| {
             for _ in 0..150 {
                 tx.send(Input::Message(Msg::Up)).unwrap();
                 thread::sleep(Duration::from_millis(1));
@@ -690,7 +705,7 @@ mod tests {
         let (tx, rx) = channel();
         let effects = Effects::new(tx.clone());
         let (app, frames) = Counter::with_frames();
-        let handle = thread::spawn(move || {
+        let handle = spawn_driver(tx.clone(), move |tx| {
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(Input::Signal(Signal::Resize)).unwrap();
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -748,7 +763,7 @@ mod tests {
         let (tx, rx) = channel();
         let effects = Effects::new(tx.clone());
         let (app, frames) = Counter::with_frames();
-        let handle = thread::spawn(move || {
+        let handle = spawn_driver(tx.clone(), move |tx| {
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(Input::Signal(Signal::Continue)).unwrap();
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -855,32 +870,70 @@ mod tests {
 
     #[test]
     fn batch_starts_every_command_and_all_results_arrive() {
-        let app = Scripted::new(|m| match m {
+        let mut seen = 0;
+        let app = Scripted::new(move |m| match m {
             Fx::Start => Cmd::batch([
                 Cmd::perform(|| Fx::Got(1)),
                 Cmd::perform(|| Fx::Got(2)),
-                Cmd::batch([
-                    Cmd::perform(|| Fx::Got(3)),
-                    Cmd::after(Duration::from_millis(80), Fx::Done),
-                ]),
+                Cmd::batch([Cmd::perform(|| Fx::Got(3))]),
             ]),
-            Fx::Done => Cmd::quit(),
-            Fx::Got(_) => Cmd::none(),
+            Fx::Got(_) => {
+                seen += 1;
+                if seen == 3 { Cmd::quit() } else { Cmd::none() }
+            }
+            Fx::Done => Cmd::none(),
         });
         let mut app = drive(app, &mut FakeHost::new(20, 3));
-        assert_eq!(app.log.pop(), Some(Fx::Done));
+        assert_eq!(app.log.remove(0), Fx::Start);
         app.log.sort_by_key(|f| format!("{f:?}"));
-        assert_eq!(app.log, vec![Fx::Got(1), Fx::Got(2), Fx::Got(3), Fx::Start]);
+        assert_eq!(app.log, vec![Fx::Got(1), Fx::Got(2), Fx::Got(3)]);
     }
 
     #[test]
-    fn a_batch_containing_quit_stops_the_program_and_drops_effects_not_yet_started() {
+    fn a_batch_containing_quit_stops_the_program() {
         let app = Scripted::new(|m| match m {
-            Fx::Start => Cmd::batch([Cmd::perform(|| Fx::Done), Cmd::quit()]),
+            Fx::Start => Cmd::batch([Cmd::quit(), Cmd::perform(|| Fx::Done)]),
             _ => Cmd::none(),
         });
         let app = drive(app, &mut FakeHost::new(20, 3));
         assert_eq!(app.log, vec![Fx::Start]);
+    }
+
+    #[test]
+    fn jobs_that_have_not_started_when_the_program_ends_never_run() {
+        // Eight gated jobs fill the pool, so the ninth waits in the queue.
+        let gate = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(AtomicBool::new(false));
+        let (g, r) = (gate.clone(), ran.clone());
+        let app = Scripted::new(move |m| match m {
+            Fx::Start => {
+                let mut cmds: Vec<Cmd<Fx>> = (0..crate::effects::MAX_WORKERS)
+                    .map(|_| {
+                        let g = g.clone();
+                        Cmd::spawn(move |_| {
+                            while !g.load(Ordering::SeqCst) {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                        })
+                    })
+                    .collect();
+                let r = r.clone();
+                cmds.push(Cmd::perform(move || {
+                    r.store(true, Ordering::SeqCst);
+                    Fx::Done
+                }));
+                cmds.push(Cmd::quit());
+                Cmd::batch(cmds)
+            }
+            _ => Cmd::none(),
+        });
+        drive(app, &mut FakeHost::new(20, 3));
+        gate.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a queued job ran after the program ended"
+        );
     }
 
     #[test]
@@ -931,7 +984,7 @@ mod tests {
         });
         app.frames = Some(frames_tx);
         tx.send(Input::Message(Fx::Start)).unwrap();
-        let handle = thread::spawn(move || {
+        let handle = spawn_driver(tx.clone(), move |tx| {
             // The initial frame, then the one the repaint asked for.
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -1001,21 +1054,33 @@ mod tests {
     }
 
     #[test]
-    fn effects_started_by_a_program_are_dropped_when_it_ends() {
-        // A timer far in the future must not keep anything alive or fire.
-        let fired = Arc::new(AtomicBool::new(false));
-        let f = fired.clone();
-        let app = Scripted::new(move |m| match m {
+    fn timers_still_pending_when_the_program_ends_never_fire() {
+        let app = Scripted::new(|m| match m {
             Fx::Start => Cmd::batch([Cmd::after(Duration::from_millis(60), Fx::Done), Cmd::quit()]),
-            _ => {
-                f.store(true, Ordering::SeqCst);
-                Cmd::none()
-            }
+            _ => Cmd::none(),
+        });
+        let (tx, rx) = channel();
+        tx.send(Input::Message(Fx::Start)).unwrap();
+        let effects = Effects::new(tx);
+        event_loop(app, &rx, &effects, &mut FakeHost::new(20, 3), 0).unwrap();
+        drop(effects);
+        thread::sleep(Duration::from_millis(150));
+        // Had the timer fired, its message would be waiting here.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_delay_too_large_to_represent_is_a_timer_that_never_fires() {
+        let app = Scripted::new(|m| match m {
+            Fx::Start => Cmd::batch([
+                Cmd::after(Duration::MAX, Fx::Done),
+                Cmd::after(Duration::from_millis(20), Fx::Got(1)),
+            ]),
+            Fx::Got(_) => Cmd::quit(),
+            Fx::Done => Cmd::none(),
         });
         let app = drive(app, &mut FakeHost::new(20, 3));
-        assert_eq!(app.log, vec![Fx::Start]);
-        thread::sleep(Duration::from_millis(150));
-        assert!(!fired.load(Ordering::SeqCst));
+        assert_eq!(app.log, vec![Fx::Start, Fx::Got(1)]);
     }
 
     #[test]

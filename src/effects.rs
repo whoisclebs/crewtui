@@ -110,7 +110,11 @@ impl Pool {
         state.queue.push_back(job);
         if state.idle > 0 {
             self.wake.notify_one();
-        } else if state.workers < self.max {
+        }
+        // A woken worker is still counted as idle until it takes the lock
+        // again, so `idle` alone can't say whether the queue is covered.
+        // Start another worker whenever there are more jobs than idle ones.
+        if state.queue.len() > state.idle && state.workers < self.max {
             state.workers += 1;
             let pool = Arc::clone(self);
             let started = thread::Builder::new()
@@ -161,6 +165,11 @@ impl Pool {
     #[cfg(test)]
     fn workers(&self) -> usize {
         lock(&self.state).workers
+    }
+
+    #[cfg(test)]
+    fn idle(&self) -> usize {
+        lock(&self.state).idle
     }
 }
 
@@ -310,9 +319,14 @@ impl<M: Send + 'static> Effects<M> {
     }
 
     pub(crate) fn after(&self, delay: Duration, message: M) {
+        // A delay too large to represent, such as `Duration::MAX` used to
+        // mean "never", is a timer that never fires.
+        let Some(at) = Instant::now().checked_add(delay) else {
+            return;
+        };
         let tx = self.tx.clone();
         self.timers.add(
-            Instant::now() + delay,
+            at,
             Box::new(move || {
                 let _ = tx.send(Input::Message(message));
             }),
@@ -382,6 +396,33 @@ mod tests {
             done2.fetch_add(1, Ordering::SeqCst);
         }));
         wait_until("a new worker", || done.load(Ordering::SeqCst) == 5);
+    }
+
+    #[test]
+    fn a_second_job_does_not_wait_behind_a_long_one_while_slots_are_free() {
+        let pool = Pool::new(4, Duration::from_secs(5));
+        // Leave exactly one worker idle.
+        let warm = Arc::new(AtomicBool::new(false));
+        let w = warm.clone();
+        pool.execute(Box::new(move || w.store(true, Ordering::SeqCst)));
+        wait_until("the warm-up job", || warm.load(Ordering::SeqCst));
+        wait_until("the worker to go idle", || pool.idle() == 1);
+
+        let gate = Arc::new(AtomicBool::new(false));
+        let g = gate.clone();
+        pool.execute(Box::new(move || {
+            while !g.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }));
+        let second = Arc::new(AtomicBool::new(false));
+        let s2 = second.clone();
+        pool.execute(Box::new(move || s2.store(true, Ordering::SeqCst)));
+        // The long job still holds one worker; the second must get another.
+        wait_until("the second job to run beside the long one", || {
+            second.load(Ordering::SeqCst)
+        });
+        gate.store(true, Ordering::SeqCst);
     }
 
     #[test]
