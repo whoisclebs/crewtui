@@ -1,8 +1,8 @@
 # Performance
 
-Numbers from `cargo bench`, which runs `benches/frame.rs`. It has no harness and no dependencies: each case is warmed up, then sampled 25 times, and the table shows the median and the fastest sample per frame, plus the bytes the frame wrote to the terminal.
+Numbers from `cargo bench`, which runs `benches/frame.rs`. It has no harness and no dependencies: each case is warmed up, then sampled 25 times, and the table shows the median and the fastest sample per frame, plus the bytes a frame wrote to the terminal on average.
 
-These were taken on a Ryzen 5 7600 under WSL2 with rustc 1.96, on a 200x60 screen (12,000 cells). Treat them as a comparison between rows, not as promises. Run-to-run noise is around 5%.
+These were taken on a Ryzen 5 7600 under WSL2 with rustc 1.96, on a 200x60 screen (12,000 cells). Treat them as a comparison between rows, not as promises. The median and the fastest sample differ by 20 to 30% in some cases on this machine, so a gap smaller than that is noise. Every gap used below to make a decision is larger.
 
 ## Diffing two buffers
 
@@ -12,46 +12,50 @@ Each case draws two scenes on alternate frames, so the renderer always has somet
 |---|---|---|---|
 | (baseline) copy the scene | 102 µs | 104 µs | 0 |
 | (baseline) an empty frame | 96 µs | 26 µs | 0 |
-| identical | 202 µs | 132 µs | 0 |
-| one cell differs | 202 µs | 143 µs | 20 |
-| one line differs | 200 µs | 136 µs | 221 |
-| every cell differs | 274 µs | 280 µs | 13,551 |
-| first frame, repaint everything | 278 µs | 279 µs | 13,565 |
+| identical | 202 µs | 128 µs | 0 |
+| one cell differs | 202 µs | 131 µs | 20 |
+| one line differs | 200 µs | 138 µs | 221 |
+| every cell differs | 274 µs | 273 µs | 13,551 |
+| first frame, repaint everything | 278 µs | 283 µs | 13,565 |
 
-"Cell by cell" walks every cell and compares it with the one in the previous buffer. "Rows skipped first" compares each row as a slice before looking at its cells, and moves on when the two rows are equal.
+"Cell by cell" walks every cell and compares it with the one in the previous buffer. "Rows skipped first" compares each row as a slice before looking at its cells, and moves on when the two rows are equal. The two columns come from separate runs of the same bench, before and after the change.
 
-Skipping rows wins wherever most of the screen stays put, which is nearly every frame of a real app: an unchanged frame goes from 202 to 132 µs, and clearing and comparing an empty screen from 96 to 26 µs. When every cell differs the extra comparison stops at the first cell of each row and the difference is inside the noise. So the renderer skips rows. Dirty rectangles and tracking which cells a widget touched were not tried: with the row check the diff of an unchanged frame adds about 28 µs to the 104 µs it takes to put the scene in the buffer, and the rest of a real frame is drawing.
+Skipping rows wins wherever most of the screen stays put, which is nearly every frame of a real app: an unchanged frame goes from 202 to 128 µs, and clearing and comparing an empty screen from 96 to 26 µs. When every cell differs the extra comparison stops at the first cell of each row and the difference is inside the noise. So the renderer skips rows. Dirty rectangles and tracking which cells a widget touched were not tried. An unchanged frame costs 128 µs against 104 µs for copying the scene into the buffer, and part of that difference is clearing the buffer, which the empty-frame case puts at 26 µs. That leaves the diff itself small next to drawing.
 
 The bytes column is the same in both. It is what makes a frame cheap for the terminal: one changed cell writes 20 bytes, one line 221, and a full repaint 13.5 KB.
 
 ## A typical layout
 
-A header, a bordered list of 80 files beside a wrapped paragraph, an input, a progress bar and a status line, drawn with `Layout` on every frame.
+A header, a bordered list of 80 files beside a wrapped paragraph, an input, a progress bar and a status line, drawn with `Layout` on every frame. The list items and the text are built once, outside the timed loop.
 
 | Case | Cell by cell | Rows skipped first | Bytes |
 |---|---|---|---|
-| the selection moves | 440 µs | 396 µs | 127 |
-| nothing changes | 445 µs | 382 µs | 0 |
-| repaint everything | 496 µs | 484 µs | 7,325 |
+| the selection moves | 440 µs | 386 µs | 127 |
+| nothing changes | 445 µs | 365 µs | 0 |
+| repaint everything | 496 µs | 516 µs | 7,325 |
 
 Most of the time is the widgets drawing into the buffer, not the diff. At 400 µs a frame the app has 40 times more room than a 60 fps cap asks for.
 
 ## A long transcript
 
-`History` at 200x60, wrapped by word, with 20,000 entries of about one to three rows each.
+`History` at 200x60, wrapped by word, with 20,000 entries. Most are a line or two, and one in five is long enough to wrap into four or five rows.
 
 | Case | Time | Bytes |
 |---|---|---|
-| steady frame | 464 µs | 0 |
-| a streamed token appended to the last entry | 529 µs | 158 |
-| scroll by one row, 5,000 rows up | 583 µs | 2,285 |
-| the width changes on every frame | 736 µs | 10,247 |
-| the same steady frame with 200 entries | 456 µs | 0 |
-| steady frame plus the numbers for a scrollbar | 469 µs | 0 |
+| steady frame | 535 µs | 0 |
+| the same with 200 entries | 562 µs | 0 |
+| steady frame, with a scrollbar drawn | 559 µs | 0 |
+| a streamed token, a new line every 8 tokens | 404 µs | 478 |
+| a streamed token, all on one growing line | 608 µs | 241 |
+| scroll by one row, 5,000 rows up | 678 µs | 7,714 |
+| the width changes on every frame | 792 µs | 11,592 |
+| the width changes, and the scrollbar wants the total | 75 ms | 12,049 |
 
-The steady frame costs the same with 200 entries as with 20,000, which is the point of keeping the row count of each entry: a frame wraps what is on screen and nothing else. A streamed token costs about 65 µs more than a steady frame, and writes 158 bytes instead of redrawing the transcript. A width change is the expensive case, and it is still under a millisecond. Counting the rows of the whole transcript, which a scrollbar wants, is paid when the width changes and is cached after that.
+The steady frame costs the same with 200 entries as with 20,000, which is the point of keeping the row count of every line of every entry: a frame wraps what is on screen and nothing else. The frame tests in `src/widgets/history.rs` check the same thing without a clock, by counting how many entries and lines a frame looks at, so a regression fails a test instead of showing up as a number nobody reads.
 
-The frame tests in `src/widgets/history.rs` check the same thing without a clock, by counting how many entries and lines a frame looks at. That way a regression fails a test instead of showing up as a number nobody reads.
+A streamed token writes a few hundred bytes on average instead of redrawing the transcript. The two streaming rows are not the same case. With a newline every few tokens the last line stays short. With everything on one line, the line being streamed is measured again on each token, so the frame gets slower as the line grows: on a scratch copy of this bench, 4,000 tokens into one line a frame took about 1.1 ms instead of 0.6. Streamed messages usually have newlines, but a paragraph of 30 lines that arrives as one line does not.
+
+A width change is the expensive case. The frame itself is under a millisecond, because only what is on screen has to be counted again. The last row is different. A scrollbar needs the total number of rows, and after a width change that means counting every entry again: 75 ms for 20,000 entries here. It is paid once per width, and cached after that, but an app that drags its window edge with a scrollbar on a very long transcript will feel it. Making that cheaper is tracked in #54.
 
 ## Running it
 
@@ -59,4 +63,4 @@ The frame tests in `src/widgets/history.rs` check the same thing without a clock
 cargo bench
 ```
 
-`cargo test` also builds the bench and runs it with no arguments, where it exits at once.
+`cargo test` does not build or run it. `cargo test --benches` builds it and runs it with no arguments, where it exits at once.

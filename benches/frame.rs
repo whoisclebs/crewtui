@@ -3,14 +3,14 @@
 //!
 //! Run with `cargo bench`. There is no harness: each case is run for a while
 //! to warm up, then sampled, and the table shows the median and the fastest
-//! sample per frame, and how many bytes the frame wrote to the terminal.
+//! sample per frame, and the bytes a frame wrote to the terminal on average.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use crewtui::widgets::{
     Block, History, HistoryState, Input, InputState, List, ListState, Paragraph, Progress,
-    Scrollbar, Widget, Wrap,
+    Scrollbar, Wrap,
 };
 use crewtui::{Buffer, Color, Constraint, Layout, Rect, Renderer, Style};
 
@@ -55,16 +55,15 @@ fn measure(mut case: Case) -> Result {
         per_sample *= 2;
     }
     let mut samples = Vec::new();
-    let mut bytes = 0;
+    let mut all_bytes = 0;
     for _ in 0..25 {
         let start = Instant::now();
-        let mut total = 0;
         for _ in 0..per_sample {
-            total += black_box((case.frame)());
+            all_bytes += black_box((case.frame)());
         }
         samples.push(start.elapsed() / per_sample as u32);
-        bytes = total / per_sample;
     }
+    let bytes = all_bytes / (25 * per_sample);
     samples.sort();
     Result {
         name: case.name,
@@ -172,9 +171,13 @@ fn diffs() -> Vec<Result> {
 
 /// The pieces of a typical screen: a header, a list beside a transcript, an
 /// input, a progress bar and a status line.
-fn layout_frame(renderer: &mut Renderer, selected: usize, tick: usize) -> usize {
-    let items: Vec<String> = (0..80).map(|i| format!("file_{i}.rs")).collect();
-    let text = "The quick brown fox jumps over the lazy dog. ".repeat(40);
+fn layout_frame(
+    renderer: &mut Renderer,
+    items: &[String],
+    text: &str,
+    selected: usize,
+    tick: usize,
+) -> usize {
     let mut list_state = ListState::new();
     list_state.select(Some(selected));
     let input = InputState::with_text("explain the renderer to me");
@@ -200,7 +203,7 @@ fn layout_frame(renderer: &mut Renderer, selected: usize, tick: usize) -> usize 
                 &list_state,
             );
             frame.render_widget(
-                Paragraph::new(text.as_str())
+                Paragraph::new(text)
                     .block(Block::bordered().title("chat"))
                     .wrap(Wrap::Word),
                 main,
@@ -216,36 +219,44 @@ fn layout_frame(renderer: &mut Renderer, selected: usize, tick: usize) -> usize 
 }
 
 fn layouts() -> Vec<Result> {
+    let items: Vec<String> = (0..80).map(|i| format!("file_{i}.rs")).collect();
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(40);
     let cases = vec![
         case("layout: selection moves", {
+            let (items, text) = (items.clone(), text.clone());
             let mut renderer = Renderer::new(WIDTH, HEIGHT);
             let mut i = 0;
             move || {
                 i += 1;
-                layout_frame(&mut renderer, i % 40, 0)
+                layout_frame(&mut renderer, &items, &text, i % 40, 0)
             }
         }),
         case("layout: nothing changes", {
+            let (items, text) = (items.clone(), text.clone());
             let mut renderer = Renderer::new(WIDTH, HEIGHT);
-            move || layout_frame(&mut renderer, 3, 0)
+            move || layout_frame(&mut renderer, &items, &text, 3, 0)
         }),
         case("layout: repaint everything", {
+            let (items, text) = (items.clone(), text.clone());
             let mut renderer = Renderer::new(WIDTH, HEIGHT);
             move || {
                 renderer.invalidate();
-                layout_frame(&mut renderer, 3, 0)
+                layout_frame(&mut renderer, &items, &text, 3, 0)
             }
         }),
     ];
     cases.into_iter().map(measure).collect()
 }
 
+/// Entries of a line or two, and one in five long enough to wrap several
+/// times at this width.
 fn transcript(entries: usize) -> HistoryState {
     let mut state = HistoryState::new();
     for i in 0..entries {
+        let filler = if i % 5 == 0 { 40 } else { i % 7 };
         state.push(format!(
             "entry {i}: a line of the transcript with enough words in it to wrap now and then, {}",
-            "lorem ipsum ".repeat(i % 7)
+            "lorem ipsum ".repeat(filler)
         ));
     }
     state
@@ -261,13 +272,30 @@ fn history_frame(renderer: &mut Renderer, state: &HistoryState, area: Rect) -> u
 
 fn histories() -> Vec<Result> {
     let area = Rect::new(0, 0, WIDTH - 1, HEIGHT);
+    let bar = Rect::new(WIDTH - 1, 0, 1, HEIGHT);
     let cases = vec![
         case("history 20,000: steady frame", {
             let state = transcript(20_000);
             let mut renderer = Renderer::new(WIDTH, HEIGHT);
             move || history_frame(&mut renderer, &state, area)
         }),
-        case("history 20,000: streamed token", {
+        case("history 200: steady frame", {
+            let state = transcript(200);
+            let mut renderer = Renderer::new(WIDTH, HEIGHT);
+            move || history_frame(&mut renderer, &state, area)
+        }),
+        case("history 20,000: streamed token, short lines", {
+            let mut state = transcript(20_000);
+            state.push("agent:");
+            let mut renderer = Renderer::new(WIDTH, HEIGHT);
+            let mut n = 0;
+            move || {
+                n += 1;
+                state.append(if n % 8 == 0 { "token\n" } else { "token " });
+                history_frame(&mut renderer, &state, area)
+            }
+        }),
+        case("history 20,000: streamed token, one growing line", {
             let mut state = transcript(20_000);
             state.push("agent:");
             let mut renderer = Renderer::new(WIDTH, HEIGHT);
@@ -303,26 +331,44 @@ fn histories() -> Vec<Result> {
                 history_frame(&mut renderer, &state, Rect::new(0, 0, w - 1, HEIGHT))
             }
         }),
-        case("history 200: steady frame", {
-            let state = transcript(200);
-            let mut renderer = Renderer::new(WIDTH, HEIGHT);
-            move || history_frame(&mut renderer, &state, area)
-        }),
-        case("history 20,000: scrollbar numbers", {
+        case("history 20,000: steady frame with a scrollbar", {
             let state = transcript(20_000);
             let mut renderer = Renderer::new(WIDTH, HEIGHT);
-            history_frame(&mut renderer, &state, area);
-            let bar = Rect::new(WIDTH - 1, 0, 1, HEIGHT);
             move || {
                 renderer
                     .draw_frame(|frame| {
                         frame.render_stateful_widget(History::new(), area, &state);
-                        let mut buf = Buffer::new(bar);
-                        Scrollbar::vertical()
-                            .content(state.content_rows())
-                            .viewport(state.viewport_rows())
-                            .position(state.position())
-                            .render(bar, &mut buf);
+                        frame.render_widget(
+                            Scrollbar::vertical()
+                                .content(state.content_rows())
+                                .viewport(state.viewport_rows())
+                                .position(state.position()),
+                            bar,
+                        );
+                    })
+                    .len()
+            }
+        }),
+        case("history 20,000: width change, then the scrollbar", {
+            let state = transcript(20_000);
+            let mut renderer = Renderer::new(WIDTH, HEIGHT);
+            let mut narrow = false;
+            move || {
+                narrow = !narrow;
+                let w = if narrow { WIDTH - 20 } else { WIDTH };
+                renderer.resize(w, HEIGHT);
+                let area = Rect::new(0, 0, w - 1, HEIGHT);
+                let bar = Rect::new(w - 1, 0, 1, HEIGHT);
+                renderer
+                    .draw_frame(|frame| {
+                        frame.render_stateful_widget(History::new(), area, &state);
+                        frame.render_widget(
+                            Scrollbar::vertical()
+                                .content(state.content_rows())
+                                .viewport(state.viewport_rows())
+                                .position(state.position()),
+                            bar,
+                        );
                     })
                     .len()
             }
@@ -332,7 +378,7 @@ fn histories() -> Vec<Result> {
 }
 
 fn main() {
-    // `cargo test` runs bench targets too, with `--bench` absent; there is
+    // `cargo test --benches` runs this target without `--bench`; there is
     // nothing to check in that case.
     if !std::env::args().any(|a| a == "--bench") {
         return;
