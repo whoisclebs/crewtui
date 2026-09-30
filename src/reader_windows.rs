@@ -4,7 +4,9 @@
 //! With virtual terminal input the console reports every key as the escape
 //! sequence a Unix terminal would send, one character to a key event. Those
 //! characters are turned back into bytes and go through the same
-//! [`Parser`] as on Unix. Resizes arrive as their own records.
+//! [`Parser`] as on Unix. A resize is noticed from its own record, and by
+//! looking at the window size when the wait times out, because the console
+//! only reports a change of the screen buffer and not of the window on it.
 #![allow(unsafe_code)]
 
 use std::io;
@@ -18,15 +20,13 @@ use windows_sys::Win32::System::Console::{
     GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW,
     WINDOW_BUFFER_SIZE_EVENT,
 };
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
-};
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
 
 use crate::Parser;
 use crate::runtime::Input;
 use crate::signal::Signal;
-use crate::signals::Signals;
-use crate::terminal::Handle;
+use crate::signals;
+use crate::terminal::{Handle, window_size};
 use crate::utf16::Utf16Decoder;
 
 /// How long a lone Esc waits to see whether a sequence follows.
@@ -34,19 +34,23 @@ pub(crate) const ESCAPE_TIMEOUT_MS: u32 = 50;
 /// How long a paste may sit idle before it is given up on.
 const PASTE_IDLE_MS: u32 = 1000;
 const RECORDS: usize = 128;
+/// How often the window size is looked at when nothing else wakes the wait.
+const SIZE_POLL_MS: u32 = 250;
 
 /// The reader thread. Dropping it stops the thread and waits for it.
 pub(crate) struct InputReader {
     wake: Handle,
-    thread: Option<JoinHandle<Option<Signals>>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl InputReader {
-    /// Starts reading `input`, and the events of `signals` if given, sending
-    /// to `tx`.
+    /// Starts reading `input`, sending to `tx`. It also passes on the signals
+    /// that set `signal_event`, and a change of the size of the window on
+    /// `output`.
     pub(crate) fn spawn<M: Send + 'static>(
         input: Handle,
-        signals: Option<Signals>,
+        output: Handle,
+        signal_event: Option<Handle>,
         tx: Sender<Input<M>>,
         keyboard_enhancement: bool,
     ) -> io::Result<InputReader> {
@@ -62,20 +66,22 @@ impl InputReader {
             .spawn(move || {
                 let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
                     read_loop(
-                        input,
-                        wake,
-                        signals,
+                        &Handles {
+                            input,
+                            output,
+                            wake,
+                            signal_event,
+                        },
                         &tx,
                         ESCAPE_TIMEOUT_MS,
                         keyboard_enhancement,
-                    )
+                    );
                 }));
-                outcome.unwrap_or_else(|_| {
+                if outcome.is_err() {
                     // Other senders keep the channel open, so a silent death
                     // would leave the loop waiting forever.
                     let _ = tx.send(Input::Failed(io::Error::other("the input thread panicked")));
-                    None
-                })
+                }
             })
             .inspect_err(|_| {
                 // SAFETY: closes the event created above, once.
@@ -86,23 +92,12 @@ impl InputReader {
             thread: Some(thread),
         })
     }
-
-    /// Stops the thread and hands back the signal handler it was holding,
-    /// so the caller decides when it is uninstalled.
-    pub(crate) fn finish(mut self) -> Option<Signals> {
-        self.wake();
-        self.thread.take().and_then(|t| t.join().ok()).flatten()
-    }
-
-    fn wake(&self) {
-        // SAFETY: the event is open until `drop`.
-        unsafe { SetEvent(self.wake.0) };
-    }
 }
 
 impl Drop for InputReader {
     fn drop(&mut self) {
-        self.wake();
+        // SAFETY: the event is open until the end of this function.
+        unsafe { SetEvent(self.wake.0) };
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -112,21 +107,32 @@ impl Drop for InputReader {
     }
 }
 
-/// Runs until told to stop or the input fails, then returns the signal
-/// handler rather than dropping it.
-fn read_loop<M>(
+struct Handles {
     input: Handle,
+    output: Handle,
     wake: Handle,
-    mut signals: Option<Signals>,
+    signal_event: Option<Handle>,
+}
+
+/// Runs until told to stop or the input fails.
+fn read_loop<M>(
+    h: &Handles,
     tx: &Sender<Input<M>>,
     escape_timeout_ms: u32,
     keyboard_enhancement: bool,
-) -> Option<Signals> {
+) {
     let mut parser = Parser::new().with_keyboard_enhancement(keyboard_enhancement);
     let mut decoder = Utf16Decoder::default();
     // When input last arrived. The Esc and paste timeouts count from here.
     let mut last_input = Instant::now();
+    let mut size = window_size(h.output).ok();
     let mut records: Vec<INPUT_RECORD> = vec![unsafe_zeroed_record(); RECORDS];
+    // The wake event goes first. The wait returns the lowest handle that is
+    // set, so a stream of input can't keep it from being noticed.
+    let mut handles = vec![h.wake.0, h.input.0];
+    if let Some(s) = h.signal_event {
+        handles.push(s.0);
+    }
     loop {
         let limit = if parser.is_pasting() {
             Some(PASTE_IDLE_MS)
@@ -135,84 +141,89 @@ fn read_loop<M>(
         } else {
             None
         };
-        let timeout = limit.map_or(INFINITE, |limit| {
+        let left = limit.map(|limit| {
             let left = Duration::from_millis(u64::from(limit)).saturating_sub(last_input.elapsed());
             // Round up, so a wake-up just short of the limit doesn't spin.
             left.as_micros()
                 .div_ceil(1000)
-                .min(u128::from(INFINITE - 1)) as u32
+                .min(u128::from(SIZE_POLL_MS)) as u32
         });
-        let mut handles = vec![input.0, wake.0];
-        if let Some(s) = &signals {
-            handles.push(s.event().0);
-        }
+        let timeout = left.map_or(SIZE_POLL_MS, |left| left.min(SIZE_POLL_MS));
         // SAFETY: the pointer and count come from a live vector of handles
         // that stay open while this waits.
         let waited =
             unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout) };
         if waited == WAIT_FAILED {
             let _ = tx.send(Input::Failed(io::Error::last_os_error()));
-            return signals;
+            return;
         }
         if waited == WAIT_TIMEOUT {
-            let event = if parser.is_pasting() {
-                parser.abort_paste()
-            } else {
-                parser.escape_timeout()
-            };
-            for event in event
-                .into_iter()
-                .chain(std::iter::from_fn(|| parser.next_event()))
-            {
-                if tx.send(Input::Event(event)).is_err() {
-                    return signals;
+            let expired =
+                limit.is_some_and(|l| last_input.elapsed() >= Duration::from_millis(u64::from(l)));
+            if expired {
+                let event = if parser.is_pasting() {
+                    parser.abort_paste()
+                } else {
+                    parser.escape_timeout()
+                };
+                for event in event
+                    .into_iter()
+                    .chain(std::iter::from_fn(|| parser.next_event()))
+                {
+                    if tx.send(Input::Event(event)).is_err() {
+                        return;
+                    }
                 }
             }
-            continue;
-        }
-        match waited - WAIT_OBJECT_0 {
-            0 => {
-                let mut bytes = Vec::new();
-                let mut resized = false;
-                match read_records(input, &mut records, &mut decoder, &mut bytes, &mut resized) {
-                    Ok(()) => {}
-                    Err(e) => {
+        } else {
+            match waited - WAIT_OBJECT_0 {
+                0 => return,
+                1 => {
+                    let mut bytes = Vec::new();
+                    let mut resized = false;
+                    if let Err(e) = read_records(
+                        h.input,
+                        &mut records,
+                        &mut decoder,
+                        &mut bytes,
+                        &mut resized,
+                    ) {
                         let _ = tx.send(Input::Failed(e));
-                        return signals;
+                        return;
                     }
-                }
-                if resized && tx.send(Input::Signal(Signal::Resize)).is_err() {
-                    return signals;
-                }
-                if !bytes.is_empty() {
-                    last_input = Instant::now();
-                    parser.feed(&bytes);
-                    while let Some(event) = parser.next_event() {
-                        if tx.send(Input::Event(event)).is_err() {
-                            return signals;
-                        }
+                    if resized {
+                        // Forget the size, so the check below reports it.
+                        size = None;
                     }
-                }
-            }
-            1 => return signals,
-            2 => {
-                if let Some(s) = signals.as_mut() {
-                    match s.pending() {
-                        Ok(list) => {
-                            for signal in list {
-                                if tx.send(Input::Signal(signal)).is_err() {
-                                    return signals;
-                                }
+                    if !bytes.is_empty() {
+                        last_input = Instant::now();
+                        parser.feed(&bytes);
+                        while let Some(event) = parser.next_event() {
+                            if tx.send(Input::Event(event)).is_err() {
+                                return;
                             }
                         }
-                        Err(e) => {
-                            let _ = tx.send(Input::Failed(e));
-                            return signals;
+                    }
+                }
+                2 => {
+                    for signal in signals::take_pending() {
+                        if tx.send(Input::Signal(signal)).is_err() {
+                            return;
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
+        }
+        // A resize record and a change of the window that made no record both
+        // show up here.
+        if let Ok(now) = window_size(h.output) {
+            if size != Some(now) {
+                size = Some(now);
+                if tx.send(Input::Signal(Signal::Resize)).is_err() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -250,24 +261,115 @@ fn read_records(
         if read == 0 {
             break;
         }
-        for record in &records[..read as usize] {
-            match u32::from(record.EventType) {
-                KEY_EVENT => {
-                    // SAFETY: the event type says which member is valid.
-                    let key = unsafe { record.Event.KeyEvent };
-                    // SAFETY: both members of the union are integers.
-                    let unit = unsafe { key.uChar.UnicodeChar };
-                    if key.bKeyDown != 0 && unit != 0 {
-                        for _ in 0..key.wRepeatCount.max(1) {
-                            decoder.push(unit, bytes);
-                        }
-                    }
-                }
-                WINDOW_BUFFER_SIZE_EVENT => *resized = true,
-                _ => {}
-            }
-        }
+        collect(&records[..read as usize], decoder, bytes, resized);
         queued = queued.saturating_sub(read);
     }
     Ok(())
+}
+
+/// Turns records into bytes for the parser. Only key presses count. In
+/// virtual terminal input mode, Ctrl+Space arrives as a press with no
+/// character and no virtual key code, and it is the NUL that Unix sends. A
+/// press with no character and a key code is a modifier or a function key on
+/// its own, and carries nothing.
+fn collect(
+    records: &[INPUT_RECORD],
+    decoder: &mut Utf16Decoder,
+    bytes: &mut Vec<u8>,
+    resized: &mut bool,
+) {
+    for record in records {
+        match u32::from(record.EventType) {
+            KEY_EVENT => {
+                // SAFETY: the event type says which member is valid.
+                let key = unsafe { record.Event.KeyEvent };
+                // SAFETY: both members of the union are integers.
+                let unit = unsafe { key.uChar.UnicodeChar };
+                if key.bKeyDown == 0 || (unit == 0 && key.wVirtualKeyCode != 0) {
+                    continue;
+                }
+                for _ in 0..key.wRepeatCount.max(1) {
+                    decoder.push(unit, bytes);
+                }
+            }
+            WINDOW_BUFFER_SIZE_EVENT => *resized = true,
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Console::KEY_EVENT_RECORD;
+
+    fn key(unit: u16, vk: u16, down: bool, repeat: u16) -> INPUT_RECORD {
+        let mut record = unsafe_zeroed_record();
+        record.EventType = KEY_EVENT as u16;
+        let mut event: KEY_EVENT_RECORD = unsafe { std::mem::zeroed() };
+        event.bKeyDown = i32::from(down);
+        event.wRepeatCount = repeat;
+        event.wVirtualKeyCode = vk;
+        event.uChar.UnicodeChar = unit;
+        record.Event.KeyEvent = event;
+        record
+    }
+
+    fn run(records: &[INPUT_RECORD]) -> (Vec<u8>, bool) {
+        let mut decoder = Utf16Decoder::default();
+        let (mut bytes, mut resized) = (Vec::new(), false);
+        collect(records, &mut decoder, &mut bytes, &mut resized);
+        (bytes, resized)
+    }
+
+    #[test]
+    fn key_presses_become_bytes_and_releases_do_not() {
+        let (bytes, _) = run(&[
+            key(u16::from(b'a'), 0x41, true, 1),
+            key(u16::from(b'a'), 0x41, false, 1),
+        ]);
+        assert_eq!(bytes, b"a");
+    }
+
+    #[test]
+    fn a_repeat_count_repeats_the_character() {
+        let (bytes, _) = run(&[key(u16::from(b'x'), 0x58, true, 3)]);
+        assert_eq!(bytes, b"xxx");
+        let (bytes, _) = run(&[key(u16::from(b'x'), 0x58, true, 0)]);
+        assert_eq!(bytes, b"x");
+    }
+
+    #[test]
+    fn the_units_of_a_surrogate_pair_are_joined_across_records() {
+        // U+1F600, as the console delivers it: one unit per record.
+        let (bytes, _) = run(&[key(0xD83D, 0, true, 1), key(0xDE00, 0, true, 1)]);
+        assert_eq!(bytes, "\u{1F600}".as_bytes());
+    }
+
+    #[test]
+    fn ctrl_space_is_a_nul_and_a_bare_modifier_is_nothing() {
+        // Ctrl+Space: no character, no key code.
+        let (bytes, _) = run(&[key(0, 0, true, 1)]);
+        assert_eq!(bytes, [0]);
+        // Shift on its own: no character, but a key code.
+        let (bytes, _) = run(&[key(0, 0x10, true, 1)]);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn a_buffer_size_record_says_the_window_changed() {
+        let mut record = unsafe_zeroed_record();
+        record.EventType = WINDOW_BUFFER_SIZE_EVENT as u16;
+        let (bytes, resized) = run(&[record]);
+        assert!(bytes.is_empty());
+        assert!(resized);
+    }
+
+    #[test]
+    fn other_records_are_ignored() {
+        let mut record = unsafe_zeroed_record();
+        record.EventType = 0x0010; // FOCUS_EVENT
+        let (bytes, resized) = run(&[record]);
+        assert!(bytes.is_empty() && !resized);
+    }
 }

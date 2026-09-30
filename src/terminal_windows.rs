@@ -331,6 +331,11 @@ impl Terminal {
     pub(crate) fn input_handle(&self) -> Handle {
         self.state.input
     }
+
+    /// The handle the size of the window is read from.
+    pub(crate) fn output_handle(&self) -> Handle {
+        self.state.output
+    }
 }
 
 impl Write for Terminal {

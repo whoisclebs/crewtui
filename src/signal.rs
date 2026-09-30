@@ -9,13 +9,14 @@ pub enum Signal {
     /// SIGINT, sent from outside; on Windows, Ctrl+Break. Typing Ctrl+C in
     /// raw mode doesn't produce it; that arrives as a key event.
     Interrupt,
-    /// SIGTERM; on Windows, the system shutting down or the user logging off.
+    /// SIGTERM; on Windows, the system shutting down or the user logging off,
+    /// which Windows only reports to services.
     Terminate,
     /// SIGHUP, for example when the terminal window closes; on Windows, the
     /// console window being closed.
     Hangup,
-    /// SIGWINCH: the terminal was resized. On Windows, the console buffer
-    /// changed size.
+    /// SIGWINCH: the terminal was resized. On Windows, the console buffer or
+    /// the window on it changed size.
     Resize,
     /// SIGCONT: the process resumed after being stopped.
     Continue,

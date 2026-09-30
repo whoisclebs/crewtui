@@ -3,12 +3,16 @@
 //! The system runs the handler on a thread of its own, so it only records
 //! what happened and sets an event. The input reader waits on that event
 //! next to the console's input and turns it back into signals.
+//!
+//! The event is created once for the process and never closed. The handler
+//! can be running on the system's thread while [`Signals`] is dropped, and
+//! removing a handler does not wait for it, so an event that could be closed
+//! and its value reused would be signalled by mistake.
 #![allow(unsafe_code)]
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
     SetConsoleCtrlHandler,
@@ -34,26 +38,71 @@ unsafe extern "system" fn handler(ctrl_type: u32) -> i32 {
         _ => return 0,
     };
     PENDING.fetch_or(bit, Ordering::SeqCst);
-    let event: HANDLE = EVENT.load(Ordering::SeqCst);
+    let event = EVENT.load(Ordering::SeqCst);
     if !event.is_null() {
-        // SAFETY: `event` is the handle `install` created, and it is only
-        // closed after this handler is removed.
+        // SAFETY: `event` was created by `event` and is never closed.
         unsafe { SetEvent(event) };
     }
     if process_ends {
         // The system ends the process when this returns. Give the loop the
-        // time it needs to restore the console first.
+        // time it needs to restore the console first. If the program exits
+        // sooner, the process ends sooner.
         // SAFETY: only waits.
         unsafe { Sleep(4000) };
     }
     1
 }
 
-/// The handler for console control events, and the event it signals. Only
-/// one can exist per process.
+/// The event the handler sets, created on first use.
+pub(crate) fn event() -> io::Result<Handle> {
+    let current = EVENT.load(Ordering::SeqCst);
+    if !current.is_null() {
+        return Ok(Handle(current));
+    }
+    // SAFETY: an automatic-reset event with no name and no security
+    // attributes.
+    let created = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+    if created.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    match EVENT.compare_exchange(
+        std::ptr::null_mut(),
+        created,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ) {
+        Ok(_) => Ok(Handle(created)),
+        // Another thread was first. Its event is the one in use, and this
+        // one is closed again.
+        Err(existing) => {
+            // SAFETY: closes the event created above, which nobody has seen.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(created) };
+            Ok(Handle(existing))
+        }
+    }
+}
+
+/// Signals that arrived since the last call. Never blocks.
+pub(crate) fn take_pending() -> Vec<Signal> {
+    let bits = PENDING.swap(0, Ordering::SeqCst);
+    let mut out = Vec::new();
+    for (bit, signal) in [
+        (INTERRUPT, Signal::Interrupt),
+        (TERMINATE, Signal::Terminate),
+        (HANGUP, Signal::Hangup),
+    ] {
+        if bits & bit != 0 {
+            out.push(signal);
+        }
+    }
+    out
+}
+
+/// The handler for console control events. Only one can exist per process.
+/// Dropping it uninstalls the handler.
 #[derive(Debug)]
 pub(crate) struct Signals {
-    event: Handle,
+    _private: (),
 }
 
 impl Signals {
@@ -65,60 +114,25 @@ impl Signals {
                 "signal handlers are already installed",
             ));
         }
-        // SAFETY: an automatic-reset event with no name and no security
-        // attributes.
-        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
-        if event.is_null() {
+        if let Err(e) = event() {
             INSTALLED.store(false, Ordering::SeqCst);
-            return Err(io::Error::last_os_error());
+            return Err(e);
         }
         PENDING.store(0, Ordering::SeqCst);
-        EVENT.store(event, Ordering::SeqCst);
         // SAFETY: `handler` has the signature the system calls it with.
         if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
             let err = io::Error::last_os_error();
-            EVENT.store(std::ptr::null_mut(), Ordering::SeqCst);
-            // SAFETY: closes the event created above, once.
-            unsafe { CloseHandle(event) };
             INSTALLED.store(false, Ordering::SeqCst);
             return Err(err);
         }
-        Ok(Signals {
-            event: Handle(event),
-        })
-    }
-
-    /// The event that is set when a signal arrived.
-    pub(crate) fn event(&self) -> Handle {
-        self.event
-    }
-
-    /// Signals that arrived since the last call. Never blocks.
-    pub(crate) fn pending(&mut self) -> io::Result<Vec<Signal>> {
-        let bits = PENDING.swap(0, Ordering::SeqCst);
-        let mut out = Vec::new();
-        for (bit, signal) in [
-            (INTERRUPT, Signal::Interrupt),
-            (TERMINATE, Signal::Terminate),
-            (HANGUP, Signal::Hangup),
-        ] {
-            if bits & bit != 0 {
-                out.push(signal);
-            }
-        }
-        Ok(out)
+        Ok(Signals { _private: () })
     }
 }
 
 impl Drop for Signals {
     fn drop(&mut self) {
-        // SAFETY: removes the handler installed above, then closes the event
-        // it used, once.
-        unsafe {
-            SetConsoleCtrlHandler(Some(handler), 0);
-            EVENT.store(std::ptr::null_mut(), Ordering::SeqCst);
-            CloseHandle(self.event.0);
-        }
+        // SAFETY: removes the handler installed above.
+        unsafe { SetConsoleCtrlHandler(Some(handler), 0) };
         INSTALLED.store(false, Ordering::SeqCst);
     }
 }
@@ -132,28 +146,28 @@ mod tests {
     // The handler and its state are per process, so tests take turns.
     static TURN: Mutex<()> = Mutex::new(());
 
-    fn is_set(signals: &Signals) -> bool {
-        // SAFETY: the event is open while `signals` is alive.
-        unsafe { WaitForSingleObject(signals.event().0, 0) == 0 }
+    fn is_set() -> bool {
+        // SAFETY: the event is never closed.
+        unsafe { WaitForSingleObject(event().unwrap().0, 0) == 0 }
     }
 
     #[test]
     fn a_control_event_becomes_a_signal_and_sets_the_event() {
         let _turn = TURN.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut signals = Signals::install().unwrap();
-        assert!(!is_set(&signals));
+        let _signals = Signals::install().unwrap();
+        assert!(!is_set());
         // SAFETY: what the system does when the user presses Ctrl+C.
         assert_eq!(unsafe { handler(CTRL_C_EVENT) }, 1);
-        assert!(is_set(&signals));
-        assert_eq!(signals.pending().unwrap(), [Signal::Interrupt]);
-        assert_eq!(signals.pending().unwrap(), []);
+        assert!(is_set());
+        assert_eq!(take_pending(), [Signal::Interrupt]);
+        assert_eq!(take_pending(), []);
         // SAFETY: as above, for Ctrl+Break.
         unsafe { handler(CTRL_BREAK_EVENT) };
-        assert_eq!(signals.pending().unwrap(), [Signal::Interrupt]);
+        assert_eq!(take_pending(), [Signal::Interrupt]);
         // An event that is not one of ours is left to the next handler.
         // SAFETY: as above.
         assert_eq!(unsafe { handler(99) }, 0);
-        assert_eq!(signals.pending().unwrap(), []);
+        assert_eq!(take_pending(), []);
     }
 
     #[test]
@@ -163,8 +177,15 @@ mod tests {
         let err = Signals::install().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         drop(first);
-        let mut again = Signals::install().unwrap();
+        let _again = Signals::install().unwrap();
         // What arrived for the old handler is not delivered to the new one.
-        assert_eq!(again.pending().unwrap(), []);
+        assert_eq!(take_pending(), []);
+    }
+
+    #[test]
+    fn the_event_is_the_same_for_the_whole_process() {
+        let a = event().unwrap();
+        let b = event().unwrap();
+        assert_eq!(a.0, b.0);
     }
 }

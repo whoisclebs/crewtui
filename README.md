@@ -80,7 +80,7 @@ cargo run --release --example agent -- --stress
 
 ## Status
 
-Version 0.1, not published yet. It runs on Unix, where Linux is what it is developed and tested on, and on the Windows console (Windows 10 1809 or later). The Windows backend compiles and its portable tests run in CI, but the pty tests that drive a whole program are Unix only, so it has had less testing. The API can still change before 1.0.
+Version 0.1, not published yet. It runs on Unix, where Linux is what it is developed and tested on, and on the Windows console (Windows 10 or later, where the console understands virtual terminal sequences). The Windows backend compiles and its portable tests run in CI, but the pty tests that drive a whole program are Unix only, so it has had less testing. The API can still change before 1.0.
 
 The crate has three dependencies on any one platform: `unicode-width`, `unicode-segmentation` and `libc` on Unix or `windows-sys` on Windows. [Why](docs/dependencies.md).
 

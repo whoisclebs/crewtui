@@ -396,9 +396,6 @@ impl<A: App> Program<A> {
     /// typed in raw mode is a key event instead, and the app decides what
     /// it does.
     ///
-    /// On Windows the same holds for the console: Ctrl+Break, closing the
-    /// window, logging off and shutting down end the run, and Ctrl+C is a
-    /// key.
     #[cfg(unix)]
     pub fn run(self) -> io::Result<A> {
         self.run_on(libc::STDIN_FILENO, libc::STDOUT_FILENO, true)
@@ -406,28 +403,30 @@ impl<A: App> Program<A> {
 
     /// Runs until the app quits.
     ///
-    /// Ctrl+Break, the console window being closed, logging off and shutting
-    /// down from outside end the run with an [`io::ErrorKind::Interrupted`]
-    /// error that wraps the [`Signal`]. Ctrl+C typed in raw mode is a key
+    /// Ctrl+Break and the console window being closed from outside end the
+    /// run with an [`io::ErrorKind::Interrupted`] error that wraps the
+    /// [`Signal`]. Logging off and shutting down do too, when Windows
+    /// delivers them, which it does only to services. Ctrl+C typed in raw mode is a key
     /// event instead, and the app decides what it does.
     #[cfg(windows)]
     pub fn run(self) -> io::Result<A> {
-        // The handler goes in first and comes out last, like on Unix.
-        let mut held: Option<Signals> = None;
-        let signals = Signals::install()?;
+        // The handler goes in first and comes out last, like on Unix. Locals
+        // drop in the opposite order to how they are declared, on a panic as
+        // well, so the console is restored before the handler is removed.
+        let _signals = Signals::install()?;
         let mut terminal = Terminal::enter(self.options)?;
         let reader = InputReader::spawn(
             terminal.input_handle(),
-            Some(signals),
+            terminal.output_handle(),
+            Some(crate::signals::event()?),
             self.tx.clone(),
             self.options.keyboard_enhancement,
         )?;
         let effects = Effects::new(self.tx);
         let result = event_loop(self.app, &self.rx, &effects, &mut terminal, self.max_fps);
-        held = reader.finish().or(held);
+        drop(reader);
         drop(effects);
         drop(terminal);
-        drop(held);
         result
     }
 
