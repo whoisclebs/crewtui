@@ -5,10 +5,11 @@
 #![allow(unsafe_code)]
 
 use std::io::{self, Write};
+use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, Once, PoisonError};
 use std::thread::{self, ThreadId};
 
 fn last_error() -> io::Error {
@@ -162,7 +163,24 @@ struct State {
 }
 
 impl State {
-    /// Undoes everything `enter` did. Only the first call does any work.
+    /// Puts the tty in raw mode and turns the requested modes on.
+    fn activate(self: &Arc<Self>) -> io::Result<()> {
+        let mut raw = self.original;
+        make_raw(&mut raw);
+        set_termios(self.input, libc::TCSAFLUSH, &raw)?;
+        self.restored.store(false, Ordering::SeqCst);
+        ACTIVE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::clone(self));
+        if let Err(e) = write_all_fd(self.output, &enable_sequence(&self.options)) {
+            let _ = self.restore();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Undoes everything `activate` did. Only the first call does any work.
     fn restore(self: &Arc<Self>) -> io::Result<()> {
         if self.restored.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -191,16 +209,16 @@ fn install_panic_hook() {
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             let me = thread::current().id();
-            let mine: Vec<Arc<State>> = match ACTIVE.try_lock() {
-                Ok(active) => active.iter().filter(|s| s.owner == me).cloned().collect(),
-                Err(TryLockError::Poisoned(p)) => p
-                    .into_inner()
-                    .iter()
-                    .filter(|s| s.owner == me)
-                    .cloned()
-                    .collect(),
-                Err(TryLockError::WouldBlock) => Vec::new(),
-            };
+            // No thread runs user code while holding `ACTIVE`, so waiting for
+            // the lock here can't deadlock, and skipping it could leave a
+            // terminal raw.
+            let mine: Vec<Arc<State>> = ACTIVE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|s| s.owner == me)
+                .cloned()
+                .collect();
             for state in mine {
                 let _ = state.restore();
             }
@@ -223,13 +241,24 @@ fn install_panic_hook() {
 ///
 /// The panic hook is installed by the first `enter` and chains to whatever
 /// hook was set before. An app that sets its own hook afterwards replaces
-/// it, so set yours before entering. The hook only covers terminals
-/// entered on the panicking thread; a `Terminal` moved to another thread
-/// is still restored by `Drop` when that thread unwinds.
+/// it, so set yours before entering. The hook restores the terminal on
+/// every panic of the thread that entered, before the message prints. An
+/// app that catches such a panic and keeps going must call
+/// [`Terminal::resume`] to get raw mode back.
+///
+/// A `Terminal` isn't `Send`: it belongs to the thread that entered.
+///
+/// ```compile_fail
+/// fn is_send<T: Send>() {}
+/// is_send::<crewtui::Terminal>();
+/// ```
 ///
 /// The terminal is also a [`Write`] sink for output to the tty.
 pub struct Terminal {
     state: Arc<State>,
+    /// Ties the value to the thread that entered, which is the thread the
+    /// panic hook restores for.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl Terminal {
@@ -243,36 +272,28 @@ impl Terminal {
         output: RawFd,
         options: TerminalOptions,
     ) -> io::Result<Terminal> {
-        if !is_tty(output) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "stdout is not a terminal",
-            ));
+        for (fd, name) in [(output, "stdout"), (input, "stdin")] {
+            if !is_tty(fd) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("{name} is not a terminal"),
+                ));
+            }
         }
-        let original = get_termios(input)?;
-        let mut raw = original;
-        make_raw(&mut raw);
-        set_termios(input, libc::TCSAFLUSH, &raw)?;
-
         let state = Arc::new(State {
             input,
             output,
-            original,
+            original: get_termios(input)?,
             options,
-            restored: AtomicBool::new(false),
+            restored: AtomicBool::new(true),
             owner: thread::current().id(),
         });
-        ACTIVE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(Arc::clone(&state));
         install_panic_hook();
-
-        if let Err(e) = write_all_fd(output, &enable_sequence(&options)) {
-            let _ = state.restore();
-            return Err(e);
-        }
-        Ok(Terminal { state })
+        state.activate()?;
+        Ok(Terminal {
+            state,
+            _not_send: PhantomData,
+        })
     }
 
     /// The terminal size as `(columns, rows)`.
@@ -284,6 +305,18 @@ impl Terminal {
     /// dropping afterwards, does nothing.
     pub fn restore(&mut self) -> io::Result<()> {
         self.state.restore()
+    }
+
+    /// Goes back to raw mode and the requested screen modes after the
+    /// terminal was restored, for instance by the panic hook when the app
+    /// caught the panic and carries on. Does nothing while the terminal is
+    /// active. The next frame has to repaint everything, so call
+    /// `Renderer::invalidate` too.
+    pub fn resume(&mut self) -> io::Result<()> {
+        if self.state.restored.load(Ordering::SeqCst) {
+            self.state.activate()?;
+        }
+        Ok(())
     }
 }
 
@@ -528,6 +561,28 @@ mod tests {
     }
 
     #[test]
+    fn a_caught_panic_can_be_followed_by_resume() {
+        let pty = Pty::open();
+        let original = pty.termios();
+        let mut term = enter(&pty, ALL);
+        pty.output();
+        // The app catches the panic and keeps its terminal.
+        let result = panic::catch_unwind(|| panic!("caught"));
+        assert!(result.is_err());
+        assert!(same(&pty.termios(), &original));
+        assert_eq!(pty.output(), ALL_OFF);
+
+        term.resume().unwrap();
+        assert!(pty.is_raw());
+        assert_eq!(pty.output(), ALL_ON);
+        term.resume().unwrap();
+        assert!(pty.output().is_empty());
+        drop(term);
+        assert!(same(&pty.termios(), &original));
+        assert_eq!(pty.output(), ALL_OFF);
+    }
+
+    #[test]
     fn a_panic_on_another_thread_leaves_this_terminal_alone() {
         let pty = Pty::open();
         let term = enter(&pty, ALL);
@@ -564,7 +619,9 @@ mod tests {
         // SAFETY: `fds` has room for the two descriptors `pipe` writes.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let pty = Pty::open();
-        assert!(Terminal::enter_on(fds[0], pty.slave, ALL).is_err());
+        let err = Terminal::enter_on(fds[0], pty.slave, ALL).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("stdin"));
         assert!(pty.output().is_empty());
         // SAFETY: closing the two pipe ends opened above.
         unsafe {
