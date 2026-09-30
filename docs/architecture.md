@@ -44,10 +44,17 @@ next frame leaves the screen equal to the buffer.
 - `update` changes state and returns a `Cmd`. It never touches the terminal.
 - `view` draws the state into a `Frame`. It only reads.
 
-The main thread blocks in one place, a channel receiver. The reader thread waits on stdin, the signal pipe and a wake-up pipe together, parses input with `Parser`, and sends events and signals into that channel. Work started by effects will send messages into the same channel, so nothing wakes the loop by polling on a timer.
+The main thread blocks in one place, a channel receiver. The reader thread waits on stdin, the signal pipe and a wake-up pipe together, parses input with `Parser`, and sends events and signals into that channel. Work started by effects sends its messages into the same channel, so nothing wakes the loop by polling on a timer.
 
 When something changes, the loop draws, but no more than `max_fps` times a second. It applies everything that is already waiting before it draws, so a burst of messages costs one frame. Quitting doesn't draw a last frame.
 
 Signals are turned into loop behavior in one place. SIGWINCH resizes the renderer, which repaints, and gives the app an `Event::Resize`. SIGCONT re-enters raw mode and invalidates the renderer. SIGINT, SIGTERM and SIGHUP end the run with an `Interrupted` error that wraps the signal, and the terminal is restored on the way out like on any other exit. Ctrl+C typed in raw mode is not a signal: it reaches the app as a key event, and the app decides whether it quits.
 
 The loop itself is a function over a small `Host` trait (write bytes, report the size, resume raw mode). That is what lets the tests drive it without a terminal, with one test that runs a real `Program` on a pty.
+
+## Effects
+
+`update` returns a `Cmd` and never does the work itself. `Cmd::perform` runs a blocking closure on a worker thread and turns its result into a message; `Cmd::spawn` gives a worker a `Sender` for work that produces many messages, like a token stream; `Cmd::after` delivers a message later; `Cmd::repaint` invalidates the renderer; `Cmd::batch` and `Cmd::quit` do what they say. Apps that have their own threads or a runtime use `Program::sender()`.
+
+The pool is bounded, timers share one thread, and everything that hasn't started is dropped when the program ends. The reasoning and the alternatives are in `docs/adr/0001-executor.md`.
+

@@ -2,6 +2,8 @@
 //! update and view.
 
 mod buffer;
+#[cfg(unix)]
+mod effects;
 mod frame;
 mod geometry;
 mod input;
@@ -20,6 +22,8 @@ mod testing;
 pub mod text;
 
 pub use buffer::{Buffer, Cell};
+#[cfg(unix)]
+pub use effects::{Closed, Sender};
 pub use frame::Frame;
 pub use geometry::Rect;
 pub use input::{Event, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind, Parser};
