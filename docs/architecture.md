@@ -35,3 +35,19 @@ Who calls it:
 The tests cut a frame at every possible byte, including inside an escape
 sequence, feed the pieces to a small terminal model, and check that the
 next frame leaves the screen equal to the buffer.
+
+## The loop
+
+`Program::run` owns everything that touches the terminal: the raw-mode guard, a reader thread, the signal handlers and the renderer. The app only sees three methods.
+
+- `event` turns something the terminal reported into a message, or ignores it.
+- `update` changes state and returns a `Cmd`. It never touches the terminal.
+- `view` draws the state into a `Frame`. It only reads.
+
+The main thread blocks in one place, a channel receiver. The reader thread waits on stdin, the signal pipe and a wake-up pipe together, parses input with `Parser`, and sends events and signals into that channel. Work started by effects will send messages into the same channel, so nothing wakes the loop by polling on a timer.
+
+When something changes, the loop draws, but no more than `max_fps` times a second. It applies everything that is already waiting before it draws, so a burst of messages costs one frame. Quitting doesn't draw a last frame.
+
+Signals are turned into loop behavior in one place. SIGWINCH resizes the renderer, which repaints, and gives the app an `Event::Resize`. SIGCONT re-enters raw mode and invalidates the renderer. SIGINT, SIGTERM and SIGHUP end the run with an `Interrupted` error that wraps the signal, and the terminal is restored on the way out like on any other exit. Ctrl+C typed in raw mode is not a signal: it reaches the app as a key event, and the app decides whether it quits.
+
+The loop itself is a function over a small `Host` trait (write bytes, report the size, resume raw mode). That is what lets the tests drive it without a terminal, with one test that runs a real `Program` on a pty.
