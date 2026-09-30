@@ -426,9 +426,9 @@ pub(crate) fn kill(child: &Child, sig: libc::c_int) {
     assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, sig) }, 0);
 }
 
-/// Waits until `child` has been stopped by a signal, and says whether that
-/// happened within `limit`.
-pub(crate) fn wait_until_stopped(child: &Child, limit: Duration) -> bool {
+/// Waits until `child` has been stopped by a signal, and returns which one,
+/// or `None` if that didn't happen within `limit`.
+pub(crate) fn wait_until_stopped(child: &Child, limit: Duration) -> Option<libc::c_int> {
     let deadline = Instant::now() + limit;
     while Instant::now() < deadline {
         let mut status = 0;
@@ -441,11 +441,11 @@ pub(crate) fn wait_until_stopped(child: &Child, limit: Duration) -> bool {
             )
         };
         if got > 0 && libc::WIFSTOPPED(status) {
-            return true;
+            return Some(libc::WSTOPSIG(status));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    false
+    None
 }
 
 /// The environment variable that tells a re-run test executable which

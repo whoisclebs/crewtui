@@ -336,7 +336,11 @@ mod tests {
     fn a_stop_from_outside_gives_the_terminal_back_and_a_continue_takes_it_again() {
         let mut s = Scenario::start("stoppable");
         s.signal(libc::SIGTSTP);
-        assert!(wait_until_stopped(&s.child, LIMIT), "{}", s.text());
+        assert!(
+            wait_until_stopped(&s.child, LIMIT).is_some(),
+            "{}",
+            s.text()
+        );
         // While it is stopped the shell must be usable.
         s.seen.extend(s.pty.output());
         s.assert_restored(LEAVE);
@@ -356,6 +360,11 @@ mod tests {
             s.text()
         );
         assert!(s.pty.is_raw(), "the terminal is not raw after the continue");
+        // The terminal was taken once, and the screen repainted once.
+        let after = &s.seen[left_at..];
+        let count = |needle: &[u8]| after.windows(needle.len()).filter(|w| *w == needle).count();
+        assert_eq!(count(enter), 1, "{}", s.text());
+        assert_eq!(count(b"\x1b[2J"), 1, "{}", s.text());
         // It is a working program again.
         s.type_bytes(b"q");
         let status = s.finish();

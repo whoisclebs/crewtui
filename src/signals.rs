@@ -10,7 +10,7 @@ use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 /// A signal the framework cares about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +87,10 @@ pub(crate) fn stop_with_sigstop() {
     STOP_WITH.store(libc::SIGSTOP, Ordering::SeqCst);
 }
 
+/// How many times the SIGCONT handler ran, so that `stop_process` can tell
+/// whether a continue signal was delivered while it was stopped.
+static CONTINUES: AtomicU32 = AtomicU32::new(0);
+
 /// Write end of the pipe, read by the handler. `-1` while nothing is installed.
 static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -120,6 +124,9 @@ extern "C" fn handler(sig: libc::c_int) {
     let Some(code) = Signal::ALL.iter().position(|&(_, s)| s == sig) else {
         return;
     };
+    if sig == libc::SIGCONT {
+        CONTINUES.fetch_add(1, Ordering::SeqCst);
+    }
     let fd = WRITE_FD.load(Ordering::Relaxed);
     if fd < 0 {
         return;
@@ -218,8 +225,8 @@ fn pipe() -> io::Result<(RawFd, RawFd)> {
 /// [`Signals::pending`].
 ///
 /// A SIGINT, SIGHUP or SIGTSTP that was being ignored when
-/// [`Signals::install`] ran, as it is under `nohup` or in a shell script,
-/// stays ignored, so [`Signal::Interrupt`], [`Signal::Hangup`] and
+/// [`Signals::install`] ran, as SIGHUP is under `nohup` and SIGINT is for a
+/// background job in a shell script, stays ignored, so [`Signal::Interrupt`], [`Signal::Hangup`] and
 /// [`Signal::Suspend`] are never delivered then.
 #[derive(Debug)]
 pub struct Signals {
@@ -280,7 +287,12 @@ impl Signals {
     /// once it is continued. Our handler for SIGTSTP is put aside while it is
     /// stopped, since with it installed the process would not stop, and put
     /// back after.
-    pub(crate) fn stop_process() -> io::Result<()> {
+    ///
+    /// Returns whether the SIGCONT handler ran meanwhile, which means a
+    /// [`Signal::Continue`] is on its way through the pipe. In an orphaned
+    /// process group the stop is discarded and nothing follows.
+    pub(crate) fn stop_process() -> io::Result<bool> {
+        let continues = CONTINUES.load(Ordering::SeqCst);
         // SAFETY: both actions are fully initialized before use, and `ours`
         // is valid for a write.
         unsafe {
@@ -297,7 +309,16 @@ impl Signals {
                 return Err(io::Error::last_os_error());
             }
         }
-        Ok(())
+        // The handler may run on another thread, a moment after `raise`
+        // returned. In an orphaned process group nothing runs, and this
+        // waits for nothing.
+        for _ in 0..50 {
+            if CONTINUES.load(Ordering::SeqCst) != continues {
+                return Ok(true);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(false)
     }
 
     /// Signals that arrived since the last call, oldest first. Never blocks.
@@ -467,20 +488,23 @@ mod tests {
     }
 
     #[test]
-    fn an_ignored_sigint_or_sighup_stays_ignored() {
+    fn an_ignored_sigint_sighup_or_sigtstp_stays_ignored() {
         let _s = serial();
         // SAFETY: setting a disposition to ignore has no other preconditions.
-        let (old_int, old_hup) = unsafe {
+        let (old_int, old_hup, old_tstp) = unsafe {
             (
                 libc::signal(libc::SIGINT, libc::SIG_IGN),
                 libc::signal(libc::SIGHUP, libc::SIG_IGN),
+                libc::signal(libc::SIGTSTP, libc::SIG_IGN),
             )
         };
         let mut signals = Signals::install().unwrap();
         assert_eq!(disposition(libc::SIGINT), libc::SIG_IGN);
         assert_eq!(disposition(libc::SIGHUP), libc::SIG_IGN);
+        assert_eq!(disposition(libc::SIGTSTP), libc::SIG_IGN);
         raise(libc::SIGINT);
         raise(libc::SIGHUP);
+        raise(libc::SIGTSTP);
         raise(libc::SIGTERM);
         assert_eq!(signals.pending().unwrap(), vec![Signal::Terminate]);
         drop(signals);
@@ -489,7 +513,58 @@ mod tests {
         unsafe {
             libc::signal(libc::SIGINT, old_int);
             libc::signal(libc::SIGHUP, old_hup);
+            libc::signal(libc::SIGTSTP, old_tstp);
         }
+    }
+
+    /// The child of `stop_process_stops_with_sigtstp_and_puts_the_handler_back`.
+    /// It stops itself and then reports whether our handler is back.
+    #[test]
+    fn stop_probe_child() {
+        if std::env::var("CREWTUI_STOP_PROBE").is_err() {
+            return;
+        }
+        let _signals = Signals::install().unwrap();
+        let continued = Signals::stop_process().unwrap();
+        // Our handler is installed again: not the default and not ignored.
+        let d = disposition(libc::SIGTSTP);
+        let handler_back = d != libc::SIG_DFL && d != libc::SIG_IGN;
+        std::process::exit(match (handler_back, continued) {
+            (true, true) => 0,
+            (false, _) => 3,
+            (_, false) => 4,
+        });
+    }
+
+    /// The real thing: a process that isn't orphaned really stops with
+    /// SIGTSTP, and after SIGCONT it finds its handler back and knows it was
+    /// continued.
+    #[test]
+    fn stop_process_stops_with_sigtstp_and_puts_the_handler_back() {
+        use crate::testing::{kill, wait_timeout, wait_until_stopped};
+        use std::os::unix::process::CommandExt;
+        use std::time::Duration;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "signals::tests::stop_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CREWTUI_STOP_PROBE", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            // Its own group, whose parent is in another group of this session:
+            // not orphaned, so the default action of SIGTSTP stops it.
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stopped = wait_until_stopped(&child, Duration::from_secs(30));
+        assert_eq!(stopped, Some(libc::SIGTSTP));
+        kill(&child, libc::SIGCONT);
+        let status = wait_timeout(&mut child, Duration::from_secs(30));
+        assert_eq!(status.and_then(|s| s.code()), Some(0));
     }
 
     #[test]

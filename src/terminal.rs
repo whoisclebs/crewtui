@@ -301,6 +301,9 @@ pub struct Terminal {
     /// Ties the value to the thread that entered, which is the thread the
     /// panic hook restores for.
     _not_send: PhantomData<*const ()>,
+    /// Set after a stop that a SIGCONT ended, so that the continue signal
+    /// that follows doesn't take the terminal a second time.
+    pub(crate) skip_continue: bool,
 }
 
 impl Terminal {
@@ -335,6 +338,7 @@ impl Terminal {
         Ok(Terminal {
             state,
             _not_send: PhantomData,
+            skip_continue: false,
         })
     }
 

@@ -214,7 +214,9 @@ pub(crate) enum Input<M> {
 pub(crate) trait Host: Write {
     fn size(&self) -> io::Result<(u16, u16)>;
     /// Goes back to raw mode after the process was stopped and continued.
-    fn resume(&mut self) -> io::Result<()>;
+    /// Returns whether it did, which is a reason to repaint. It doesn't when
+    /// [`Host::suspend`] just did.
+    fn resume(&mut self) -> io::Result<bool>;
     /// Gives the terminal back, stops the process until it is continued, and
     /// takes the terminal again.
     fn suspend(&mut self) -> io::Result<()>;
@@ -230,14 +232,22 @@ impl Host for Terminal {
         Terminal::size(self)
     }
 
-    fn resume(&mut self) -> io::Result<()> {
-        Terminal::resume(self)
+    fn resume(&mut self) -> io::Result<bool> {
+        if std::mem::take(&mut self.skip_continue) {
+            return Ok(false);
+        }
+        Terminal::resume(self)?;
+        Ok(true)
     }
 
     fn suspend(&mut self) -> io::Result<()> {
         self.restore()?;
-        Signals::stop_process()?;
-        Terminal::resume(self)
+        let continued = Signals::stop_process()?;
+        Terminal::resume(self)?;
+        // The continue signal that woke the process reaches the loop next.
+        // It has nothing left to do.
+        self.skip_continue = continued;
+        Ok(())
     }
 
     fn cursor_hidden(&self) -> bool {
@@ -377,11 +387,12 @@ fn handle<A: App, H: Host>(
                 .is_some_and(|m| apply(app, effects, renderer, dirty, m)))
         }
         Input::Signal(Signal::Continue) => {
-            host.resume()?;
-            renderer.invalidate();
-            // The cursor may be back to whatever the terminal defaults to.
-            renderer.cursor_was_reset();
-            *dirty = true;
+            if host.resume()? {
+                renderer.invalidate();
+                // The cursor may be back to whatever the terminal defaults to.
+                renderer.cursor_was_reset();
+                *dirty = true;
+            }
             Ok(false)
         }
         Input::Signal(Signal::Suspend) => {
@@ -514,9 +525,9 @@ mod tests {
             Ok(size.unwrap_or(self.last))
         }
 
-        fn resume(&mut self) -> io::Result<()> {
+        fn resume(&mut self) -> io::Result<bool> {
             self.resumed += 1;
-            Ok(())
+            Ok(true)
         }
 
         fn suspend(&mut self) -> io::Result<()> {
