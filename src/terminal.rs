@@ -221,6 +221,12 @@ fn install_panic_hook() {
 /// `std::process::exit` skips destructors. Call [`Terminal::restore`]
 /// first if you need to exit that way.
 ///
+/// The panic hook is installed by the first `enter` and chains to whatever
+/// hook was set before. An app that sets its own hook afterwards replaces
+/// it, so set yours before entering. The hook only covers terminals
+/// entered on the panicking thread; a `Terminal` moved to another thread
+/// is still restored by `Drop` when that thread unwinds.
+///
 /// The terminal is also a [`Write`] sink for output to the tty.
 pub struct Terminal {
     state: Arc<State>,
