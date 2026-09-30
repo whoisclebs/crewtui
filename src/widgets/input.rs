@@ -345,6 +345,7 @@ pub struct Input<'a> {
     placeholder: &'a str,
     placeholder_style: Style,
     block: Option<Block<'a>>,
+    mask: Option<char>,
 }
 
 impl<'a> Input<'a> {
@@ -355,7 +356,15 @@ impl<'a> Input<'a> {
             placeholder: "",
             placeholder_style: Style::new().dim(),
             block: None,
+            mask: None,
         }
+    }
+
+    /// Draws `mask` once per grapheme instead of the text, for a password or a key. The state still holds
+    /// the real text. The placeholder is drawn as it is.
+    pub fn mask(mut self, mask: char) -> Self {
+        self.mask = Some(mask);
+        self
     }
 
     /// The style of the text and of the row it sits on.
@@ -429,8 +438,15 @@ impl StatefulWidget for Input<'_> {
         // Scroll only as far as it takes to keep the cursor in view; the
         // cursor may sit one cell past the text, so the text plus one cell
         // is what the scroll can reach.
-        let cursor_col = state.cursor_column();
-        let end_col = width(&state.text);
+        let masked = self.mask.map(|c| c.to_string());
+        let (cursor_col, end_col) = if masked.is_some() {
+            (
+                state.text[..state.cursor].graphemes(true).count(),
+                state.text.graphemes(true).count(),
+            )
+        } else {
+            (state.cursor_column(), width(&state.text))
+        };
         let mut scroll = state.scroll.get().min((end_col + 1).saturating_sub(room));
         if cursor_col < scroll {
             scroll = cursor_col;
@@ -441,7 +457,10 @@ impl StatefulWidget for Input<'_> {
 
         let mut col = 0;
         for g in state.text.graphemes(true) {
-            let w = grapheme_width(g);
+            let (g, w) = match &masked {
+                Some(mask) => (mask.as_str(), 1),
+                None => (g, grapheme_width(g)),
+            };
             if w == 0 {
                 continue;
             }
@@ -1027,5 +1046,44 @@ mod tests {
         Input::new().render(area, &mut buf, &s);
         // The cell after the text is left alone, like every widget does.
         assert_eq!(rows_of(&buf), [" 字x"]);
+    }
+
+    fn draw_masked(text: &str, width: u16) -> (Vec<String>, Option<(u16, u16)>, InputState) {
+        let area = Rect::new(0, 0, width, 1);
+        let mut buf = Buffer::new(area);
+        let state = InputState::with_text(text);
+        Input::new()
+            .mask('•')
+            .placeholder("key")
+            .render(area, &mut buf, &state);
+        (rows_of(&buf), state.cursor_position(), state)
+    }
+
+    #[test]
+    fn a_masked_input_draws_one_mask_per_grapheme_and_keeps_the_text() {
+        let (rows, cursor, state) = draw_masked("abc", 10);
+        assert_eq!(rows[0].trim_end(), "•••");
+        assert_eq!(cursor, Some((3, 0)));
+        assert_eq!(state.text(), "abc");
+    }
+
+    #[test]
+    fn wide_and_combining_characters_are_one_mask_each() {
+        let (rows, cursor, _) = draw_masked("日本e\u{301}", 10);
+        assert_eq!(rows[0].trim_end(), "•••");
+        assert_eq!(cursor, Some((3, 0)));
+    }
+
+    #[test]
+    fn a_masked_input_wider_than_the_area_scrolls_to_the_cursor() {
+        let (rows, cursor, _) = draw_masked("abcdefghij", 4);
+        assert_eq!(rows[0], "••• ", "the last cell is left for the cursor");
+        assert_eq!(cursor, Some((3, 0)));
+    }
+
+    #[test]
+    fn an_empty_masked_input_shows_its_placeholder() {
+        let (rows, _, _) = draw_masked("", 10);
+        assert_eq!(rows[0].trim_end(), "key");
     }
 }
