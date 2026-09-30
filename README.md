@@ -75,7 +75,7 @@ cargo run --release --example agent -- --stress
 - [Architecture](docs/architecture.md): how an event becomes bytes on the terminal.
 - [Decisions](docs/adr/): why the executor, renderer, event model, Unicode handling and widgets look the way they do.
 - [Performance](docs/perf.md): benchmark and stress numbers.
-- [Testing terminal behavior](docs/testing.md), [dependencies](docs/dependencies.md).
+- [Testing terminal behavior and apps](docs/testing.md), including `testing::Harness` for testing an `App` without a terminal, and [dependencies](docs/dependencies.md).
 - `cargo doc --open` for the API.
 
 ## Status

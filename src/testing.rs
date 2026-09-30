@@ -1,728 +1,664 @@
-//! A minimal terminal model for tests: it applies the escape sequences the
-//! renderer emits and exposes the resulting grid.
+//! Testing an [`App`] without a terminal.
 //!
-//! It implements only what the renderer uses (cursor moves, SGR, clear
-//! screen) plus the behaviors that matter for correctness: pending wrap
-//! after writing the last column, and erasing the other half of a wide
-//! glyph when one half is overwritten.
-#![allow(unsafe_code)]
+//! This is a helper for tests, and it is part of the public API so an app can
+//! use it from its own test suite. It needs nothing but the crate: no
+//! terminal, no threads and no clock.
+//!
+//! A [`Harness`] owns the app and a screen size. It does what the run loop
+//! does, in one thread and in an order the test controls: it turns events
+//! into messages, passes them to `update`, and looks at the commands that
+//! come back. Effects that would run elsewhere in a real program, such as
+//! [`Cmd::perform`] and [`Cmd::after`], wait until the test asks for them.
+//!
+//! ```
+//! use crewtui::prelude::*;
+//! use crewtui::testing::Harness;
+//! use crewtui::{Cmd, Event, Frame, KeyCode, KeyEvent, KeyModifiers};
+//!
+//! struct Counter(i32);
+//!
+//! enum Msg {
+//!     Up,
+//!     Copy,
+//! }
+//!
+//! impl App for Counter {
+//!     type Message = Msg;
+//!
+//!     fn event(&self, event: Event) -> Option<Msg> {
+//!         match event {
+//!             Event::Key(k) if k.is(KeyCode::Char('+')) => Some(Msg::Up),
+//!             Event::Key(k) if k.is(KeyCode::Char('c')) => Some(Msg::Copy),
+//!             _ => None,
+//!         }
+//!     }
+//!
+//!     fn update(&mut self, msg: Msg) -> Cmd<Msg> {
+//!         match msg {
+//!             Msg::Up => {
+//!                 self.0 += 1;
+//!                 Cmd::none()
+//!             }
+//!             Msg::Copy => Cmd::copy_to_clipboard(self.0.to_string()),
+//!         }
+//!     }
+//!
+//!     fn view(&self, frame: &mut Frame) {
+//!         frame.render_widget(Paragraph::new(format!("count: {}", self.0)), frame.area());
+//!     }
+//! }
+//!
+//! let mut harness = Harness::new(Counter(0), 20, 2);
+//! harness.start();
+//! harness.key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+//! harness.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+//! assert_eq!(harness.screen().rows(), ["count: 1", ""]);
+//! assert_eq!(harness.clipboard(), ["1"]);
+//! ```
 
-use unicode_segmentation::UnicodeSegmentation;
+use std::collections::VecDeque;
+use std::fmt;
+use std::sync::mpsc::{Receiver, channel};
+use std::time::Duration;
 
-use crate::text::grapheme_width;
-use crate::{Buffer, Cell, Color, Modifier, Rect, Style};
+use crate::runtime::{Effect, Input, effects_of};
+use crate::{App, Buffer, Cell, Cmd, Event, Frame, KeyEvent, Rect, Sender};
 
-pub(crate) struct Screen {
-    width: usize,
-    height: usize,
-    cells: Vec<Cell>,
-    x: usize,
-    y: usize,
-    pending_wrap: bool,
-    pen: Style,
-    link: Option<std::sync::Arc<str>>,
-    /// The link of each cell, kept apart from the cells like a terminal
-    /// keeps it apart from the text.
-    links: Vec<Option<std::sync::Arc<str>>>,
-    pending: Vec<u8>,
-    cursor_visible: bool,
+/// The most jobs one call to [`Harness::run_commands`] runs, so a program
+/// that keeps starting new work fails the test instead of hanging it.
+const MAX_JOBS: usize = 10_000;
+
+enum Job<M> {
+    Perform(Box<dyn FnOnce() -> M + Send>),
+    Spawn(Box<dyn FnOnce(Sender<M>) + Send>),
 }
 
-impl Screen {
-    pub(crate) fn new(width: u16, height: u16) -> Self {
-        Screen {
-            width: width as usize,
-            height: height as usize,
-            cells: vec![Cell::blank(); width as usize * height as usize],
-            x: 0,
-            y: 0,
-            pending_wrap: false,
-            pen: Style::new(),
-            link: None,
-            links: vec![None; width as usize * height as usize],
-            pending: Vec::new(),
-            // The terminal hides it on entering, and that is what the
-            // renderer's output is checked against.
-            cursor_visible: false,
+/// An app running without a terminal.
+///
+/// Events and messages go through the app's own `event` and `update`, as in
+/// [`Program`](crate::Program). What the commands ask for is handled like this:
+///
+/// - [`Cmd::quit`] is remembered; see [`Harness::has_quit`]. The harness
+///   keeps accepting input after it, so a test can check what came next.
+/// - [`Cmd::copy_to_clipboard`] records the text in [`Harness::clipboard`],
+///   for the texts that would really be sent.
+/// - [`Cmd::repaint`] does nothing, since the screen is drawn from the state
+///   every time it is asked for.
+/// - [`Cmd::perform`] and [`Cmd::spawn`] wait in a queue until
+///   [`Harness::run_commands`], which runs them on the calling thread.
+/// - [`Cmd::after`] waits until [`Harness::fire_timers`], whatever the delay.
+///   [`Harness::pending_timers`] lists the delays.
+pub struct Harness<A: App> {
+    app: A,
+    width: u16,
+    height: u16,
+    jobs: VecDeque<Job<A::Message>>,
+    timers: Vec<(Duration, A::Message)>,
+    clipboard: Vec<String>,
+    quit: bool,
+    tx: std::sync::mpsc::Sender<Input<A::Message>>,
+    rx: Receiver<Input<A::Message>>,
+}
+
+impl<A: App> Harness<A> {
+    /// A harness for `app` on a screen of `width` by `height` cells. Nothing
+    /// has run yet, not even [`App::init`]; call [`Harness::start`] for that.
+    pub fn new(app: A, width: u16, height: u16) -> Self {
+        let (tx, rx) = channel();
+        Harness {
+            app,
+            width,
+            height,
+            jobs: VecDeque::new(),
+            timers: Vec::new(),
+            clipboard: Vec::new(),
+            quit: false,
+            tx,
+            rx,
         }
     }
 
-    /// The cursor's `(column, row)` and whether it is showing.
-    pub(crate) fn cursor(&self) -> ((usize, usize), bool) {
-        ((self.x, self.y), self.cursor_visible)
+    /// The app.
+    pub fn app(&self) -> &A {
+        &self.app
     }
 
-    /// The text of row `y`, one symbol per cell, continuation cells omitted.
-    pub(crate) fn row(&self, y: usize) -> String {
-        self.cells[y * self.width..(y + 1) * self.width]
-            .iter()
-            .map(|c| c.symbol())
+    /// The app, to set it up or change it behind its own back.
+    pub fn app_mut(&mut self) -> &mut A {
+        &mut self.app
+    }
+
+    /// Takes the app back, ending the test.
+    pub fn into_app(self) -> A {
+        self.app
+    }
+
+    /// Runs the commands [`App::init`] returns, as the program does before
+    /// its first frame.
+    pub fn start(&mut self) -> &mut Self {
+        let cmd = self.app.init();
+        self.enqueue(cmd);
+        self
+    }
+
+    /// Delivers an event: the app's `event` turns it into a message, if it
+    /// wants one, and `update` gets that.
+    pub fn event(&mut self, event: Event) -> &mut Self {
+        if let Some(message) = self.app.event(event) {
+            self.message(message);
+        }
+        self
+    }
+
+    /// Delivers a key press. Shorthand for `event(Event::Key(key))`.
+    pub fn key(&mut self, key: KeyEvent) -> &mut Self {
+        self.event(Event::Key(key))
+    }
+
+    /// Passes a message straight to `update`, as if a worker had sent it.
+    pub fn message(&mut self, message: A::Message) -> &mut Self {
+        let cmd = self.app.update(message);
+        self.enqueue(cmd);
+        self
+    }
+
+    /// Changes the screen size and tells the app with an [`Event::Resize`],
+    /// as the program does.
+    pub fn resize(&mut self, width: u16, height: u16) -> &mut Self {
+        self.width = width;
+        self.height = height;
+        self.event(Event::Resize(width, height))
+    }
+
+    fn enqueue(&mut self, cmd: Cmd<A::Message>) {
+        for effect in effects_of(cmd) {
+            match effect {
+                Effect::Quit => self.quit = true,
+                Effect::Repaint => {}
+                Effect::Copy(text) => {
+                    if crate::clipboard::osc52(&text).is_some() {
+                        self.clipboard.push(text);
+                    }
+                }
+                Effect::Perform(work) => self.jobs.push_back(Job::Perform(work)),
+                Effect::Spawn(work) => self.jobs.push_back(Job::Spawn(work)),
+                Effect::After(delay, message) => self.timers.push((delay, message)),
+            }
+        }
+    }
+
+    /// How many [`Cmd::perform`] and [`Cmd::spawn`] jobs are waiting.
+    pub fn pending_jobs(&self) -> usize {
+        self.jobs.len()
+    }
+
+    /// The delays of the [`Cmd::after`] timers that are waiting, in the order
+    /// they were asked for.
+    pub fn pending_timers(&self) -> Vec<Duration> {
+        self.timers.iter().map(|(delay, _)| *delay).collect()
+    }
+
+    /// Runs the waiting [`Cmd::perform`] and [`Cmd::spawn`] jobs on this
+    /// thread and gives their messages to `update`, until none are left,
+    /// including those that the messages started.
+    ///
+    /// A [`Cmd::spawn`] job gets a [`Sender`] and runs to its end before this
+    /// returns. What it sends goes to `update` in order, but a job that hands
+    /// its sender to another thread and waits for it will block the test. A
+    /// job that panics fails the test, where in a program it would be
+    /// dropped or reported through the `_catching` variants.
+    ///
+    /// # Panics
+    ///
+    /// When more than 10,000 jobs run in one call, which means the app keeps
+    /// starting work.
+    pub fn run_commands(&mut self) -> &mut Self {
+        let mut ran = 0;
+        while let Some(job) = self.jobs.pop_front() {
+            ran += 1;
+            assert!(
+                ran <= MAX_JOBS,
+                "the app keeps starting commands: over {MAX_JOBS} jobs ran"
+            );
+            match job {
+                Job::Perform(work) => {
+                    let message = work();
+                    self.message(message);
+                }
+                Job::Spawn(work) => {
+                    work(Sender::new(self.tx.clone()));
+                    self.deliver_sent();
+                }
+            }
+        }
+        self
+    }
+
+    fn deliver_sent(&mut self) {
+        while let Ok(input) = self.rx.try_recv() {
+            if let Input::Message(message) = input {
+                self.message(message);
+            }
+        }
+    }
+
+    /// Delivers the message of every waiting [`Cmd::after`] timer, shortest
+    /// delay first and in the order asked for among equal ones. A timer that
+    /// `update` starts in response waits for the next call.
+    pub fn fire_timers(&mut self) -> &mut Self {
+        let mut timers = std::mem::take(&mut self.timers);
+        timers.sort_by_key(|(delay, _)| *delay);
+        for (_, message) in timers {
+            self.message(message);
+        }
+        self
+    }
+
+    /// The texts [`Cmd::copy_to_clipboard`] was asked to copy, oldest first.
+    /// Text that would not be sent, because it is empty or over
+    /// [`CLIPBOARD_LIMIT`](crate::CLIPBOARD_LIMIT), is not listed.
+    pub fn clipboard(&self) -> &[String] {
+        &self.clipboard
+    }
+
+    /// Takes the recorded clipboard texts, leaving the list empty.
+    pub fn take_clipboard(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.clipboard)
+    }
+
+    /// Whether the app has returned [`Cmd::quit`].
+    pub fn has_quit(&self) -> bool {
+        self.quit
+    }
+
+    /// Draws the app with its current state and returns what is on screen.
+    /// The state is not changed, so this can be called as often as needed.
+    pub fn screen(&self) -> Snapshot {
+        let area = Rect::new(0, 0, self.width, self.height);
+        let mut buffer = Buffer::new(area);
+        let mut frame = Frame::new(&mut buffer);
+        self.app.view(&mut frame);
+        let cursor = frame.cursor().filter(|&(x, y)| area.contains(x, y));
+        Snapshot { buffer, cursor }
+    }
+}
+
+impl<A: App> fmt::Debug for Harness<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Harness")
+            .field("size", &(self.width, self.height))
+            .field("pending_jobs", &self.jobs.len())
+            .field("pending_timers", &self.timers.len())
+            .field("clipboard", &self.clipboard)
+            .field("quit", &self.quit)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What one frame of an app looked like: its cells and where the cursor was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    buffer: Buffer,
+    cursor: Option<(u16, u16)>,
+}
+
+impl Snapshot {
+    /// The width in columns.
+    pub fn width(&self) -> u16 {
+        self.buffer.area().width
+    }
+
+    /// The height in rows.
+    pub fn height(&self) -> u16 {
+        self.buffer.area().height
+    }
+
+    /// The text of each row, top to bottom, with trailing spaces removed. A
+    /// wide glyph is one character, as on screen.
+    pub fn rows(&self) -> Vec<String> {
+        let area = self.buffer.area();
+        (area.y..area.bottom())
+            .map(|y| {
+                let row: String = (area.x..area.right())
+                    .filter_map(|x| self.buffer.get(x, y))
+                    .map(Cell::symbol)
+                    .collect();
+                row.trim_end().to_owned()
+            })
             .collect()
     }
 
-    pub(crate) fn to_buffer(&self) -> Buffer {
-        let mut b = Buffer::new(Rect::new(0, 0, self.width as u16, self.height as u16));
-        for y in 0..self.height {
-            for x in 0..self.width {
-                *b.get_mut(x as u16, y as u16).unwrap() = self.cells[y * self.width + x].clone();
-            }
-            // Runs of cells with the same link.
-            let row = &self.links[y * self.width..(y + 1) * self.width];
-            let mut x = 0;
-            while x < self.width {
-                let Some(url) = &row[x] else {
-                    x += 1;
-                    continue;
-                };
-                let end = (x..self.width)
-                    .find(|&k| row[k].as_ref() != Some(url))
-                    .unwrap_or(self.width);
-                b.set_link(
-                    Rect::new(x as u16, y as u16, (end - x) as u16, 1),
-                    Some(url),
-                );
-                x = end;
-            }
+    /// All the rows joined by `\n`, with trailing blank rows removed.
+    pub fn text(&self) -> String {
+        let mut rows = self.rows();
+        while rows.last().is_some_and(String::is_empty) {
+            rows.pop();
         }
-        b
+        rows.join("\n")
     }
 
-    /// Applies bytes the way a terminal would: sequences may be split
-    /// across calls, an ESC inside a CSI sequence aborts it, and invalid
-    /// UTF-8 prints U+FFFD.
-    pub(crate) fn feed(&mut self, bytes: &[u8]) {
-        self.pending.extend_from_slice(bytes);
-        let data = std::mem::take(&mut self.pending);
-        let mut i = 0;
-        while i < data.len() {
-            if data[i] == 0x1b {
-                if i + 1 == data.len() {
-                    break;
-                }
-                if data[i + 1] == b']' {
-                    // An OSC sequence runs to BEL or ESC \. Any other ESC
-                    // cancels it and starts a sequence of its own.
-                    let mut j = i + 2;
-                    let mut end = None;
-                    let mut cancelled = None;
-                    let mut incomplete = false;
-                    while j < data.len() {
-                        if data[j] == 0x07 {
-                            end = Some((j, j + 1));
-                            break;
-                        }
-                        if data[j] == 0x1b {
-                            match data.get(j + 1) {
-                                Some(b'\\') => end = Some((j, j + 2)),
-                                Some(_) => cancelled = Some(j),
-                                None => incomplete = true,
-                            }
-                            break;
-                        }
-                        j += 1;
-                    }
-                    if incomplete || (end.is_none() && cancelled.is_none()) {
-                        break;
-                    }
-                    if let Some(at) = cancelled {
-                        i = at;
-                        continue;
-                    }
-                    let (stop, next) = end.expect("checked above");
-                    let payload = std::str::from_utf8(&data[i + 2..stop]).unwrap_or("");
-                    self.osc(payload);
-                    i = next;
-                    continue;
-                }
-                // An ESC right after an ESC starts over from the second one.
-                if data[i + 1] == 0x1b {
-                    i += 1;
-                    continue;
-                }
-                if data[i + 1] != b'[' {
-                    i += 2;
-                    continue;
-                }
-                let mut j = i + 2;
-                let mut done = false;
-                while j < data.len() {
-                    match data[j] {
-                        0x1b => break,
-                        0x40..=0x7e => {
-                            let params = std::str::from_utf8(&data[i + 2..j]).unwrap_or("");
-                            self.csi(params, data[j] as char);
-                            done = true;
-                            break;
-                        }
-                        _ => j += 1,
-                    }
-                }
-                if done {
-                    i = j + 1;
-                } else if j == data.len() {
-                    break;
-                } else {
-                    i = j;
-                }
-            } else {
-                let end = data[i..]
-                    .iter()
-                    .position(|&b| b == 0x1b)
-                    .map_or(data.len(), |p| i + p);
-                match std::str::from_utf8(&data[i..end]) {
-                    Ok(text) => {
-                        self.print_text(text);
-                        i = end;
-                    }
-                    Err(e) => {
-                        let valid = i + e.valid_up_to();
-                        self.print_text(std::str::from_utf8(&data[i..valid]).unwrap_or(""));
-                        match e.error_len() {
-                            Some(n) => {
-                                self.print("\u{fffd}");
-                                i = valid + n;
-                            }
-                            None if end == data.len() => {
-                                i = valid;
-                                break;
-                            }
-                            None => {
-                                self.print("\u{fffd}");
-                                i = end;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        self.pending = data[i..].to_vec();
+    /// Whether `needle` is in the text of a single row. Text that wrapped
+    /// onto two rows is not found across them.
+    pub fn contains(&self, needle: &str) -> bool {
+        self.rows().iter().any(|row| row.contains(needle))
     }
 
-    fn print_text(&mut self, text: &str) {
-        for g in text.graphemes(true) {
-            self.print(g);
-        }
-    }
-
-    fn osc(&mut self, payload: &str) {
-        let mut parts = payload.splitn(3, ';');
-        match (parts.next(), parts.next(), parts.next()) {
-            // Hyperlinks: OSC 8 ; params ; URL.
-            (Some("8"), Some(_params), Some(url)) => {
-                self.link = (!url.is_empty()).then(|| std::sync::Arc::from(url));
-            }
-            _ => panic!("unmodeled OSC {payload:?}"),
-        }
-    }
-
-    fn csi(&mut self, params: &str, fin: char) {
-        let nums: Vec<usize> = params.split(';').map(|p| p.parse().unwrap_or(0)).collect();
-        match fin {
-            'H' => {
-                self.y = nums[0].max(1).saturating_sub(1).min(self.height - 1);
-                self.x = nums
-                    .get(1)
-                    .copied()
-                    .unwrap_or(1)
-                    .max(1)
-                    .saturating_sub(1)
-                    .min(self.width - 1);
-                self.pending_wrap = false;
-            }
-            'C' => {
-                let n = nums[0].max(1);
-                self.x = (self.x + n).min(self.width - 1);
-                self.pending_wrap = false;
-            }
-            'J' => {
-                assert_eq!(nums[0], 2, "only ED 2 is modeled");
-                self.cells.iter_mut().for_each(Cell::reset);
-                self.links.iter_mut().for_each(|l| *l = None);
-            }
-            'm' => self.sgr(&nums),
-            // Private modes such as alternate screen; not modeled.
-            'h' | 'l' => {
-                if params == "?25" {
-                    self.cursor_visible = fin == 'h';
-                }
-            }
-            other => panic!("unmodeled CSI final {other:?}"),
-        }
-    }
-
-    fn sgr(&mut self, nums: &[usize]) {
-        let mut i = 0;
-        while i < nums.len() {
-            let n = nums[i];
-            let color = |base: usize, i: &mut usize| -> Color {
-                match nums[*i + 1] {
-                    5 => {
-                        *i += 2;
-                        Color::Indexed(nums[*i] as u8)
-                    }
-                    2 => {
-                        let c =
-                            Color::Rgb(nums[*i + 2] as u8, nums[*i + 3] as u8, nums[*i + 4] as u8);
-                        *i += 4;
-                        let _ = base;
-                        c
-                    }
-                    other => panic!("bad extended color {other}"),
-                }
-            };
-            match n {
-                0 => self.pen = Style::new(),
-                1 => self.pen = self.pen.add_modifier(Modifier::BOLD),
-                2 => self.pen = self.pen.add_modifier(Modifier::DIM),
-                3 => self.pen = self.pen.add_modifier(Modifier::ITALIC),
-                4 => self.pen = self.pen.add_modifier(Modifier::UNDERLINE),
-                7 => self.pen = self.pen.add_modifier(Modifier::REVERSE),
-                9 => self.pen = self.pen.add_modifier(Modifier::STRIKETHROUGH),
-                30..=37 => self.pen.fg = Some(ansi(n - 30)),
-                90..=97 => self.pen.fg = Some(ansi(n - 90 + 8)),
-                40..=47 => self.pen.bg = Some(ansi(n - 40)),
-                100..=107 => self.pen.bg = Some(ansi(n - 100 + 8)),
-                39 => self.pen.fg = Some(Color::Default),
-                49 => self.pen.bg = Some(Color::Default),
-                38 => self.pen.fg = Some(color(38, &mut i)),
-                48 => self.pen.bg = Some(color(48, &mut i)),
-                other => panic!("unmodeled SGR {other}"),
-            }
-            i += 1;
-        }
-    }
-
-    fn print(&mut self, g: &str) {
-        let w = grapheme_width(g);
-        if w == 0 {
-            return;
-        }
-        if self.pending_wrap {
-            self.x = 0;
-            self.y = (self.y + 1).min(self.height - 1);
-            self.pending_wrap = false;
-        }
-        if self.x + w > self.width {
-            self.x = 0;
-            self.y = (self.y + 1).min(self.height - 1);
-        }
-        let row = self.y * self.width;
-        for k in 0..w {
-            let x = self.x + k;
-            if self.cells[row + x].is_continuation() && x > 0 {
-                self.cells[row + x - 1].set_symbol(" ");
-            } else if x + 1 < self.width && self.cells[row + x + 1].is_continuation() {
-                self.cells[row + x + 1].set_symbol(" ");
-            }
-        }
-        let mut head = Cell::blank();
-        head.set_symbol(g).set_style(self.pen);
-        self.cells[row + self.x] = head;
-        self.links[row + self.x] = self.link.clone();
-        if w == 2 {
-            let mut tail = Cell::blank();
-            tail.set_symbol("").set_style(self.pen);
-            self.cells[row + self.x + 1] = tail;
-            self.links[row + self.x + 1] = self.link.clone();
-        }
-        if self.x + w >= self.width {
-            self.x = self.width - 1;
-            self.pending_wrap = true;
-        } else {
-            self.x += w;
-        }
-    }
-}
-
-fn ansi(n: usize) -> Color {
-    [
-        Color::Black,
-        Color::Red,
-        Color::Green,
-        Color::Yellow,
-        Color::Blue,
-        Color::Magenta,
-        Color::Cyan,
-        Color::White,
-        Color::BrightBlack,
-        Color::BrightRed,
-        Color::BrightGreen,
-        Color::BrightYellow,
-        Color::BrightBlue,
-        Color::BrightMagenta,
-        Color::BrightCyan,
-        Color::BrightWhite,
-    ][n]
-}
-
-#[cfg(unix)]
-pub(crate) use pty::*;
-
-/// Pseudo-terminals and child processes, which only exist on Unix.
-#[cfg(unix)]
-mod pty {
-    use std::ffi::CStr;
-    use std::io;
-    use std::os::fd::{FromRawFd, RawFd};
-    use std::os::unix::process::CommandExt;
-    use std::process::{Child, Command, ExitStatus, Stdio};
-    use std::sync::{Mutex, PoisonError};
-    use std::time::{Duration, Instant};
-
-    use crate::terminal::{get_termios, last_error};
-
-    /// A pseudo-terminal pair: the app side is `slave`, the test reads what
-    /// the app wrote from `master`.
-    pub(crate) struct Pty {
-        pub(crate) master: RawFd,
-        pub(crate) slave: RawFd,
-    }
-
-    static OPEN: Mutex<()> = Mutex::new(());
-
-    impl Pty {
-        pub(crate) fn open() -> Pty {
-            let _guard = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
-            // SAFETY: plain libc calls; `ptsname` returns a pointer into a
-            // static buffer, which the lock above keeps other threads from
-            // overwriting until it is copied and used.
-            unsafe {
-                let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-                assert!(master >= 0, "posix_openpt: {}", last_error());
-                assert_eq!(libc::grantpt(master), 0);
-                assert_eq!(libc::unlockpt(master), 0);
-                let name = CStr::from_ptr(libc::ptsname(master)).to_owned();
-                let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
-                assert!(slave >= 0, "open slave: {}", last_error());
-                let flags = libc::fcntl(master, libc::F_GETFL);
-                libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                // Children must not inherit these: a master kept open in the
-                // child would stop a hangup from ever happening.
-                libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
-                libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
-                Pty { master, slave }
-            }
-        }
-
-        /// Everything the app has written so far.
-        pub(crate) fn output(&self) -> Vec<u8> {
-            drain_fd(self.master, 100)
-        }
-
-        /// What the app has written, but for at most `limit` even if it keeps
-        /// writing.
-        pub(crate) fn output_within(&self, limit: Duration) -> Vec<u8> {
-            drain_fd_until(self.master, 100, Some(Instant::now() + limit))
-        }
-
-        /// Reads output into `seen` until it contains `needle`. Returns false if
-        /// `limit` passes first.
-        pub(crate) fn read_until(
-            &self,
-            needle: &[u8],
-            limit: Duration,
-            seen: &mut Vec<u8>,
-        ) -> bool {
-            let deadline = Instant::now() + limit;
-            while !seen.windows(needle.len()).any(|w| w == needle) {
-                if Instant::now() >= deadline {
-                    return false;
-                }
-                seen.extend(drain_fd(self.master, 50));
-            }
-            true
-        }
-
-        /// Sets the size the terminal reports.
-        pub(crate) fn set_size(&self, columns: u16, rows: u16) {
-            let ws = libc::winsize {
-                ws_row: rows,
-                ws_col: columns,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            // SAFETY: `TIOCSWINSZ` reads one `winsize` through the pointer.
-            assert_eq!(
-                unsafe { libc::ioctl(self.master, libc::TIOCSWINSZ, &ws) },
-                0
-            );
-        }
-
-        pub(crate) fn termios(&self) -> libc::termios {
-            get_termios(self.slave).unwrap()
-        }
-
-        pub(crate) fn is_raw(&self) -> bool {
-            self.termios().c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG) == 0
-        }
-    }
-
-    impl Pty {
-        /// Closes the master side, which hangs up the terminal: processes that
-        /// have it as their controlling terminal get SIGHUP.
-        pub(crate) fn close_master(&mut self) {
-            // SAFETY: closes the descriptor once; `Drop` skips it afterwards.
-            unsafe { libc::close(self.master) };
-            self.master = -1;
-        }
-
-        /// Starts `cmd` with this terminal as its stdin, stdout, stderr and
-        /// controlling terminal, in a session of its own. That last part is what
-        /// makes hangups and terminal-generated signals reach it.
-        pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
-            let dup = || -> io::Result<Stdio> {
-                // SAFETY: `dup` returns a new descriptor that `Stdio` then owns.
-                let fd = unsafe { libc::dup(self.slave) };
-                if fd < 0 {
-                    return Err(last_error());
-                }
-                Ok(unsafe { Stdio::from_raw_fd(fd) })
-            };
-            cmd.stdin(dup()?).stdout(dup()?).stderr(dup()?);
-            // SAFETY: runs between fork and exec in the child and only calls
-            // async-signal-safe functions (`setsid`, `ioctl`).
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::setsid() < 0 {
-                        return Err(last_error());
-                    }
-                    if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                        return Err(last_error());
-                    }
-                    Ok(())
-                });
-            }
-            cmd.spawn()
-        }
-
-        /// Reruns this test executable as a child on this terminal, running
-        /// only `test` (a full path such as `pty_children::child_entry`) with
-        /// `mode` in the environment. The test decides what to do from the
-        /// mode; see `crate::pty_children`.
-        pub(crate) fn spawn_self(&self, test: &str, mode: &str) -> io::Result<Child> {
-            let exe = std::env::current_exe()?;
-            self.spawn(
-                Command::new(exe)
-                    .args(["--exact", test, "--nocapture", "--test-threads=1"])
-                    .env(CHILD_MODE, mode),
+    /// The cell at column `x` and row `y`, with its symbol and style.
+    ///
+    /// # Panics
+    ///
+    /// When the position is outside the screen. [`Snapshot::buffer`] has
+    /// `get`, which returns `None` there.
+    pub fn cell(&self, x: u16, y: u16) -> &Cell {
+        self.buffer.get(x, y).unwrap_or_else(|| {
+            panic!(
+                "cell ({x}, {y}) is outside the {}x{} screen",
+                self.width(),
+                self.height()
             )
-        }
+        })
     }
 
-    /// Sends `sig` to `child`.
-    pub(crate) fn kill(child: &Child, sig: libc::c_int) {
-        // SAFETY: `kill` takes a pid and a signal number.
-        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, sig) }, 0);
+    /// The hyperlink at column `x` and row `y`, if the text there is one.
+    pub fn link_at(&self, x: u16, y: u16) -> Option<&str> {
+        self.buffer.link_at(x, y)
     }
 
-    /// Waits until `child` has been stopped by a signal, and returns which one,
-    /// or `None` if that didn't happen within `limit`.
-    pub(crate) fn wait_until_stopped(child: &Child, limit: Duration) -> Option<libc::c_int> {
-        let deadline = Instant::now() + limit;
-        while Instant::now() < deadline {
-            let mut status = 0;
-            // SAFETY: `status` is valid for a write, and WNOHANG returns at once.
-            let got = unsafe {
-                libc::waitpid(
-                    child.id() as libc::pid_t,
-                    &mut status,
-                    libc::WUNTRACED | libc::WNOHANG,
-                )
-            };
-            if got > 0 && libc::WIFSTOPPED(status) {
-                return Some(libc::WSTOPSIG(status));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        None
+    /// Where the app put the terminal cursor, or `None` when it is hidden.
+    /// A position outside the screen counts as hidden, as it does when drawing.
+    pub fn cursor(&self) -> Option<(u16, u16)> {
+        self.cursor
     }
 
-    /// The environment variable that tells a re-run test executable which
-    /// scenario to play out.
-    pub(crate) const CHILD_MODE: &str = "CREWTUI_PTY_CHILD";
-
-    /// Waits for `child` to exit, up to `limit`. `None` means it is still running.
-    pub(crate) fn wait_timeout(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
-        let deadline = Instant::now() + limit;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Some(status),
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5))
-                }
-                _ => return None,
-            }
-        }
-    }
-
-    impl Drop for Pty {
-        fn drop(&mut self) {
-            // SAFETY: both descriptors were opened by `open` and are closed once.
-            unsafe {
-                if self.master >= 0 {
-                    libc::close(self.master);
-                }
-                libc::close(self.slave);
-            }
-        }
-    }
-
-    pub(crate) fn same(a: &libc::termios, b: &libc::termios) -> bool {
-        a.c_iflag == b.c_iflag
-            && a.c_oflag == b.c_oflag
-            && a.c_cflag == b.c_cflag
-            && a.c_lflag == b.c_lflag
-            && a.c_cc == b.c_cc
-    }
-
-    /// Reads what is available on `fd`, waiting up to `idle_ms` for more.
-    pub(crate) fn drain_fd(fd: RawFd, idle_ms: libc::c_int) -> Vec<u8> {
-        drain_fd_until(fd, idle_ms, None)
-    }
-
-    /// Like `drain_fd`, but also returns once `deadline` has passed, so a child
-    /// that never stops writing can't keep the caller here forever.
-    pub(crate) fn drain_fd_until(
-        fd: RawFd,
-        idle_ms: libc::c_int,
-        deadline: Option<Instant>,
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
-        loop {
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                return out;
-            }
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: `pfd` is valid for one entry; `buf` for its length.
-            unsafe {
-                if libc::poll(&mut pfd, 1, idle_ms) <= 0 {
-                    return out;
-                }
-                let mut buf = [0u8; 512];
-                let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
-                if n <= 0 {
-                    return out;
-                }
-                out.extend_from_slice(&buf[..n as usize]);
-            }
-        }
-    }
-
-    /// Writes all of `bytes` to `fd`, which must be a pty master.
-    pub(crate) fn write_fd(fd: RawFd, bytes: &[u8]) {
-        // SAFETY: the pointer and length come from a live slice.
-        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        assert_eq!(n, bytes.len() as isize, "short write to the pty");
+    /// The buffer behind the snapshot.
+    pub fn buffer(&self) -> &Buffer {
+        &self.buffer
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::Command;
+    use crate::text::{Line, Span};
+    use crate::widgets::{InputState, Paragraph};
+    use crate::{Color, KeyCode, KeyModifiers, Style};
     use std::time::Duration;
 
-    fn sh(script: &str) -> Command {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", script]);
-        cmd
+    #[derive(Debug, PartialEq, Eq)]
+    enum Msg {
+        Key(char),
+        Load,
+        Loaded(u32),
+        Stream,
+        Chunk(u32),
+        Tick,
+        Copy,
+        Quit,
+        Resized(u16, u16),
+    }
+
+    #[derive(Default)]
+    struct Demo {
+        input: InputState,
+        loaded: Vec<u32>,
+        ticks: u32,
+        size: (u16, u16),
+    }
+
+    impl App for Demo {
+        type Message = Msg;
+
+        fn event(&self, event: Event) -> Option<Msg> {
+            match event {
+                Event::Key(k) if k.is(KeyCode::Char('!')) => Some(Msg::Load),
+                Event::Key(k) if k.is(KeyCode::Char('~')) => Some(Msg::Stream),
+                Event::Key(k) if k.is(KeyCode::Char('c')) => Some(Msg::Copy),
+                Event::Key(k) if k.is(KeyCode::Esc) => Some(Msg::Quit),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(c),
+                    ..
+                }) => Some(Msg::Key(c)),
+                Event::Resize(w, h) => Some(Msg::Resized(w, h)),
+                _ => None,
+            }
+        }
+
+        fn update(&mut self, message: Msg) -> Cmd<Msg> {
+            match message {
+                Msg::Key(c) => {
+                    self.input.insert_char(c);
+                    Cmd::none()
+                }
+                Msg::Load => Cmd::batch([
+                    Cmd::perform(|| Msg::Loaded(7)),
+                    Cmd::after(Duration::from_secs(2), Msg::Tick),
+                    Cmd::after(Duration::from_secs(1), Msg::Tick),
+                ]),
+                Msg::Loaded(n) => {
+                    self.loaded.push(n);
+                    if n < 9 {
+                        Cmd::perform(move || Msg::Loaded(n + 1))
+                    } else {
+                        Cmd::none()
+                    }
+                }
+                Msg::Stream => Cmd::spawn(|tx| {
+                    for i in 0..3 {
+                        let _ = tx.send(Msg::Chunk(i));
+                    }
+                }),
+                Msg::Chunk(n) => {
+                    self.loaded.push(100 + n);
+                    Cmd::none()
+                }
+                Msg::Tick => {
+                    self.ticks += 1;
+                    Cmd::none()
+                }
+                Msg::Copy => Cmd::batch([
+                    Cmd::copy_to_clipboard(self.input.text().to_owned()),
+                    Cmd::copy_to_clipboard(""),
+                ]),
+                Msg::Quit => Cmd::quit(),
+                Msg::Resized(w, h) => {
+                    self.size = (w, h);
+                    Cmd::none()
+                }
+            }
+        }
+
+        fn view(&self, frame: &mut Frame<'_>) {
+            let area = frame.area();
+            let title = Line::from(vec![
+                Span::styled("in: ", Style::new().fg(Color::Green)),
+                Span::raw(self.input.text().to_owned()),
+                Span::raw(" 中").link("https://e.com/x"),
+            ]);
+            frame.render_widget(Paragraph::new(title), area);
+            let rest = Rect::new(0, 1, area.width, area.height.saturating_sub(1));
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{:?} ticks={} {}x{}",
+                    self.loaded, self.ticks, area.width, area.height
+                )),
+                rest,
+            );
+            let (x, y) = (4 + self.input.cursor_column() as u16, 0);
+            frame.set_cursor(x, y);
+        }
+
+        fn init(&self) -> Cmd<Msg> {
+            Cmd::perform(|| Msg::Key('i'))
+        }
+    }
+
+    fn press(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    fn harness() -> Harness<Demo> {
+        Harness::new(Demo::default(), 30, 3)
     }
 
     #[test]
-    fn a_child_that_leaves_the_terminal_alone_leaves_termios_unchanged() {
-        let pty = Pty::open();
-        let original = pty.termios();
-        let mut child = pty.spawn(&mut sh("true")).unwrap();
-        let status = wait_timeout(&mut child, Duration::from_secs(10)).expect("still running");
-        assert!(status.success());
-        assert!(same(&pty.termios(), &original));
+    fn events_go_through_event_and_update_and_the_screen_shows_the_result() {
+        let mut h = harness();
+        h.event(press('a')).event(press('b'));
+        assert_eq!(h.app().input.text(), "ab");
+        let screen = h.screen();
+        assert_eq!(screen.rows()[0], "in: ab 中");
+        assert_eq!(screen.rows().len(), 3);
+        assert_eq!(screen.rows()[1], "[] ticks=0 30x3");
+        assert!(screen.contains("ticks=0"));
+        assert!(!screen.contains("nope"));
+        assert_eq!(screen.text(), "in: ab 中\n[] ticks=0 30x3");
+        assert_eq!(screen.width(), 30);
+        assert_eq!(screen.height(), 3);
     }
 
     #[test]
-    fn a_child_that_leaves_the_terminal_raw_is_caught() {
-        // The failure the safety tests exist to catch, produced on purpose.
-        let pty = Pty::open();
-        let original = pty.termios();
-        let mut child = pty.spawn(&mut sh("stty raw -echo")).unwrap();
-        wait_timeout(&mut child, Duration::from_secs(10)).expect("still running");
-        assert!(!same(&pty.termios(), &original));
-        assert!(pty.is_raw());
+    fn an_event_the_app_ignores_changes_nothing() {
+        let mut h = harness();
+        h.event(Event::FocusGained);
+        assert_eq!(h.app().input.text(), "");
+        assert_eq!(h.pending_jobs(), 0);
     }
 
     #[test]
-    fn bytes_typed_at_the_master_reach_the_child_and_its_output_comes_back() {
-        let pty = Pty::open();
-        let mut child = pty.spawn(&mut sh("read x; echo got:$x")).unwrap();
-        write_fd(pty.master, b"hi\n");
-        wait_timeout(&mut child, Duration::from_secs(10)).expect("still running");
-        let out = String::from_utf8_lossy(&pty.output()).into_owned();
-        assert!(out.contains("got:hi"), "{out:?}");
+    fn cells_carry_their_styles_and_links_and_the_cursor_is_reported() {
+        let mut h = harness();
+        h.event(press('a'));
+        let screen = h.screen();
+        assert_eq!(screen.cell(0, 0).symbol(), "i");
+        assert_eq!(screen.cell(0, 0).style().fg, Some(Color::Green));
+        assert_eq!(screen.cell(4, 0).style().fg, None);
+        assert_eq!(screen.link_at(6, 0), Some("https://e.com/x"));
+        assert_eq!(screen.link_at(0, 0), None);
+        assert_eq!(screen.cursor(), Some((5, 0)));
     }
 
     #[test]
-    fn an_esc_in_a_cut_sequence_starts_the_next_one_instead_of_printing_it() {
-        let mut screen = Screen::new(6, 1);
-        // An OSC 8 cut after its URL began, then a CSI, then text.
-        screen.feed(b"\x1b]8;;http://x");
-        screen.feed(b"\x1b[1mabc");
-        assert_eq!(screen.row(0).trim_end(), "abc");
-        // A CSI cut right after its ESC, then another.
-        let mut screen = Screen::new(6, 1);
-        screen.feed(b"\x1b");
-        screen.feed(b"\x1b[0mxy");
-        assert_eq!(screen.row(0).trim_end(), "xy");
+    fn a_cursor_outside_the_screen_is_hidden_and_a_cell_outside_panics() {
+        let mut h = harness();
+        h.event(press('a'));
+        h.resize(3, 3);
+        assert_eq!(h.screen().cursor(), None);
+        let out = std::panic::catch_unwind(|| {
+            let h = Harness::new(Demo::default(), 2, 2);
+            h.screen().cell(5, 5).symbol().to_owned()
+        });
+        assert!(out.is_err());
     }
 
     #[test]
-    fn output_from_a_child_can_be_replayed_into_the_screen_model() {
-        let pty = Pty::open();
-        pty.set_size(20, 3);
-        let mut child = pty
-            .spawn(&mut sh(r"printf '\033[2J\033[1;1Hhello \033[2;3Hworld'"))
-            .unwrap();
-        wait_timeout(&mut child, Duration::from_secs(10)).expect("still running");
-        let mut screen = Screen::new(20, 3);
-        screen.feed(&pty.output());
-        assert_eq!(screen.row(0).trim_end(), "hello");
-        assert_eq!(screen.row(1).trim_end(), "  world");
+    fn start_queues_what_init_returned_and_run_commands_delivers_it() {
+        let mut h = harness();
+        assert_eq!(h.pending_jobs(), 0);
+        h.start();
+        assert_eq!(h.pending_jobs(), 1);
+        assert_eq!(h.app().input.text(), "");
+        h.run_commands();
+        assert_eq!(h.pending_jobs(), 0);
+        assert_eq!(h.app().input.text(), "i");
     }
 
     #[test]
-    fn closing_the_master_hangs_the_child_up() {
-        let mut pty = Pty::open();
-        let mut child = pty.spawn(&mut sh("sleep 30")).unwrap();
-        // Let it start, so the signal isn't sent to a process still forking.
-        assert!(wait_timeout(&mut child, Duration::from_millis(100)).is_none());
-        pty.close_master();
-        let status = wait_timeout(&mut child, Duration::from_secs(10))
-            .expect("the child ignored the hangup");
-        assert_eq!(status.signal(), Some(libc::SIGHUP));
+    fn run_commands_also_runs_the_work_that_the_messages_start() {
+        let mut h = harness();
+        h.event(press('!'));
+        assert_eq!(h.pending_jobs(), 1);
+        assert!(h.app().loaded.is_empty());
+        h.run_commands();
+        assert_eq!(h.app().loaded, [7, 8, 9]);
+        assert!(h.screen().contains("[7, 8, 9]"));
     }
 
     #[test]
-    fn waiting_for_a_child_that_keeps_running_times_out() {
-        let pty = Pty::open();
-        let mut child = pty.spawn(&mut sh("sleep 30")).unwrap();
-        assert!(wait_timeout(&mut child, Duration::from_millis(100)).is_none());
-        child.kill().unwrap();
-        assert!(wait_timeout(&mut child, Duration::from_secs(10)).is_some());
+    fn spawned_work_sends_its_messages_in_order() {
+        let mut h = harness();
+        h.event(press('~')).run_commands();
+        assert_eq!(h.app().loaded, [100, 101, 102]);
     }
 
     #[test]
-    fn this_executable_can_be_rerun_as_a_child_on_a_terminal() {
-        let pty = Pty::open();
-        let mut child = pty
-            .spawn_self("pty_children::child_entry", "hello")
-            .unwrap();
-        let status =
-            wait_timeout(&mut child, Duration::from_secs(30)).expect("the child never finished");
-        assert!(status.success(), "{status:?}");
-        let out = String::from_utf8_lossy(&pty.output()).into_owned();
-        assert!(out.contains("hello from the child"), "{out:?}");
+    fn timers_wait_for_fire_timers_and_are_listed_by_delay() {
+        let mut h = harness();
+        h.event(press('!'));
+        assert_eq!(
+            h.pending_timers(),
+            [Duration::from_secs(2), Duration::from_secs(1)]
+        );
+        assert_eq!(h.app().ticks, 0);
+        h.fire_timers();
+        assert_eq!(h.app().ticks, 2);
+        assert!(h.pending_timers().is_empty());
+        assert!(h.screen().contains("ticks=2"));
+    }
+
+    #[test]
+    fn clipboard_texts_are_recorded_and_the_ones_that_would_not_be_sent_are_not() {
+        let mut h = harness();
+        h.event(press('h')).event(press('i')).event(press('c'));
+        assert_eq!(h.clipboard(), ["hi"]);
+        h.event(press('c'));
+        assert_eq!(h.take_clipboard(), ["hi", "hi"]);
+        assert!(h.clipboard().is_empty());
+    }
+
+    #[test]
+    fn quit_is_remembered_and_input_still_works_after_it() {
+        let mut h = harness();
+        assert!(!h.has_quit());
+        h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(h.has_quit());
+        h.event(press('x'));
+        assert_eq!(h.app().input.text(), "x");
+    }
+
+    #[test]
+    fn resize_changes_what_view_draws_on_and_tells_the_app() {
+        let mut h = harness();
+        h.resize(12, 2);
+        assert_eq!(h.app().size, (12, 2));
+        let screen = h.screen();
+        assert_eq!((screen.width(), screen.height()), (12, 2));
+        assert_eq!(screen.rows()[1], "[] ticks=0 1");
+    }
+
+    #[test]
+    fn messages_can_be_sent_straight_and_the_app_taken_back() {
+        let mut h = harness();
+        h.message(Msg::Loaded(9));
+        h.app_mut().ticks = 5;
+        let app = h.into_app();
+        assert_eq!(app.loaded, [9]);
+        assert_eq!(app.ticks, 5);
+    }
+
+    #[test]
+    fn work_that_never_stops_fails_the_test_instead_of_hanging() {
+        struct Forever;
+        impl App for Forever {
+            type Message = ();
+            fn event(&self, _: Event) -> Option<()> {
+                None
+            }
+            fn update(&mut self, _: ()) -> Cmd<()> {
+                Cmd::perform(|| ())
+            }
+            fn view(&self, _: &mut Frame<'_>) {}
+        }
+        let out = std::panic::catch_unwind(|| {
+            let mut h = Harness::new(Forever, 1, 1);
+            h.message(()).run_commands();
+        });
+        assert!(out.is_err());
+    }
+
+    #[test]
+    fn the_harness_has_a_debug_form_that_does_not_need_the_app_to_have_one() {
+        let h = harness();
+        let text = format!("{h:?}");
+        assert!(text.contains("pending_jobs"), "{text}");
     }
 }

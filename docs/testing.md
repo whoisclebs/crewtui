@@ -1,6 +1,14 @@
 # Testing terminal behavior
 
-Most of the crate is tested with plain unit tests. The parts that talk to a terminal need something that behaves like one. Two helpers in `src/testing.rs` (compiled only for tests) do that.
+Most of the crate is tested with plain unit tests. The parts that talk to a terminal need something that behaves like one. Two helpers in `src/term_model.rs` (compiled only for tests) do that. An app's own tests use a third, public one, the harness below.
+
+## Testing an app: `testing::Harness`
+
+`crewtui::testing::Harness` runs an `App` with no terminal, no threads and no clock, for the tests of the app that uses the crate. It lives in the public API and depends on nothing.
+
+`Harness::new(app, width, height)` wraps the app. `start()` runs `App::init`, `event(Event)` and `key(KeyEvent)` go through the app's `event` and `update`, `message(msg)` goes straight to `update`, and `resize(w, h)` changes the size and sends `Event::Resize`. `screen()` draws the app and returns a `Snapshot` with `rows()` (trailing spaces trimmed), `text()`, `contains(&str)`, `cell(x, y)` for symbol and style, `link_at(x, y)` and `cursor()`.
+
+What commands ask for is visible to the test instead of happening elsewhere. `Cmd::perform` and `Cmd::spawn` wait until `run_commands()`, which runs them on the test thread and delivers their messages, including the work those start. `Cmd::after` waits until `fire_timers()`, and `pending_timers()` lists the delays. `Cmd::copy_to_clipboard` texts are in `clipboard()`, and `Cmd::quit` sets `has_quit()`. A test decides when each of these happens, so nothing depends on timing.
 
 ## The terminal model
 

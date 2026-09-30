@@ -27,13 +27,14 @@ mod signals;
 #[path = "signals_windows.rs"]
 mod signals;
 mod style;
+#[cfg(test)]
+mod term_model;
 #[cfg(unix)]
 mod terminal;
 #[cfg(windows)]
 #[path = "terminal_windows.rs"]
 mod terminal;
-#[cfg(test)]
-mod testing;
+pub mod testing;
 pub mod text;
 mod utf16;
 pub mod widgets;

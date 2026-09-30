@@ -335,7 +335,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::testing::{Pty, same};
+    use crate::term_model::{Pty, same};
 
     fn enter(pty: &Pty, options: TerminalOptions) -> Terminal {
         Terminal::enter_on(pty.slave, pty.slave, options).unwrap()

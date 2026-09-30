@@ -234,6 +234,35 @@ impl<M> fmt::Debug for Cmd<M> {
     }
 }
 
+/// One effect of a command, with batches unrolled, for the test harness.
+pub(crate) enum Effect<M> {
+    Quit,
+    Repaint,
+    Copy(String),
+    Perform(Box<dyn FnOnce() -> M + Send>),
+    Spawn(Box<dyn FnOnce(Sender<M>) + Send>),
+    After(Duration, M),
+}
+
+/// The effects in `cmd`, in the order they start.
+pub(crate) fn effects_of<M>(cmd: Cmd<M>) -> Vec<Effect<M>> {
+    let mut out = Vec::new();
+    let mut pending = vec![cmd];
+    while let Some(cmd) = pending.pop() {
+        match cmd.kind {
+            CmdKind::None => {}
+            CmdKind::Quit => out.push(Effect::Quit),
+            CmdKind::Repaint => out.push(Effect::Repaint),
+            CmdKind::Copy(text) => out.push(Effect::Copy(text)),
+            CmdKind::Batch(cmds) => pending.extend(cmds.into_iter().rev()),
+            CmdKind::Perform(work) => out.push(Effect::Perform(work)),
+            CmdKind::Spawn(work) => out.push(Effect::Spawn(work)),
+            CmdKind::After(delay, message) => out.push(Effect::After(delay, message)),
+        }
+    }
+    out
+}
+
 /// What running a command asks of the loop itself.
 #[derive(Default)]
 struct Requests {
@@ -634,9 +663,9 @@ pub(crate) fn event_loop<A: App, H: Host>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::Screen;
+    use crate::term_model::Screen;
     #[cfg(unix)]
-    use crate::testing::{Pty, drain_fd, same, write_fd};
+    use crate::term_model::{Pty, drain_fd, same, write_fd};
     use crate::{KeyCode, KeyEvent, KeyModifiers, Rect, Style};
     use std::cell::{Cell as StdCell, RefCell};
     use std::collections::VecDeque;

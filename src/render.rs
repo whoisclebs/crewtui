@@ -334,7 +334,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::testing::Screen;
+    use crate::term_model::Screen;
 
     fn text(r: &mut Renderer, rows: &[&str]) -> Vec<u8> {
         r.draw_buf(|b| {

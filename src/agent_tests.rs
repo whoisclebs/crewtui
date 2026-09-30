@@ -3,7 +3,7 @@
 //! `pty_children`.
 
 use crate::agent_example::{Agent, Msg, Pace, Status};
-use crate::testing::Screen;
+use crate::term_model::Screen;
 use crate::{
     App, Buffer, Event, Frame, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseKind, Rect,
     Renderer,

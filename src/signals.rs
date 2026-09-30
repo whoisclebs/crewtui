@@ -501,7 +501,7 @@ mod tests {
     /// continued.
     #[test]
     fn stop_process_stops_with_sigtstp_and_puts_the_handler_back() {
-        use crate::testing::{kill, wait_timeout, wait_until_stopped};
+        use crate::term_model::{kill, wait_timeout, wait_until_stopped};
         use std::os::unix::process::CommandExt;
         use std::time::Duration;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())

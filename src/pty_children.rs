@@ -8,7 +8,7 @@
 
 use std::io::{self, Write};
 
-use crate::testing::CHILD_MODE;
+use crate::term_model::CHILD_MODE;
 use crate::{
     App, Cmd, Event, Frame, KeyCode, KeyModifiers, Program, Style, Terminal, TerminalOptions,
 };
@@ -123,7 +123,7 @@ fn child_entry() {
 
 #[cfg(test)]
 mod tests {
-    use crate::testing::{Pty, kill, same, wait_timeout, wait_until_stopped, write_fd};
+    use crate::term_model::{Pty, kill, same, wait_timeout, wait_until_stopped, write_fd};
     use std::os::unix::process::ExitStatusExt;
     use std::process::Child;
     use std::time::Duration;
@@ -389,7 +389,7 @@ mod tests {
     }
 
     /// Feeds what the child writes to `screen` until some row holds `text`.
-    fn wait_for_row(s: &mut Scenario, screen: &mut crate::testing::Screen, text: &str) {
+    fn wait_for_row(s: &mut Scenario, screen: &mut crate::term_model::Screen, text: &str) {
         let deadline = std::time::Instant::now() + LIMIT;
         loop {
             let out = s.pty.output_within(std::time::Duration::from_millis(500));
@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn the_agent_example_answers_a_request_and_quits_cleanly_on_ctrl_c() {
         let mut s = Scenario::start_sized("agent", true, 100, 30);
-        let mut screen = crate::testing::Screen::new(100, 30);
+        let mut screen = crate::term_model::Screen::new(100, 30);
         // What was drawn before `start_sized` returned.
         screen.feed(&s.seen);
         wait_for_row(&mut s, &mut screen, "crewtui agent");
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn a_kitty_release_of_ctrl_c_does_not_quit_the_agent_and_the_press_does() {
         let mut s = Scenario::start_sized("agent", true, 100, 30);
-        let mut screen = crate::testing::Screen::new(100, 30);
+        let mut screen = crate::term_model::Screen::new(100, 30);
         screen.feed(&s.seen);
         wait_for_row(&mut s, &mut screen, "crewtui agent");
         // Ctrl+C released, as a terminal with the kitty protocol reports it.
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn the_agent_example_survives_its_stress_mode_and_quits_cleanly() {
         let mut s = Scenario::start_sized("agent_stress", true, 100, 30);
-        let mut screen = crate::testing::Screen::new(100, 30);
+        let mut screen = crate::term_model::Screen::new(100, 30);
         screen.feed(&s.seen);
         wait_for_row(&mut s, &mut screen, "crewtui agent");
         // A request arrives by itself every second, on top of 20,000 lines.
