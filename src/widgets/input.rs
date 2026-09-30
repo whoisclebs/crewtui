@@ -3,7 +3,7 @@ use std::cell::Cell;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{Block, StatefulWidget, Widget};
-use crate::input::{KeyCode, KeyEvent, KeyModifiers};
+use crate::input::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::text::{grapheme_width, truncate, width};
 use crate::{Buffer, Rect, Style};
 
@@ -270,10 +270,15 @@ impl InputState {
     /// the end, Ctrl+U to the start, and Ctrl+W or Alt+Backspace for the word
     /// before the cursor.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // A key that comes up has done its work when it went down.
+        if key.kind == KeyEventKind::Release {
+            return true;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CTRL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let sup = key.modifiers.contains(KeyModifiers::SUPER);
         match key.code {
-            KeyCode::Char(c) if !ctrl && !alt => self.insert_char(c),
+            KeyCode::Char(c) if !ctrl && !alt && !sup => self.insert_char(c),
             KeyCode::Char('a') if ctrl => self.home(),
             KeyCode::Char('e') if ctrl => self.end(),
             KeyCode::Char('b') if ctrl => self.move_left(),
@@ -661,6 +666,26 @@ mod tests {
         s.clear();
         assert!(s.is_empty());
         assert_eq!(s.cursor(), 0);
+    }
+
+    #[test]
+    fn a_release_does_nothing_and_super_does_not_type() {
+        let mut s = InputState::new();
+        assert!(s.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(s.handle_key(
+            key(KeyCode::Char('a'), KeyModifiers::NONE).with_kind(KeyEventKind::Release)
+        ));
+        assert!(s.handle_key(
+            key(KeyCode::Char('b'), KeyModifiers::NONE).with_kind(KeyEventKind::Repeat)
+        ));
+        assert_eq!(s.text(), "ab");
+        assert!(s.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE)));
+        assert!(s.handle_key(
+            key(KeyCode::Backspace, KeyModifiers::NONE).with_kind(KeyEventKind::Release)
+        ));
+        assert_eq!(s.text(), "a");
+        assert!(!s.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER)));
+        assert_eq!(s.text(), "a");
     }
 
     #[test]

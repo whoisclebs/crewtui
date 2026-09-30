@@ -35,8 +35,9 @@ impl InputReader {
         input: RawFd,
         signals: Option<Signals>,
         tx: Sender<Input<M>>,
+        keyboard_enhancement: bool,
     ) -> io::Result<InputReader> {
-        InputReader::spawn_with(input, signals, tx, ESCAPE_TIMEOUT_MS)
+        InputReader::spawn_with(input, signals, tx, ESCAPE_TIMEOUT_MS, keyboard_enhancement)
     }
 
     /// Like `spawn`, with the time a lone Esc waits for a sequence to follow.
@@ -45,13 +46,21 @@ impl InputReader {
         signals: Option<Signals>,
         tx: Sender<Input<M>>,
         escape_timeout_ms: libc::c_int,
+        keyboard_enhancement: bool,
     ) -> io::Result<InputReader> {
         let (wake_read, wake_write) = new_pipe()?;
         let thread = thread::Builder::new()
             .name("crewtui-input".into())
             .spawn(move || {
                 let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                    read_loop(input, wake_read, signals, &tx, escape_timeout_ms)
+                    read_loop(
+                        input,
+                        wake_read,
+                        signals,
+                        &tx,
+                        escape_timeout_ms,
+                        keyboard_enhancement,
+                    )
                 }));
                 outcome.unwrap_or_else(|_| {
                     // Other senders keep the channel open, so a silent death
@@ -139,8 +148,9 @@ fn read_loop<M>(
     mut signals: Option<Signals>,
     tx: &Sender<Input<M>>,
     escape_timeout_ms: libc::c_int,
+    keyboard_enhancement: bool,
 ) -> Option<Signals> {
-    let mut parser = Parser::new();
+    let mut parser = Parser::new().with_keyboard_enhancement(keyboard_enhancement);
     // When input last arrived. The Esc and paste timeouts count from here,
     // so a signal waking the loop doesn't restart them.
     let mut last_input = Instant::now();
@@ -321,7 +331,7 @@ mod tests {
     fn bytes_arrive_as_events() {
         let feed = Feed::new();
         let (tx, rx) = channel();
-        let _reader = InputReader::spawn(feed.read, None, tx).unwrap();
+        let _reader = InputReader::spawn(feed.read, None, tx, false).unwrap();
         feed.send(b"a\x1b[A\r");
         assert_eq!(next_event(&rx), key(KeyCode::Char('a')));
         assert_eq!(next_event(&rx), key(KeyCode::Up));
@@ -332,7 +342,7 @@ mod tests {
     fn a_lone_escape_becomes_esc_after_a_short_wait() {
         let feed = Feed::new();
         let (tx, rx) = channel();
-        let _reader = InputReader::spawn(feed.read, None, tx).unwrap();
+        let _reader = InputReader::spawn(feed.read, None, tx, false).unwrap();
         let sent = Instant::now();
         feed.send(b"\x1b");
         assert_eq!(next_event(&rx), key(KeyCode::Esc));
@@ -347,7 +357,7 @@ mod tests {
         let (tx, rx) = channel();
         // A timeout far longer than the gap, so a slow machine can't turn
         // this into an Esc.
-        let _reader = InputReader::spawn_with(feed.read, None, tx, 5_000).unwrap();
+        let _reader = InputReader::spawn_with(feed.read, None, tx, 5_000, false).unwrap();
         feed.send(b"\x1b");
         std::thread::sleep(Duration::from_millis(20));
         feed.send(b"[A");
@@ -358,7 +368,7 @@ mod tests {
     fn a_paste_is_one_event_and_a_lost_end_marker_is_given_up_on() {
         let feed = Feed::new();
         let (tx, rx) = channel();
-        let _reader = InputReader::spawn(feed.read, None, tx).unwrap();
+        let _reader = InputReader::spawn(feed.read, None, tx, false).unwrap();
         feed.send(b"\x1b[200~one\x1b[201~");
         assert_eq!(next_event(&rx), Event::Paste("one".into()));
         feed.send(b"\x1b[200~partial");
@@ -371,7 +381,7 @@ mod tests {
     fn end_of_input_is_reported_as_a_failure() {
         let mut feed = Feed::new();
         let (tx, rx) = channel();
-        let _reader = InputReader::spawn(feed.read, None, tx).unwrap();
+        let _reader = InputReader::spawn(feed.read, None, tx, false).unwrap();
         feed.hang_up();
         match next(&rx) {
             Input::Failed(e) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
@@ -385,7 +395,7 @@ mod tests {
         // to land on by reusing a freed number.
         let closed = 9_999;
         let (tx, rx) = channel();
-        let _reader = InputReader::spawn(closed, None, tx).unwrap();
+        let _reader = InputReader::spawn(closed, None, tx, false).unwrap();
         match next(&rx) {
             Input::Failed(e) => assert_eq!(e.raw_os_error(), Some(libc::EBADF)),
             _ => panic!("expected a failure"),
@@ -398,7 +408,7 @@ mod tests {
         let feed = Feed::new();
         let signals = Signals::install().unwrap();
         let (tx, rx) = channel();
-        let _reader = InputReader::spawn(feed.read, Some(signals), tx).unwrap();
+        let _reader = InputReader::spawn(feed.read, Some(signals), tx, false).unwrap();
         // SAFETY: `raise` takes a signal number and has no other preconditions.
         assert_eq!(unsafe { libc::raise(libc::SIGWINCH) }, 0);
         assert!(matches!(next(&rx), Input::Signal(crate::Signal::Resize)));
@@ -412,7 +422,7 @@ mod tests {
         let feed = Feed::new();
         let signals = Signals::install().unwrap();
         let (tx, _rx) = channel::<Input<()>>();
-        let reader = InputReader::spawn(feed.read, Some(signals), tx).unwrap();
+        let reader = InputReader::spawn(feed.read, Some(signals), tx, false).unwrap();
         let started = Instant::now();
         drop(reader);
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -426,7 +436,7 @@ mod tests {
         let feed = Feed::new();
         let signals = Signals::install().unwrap();
         let (tx, rx) = channel::<Input<()>>();
-        let _reader = InputReader::spawn(feed.read, Some(signals), tx).unwrap();
+        let _reader = InputReader::spawn(feed.read, Some(signals), tx, false).unwrap();
         feed.send(b"\x1b");
         let started = Instant::now();
         let mut got_esc = false;
@@ -447,7 +457,7 @@ mod tests {
         let feed = Feed::new();
         let signals = Signals::install().unwrap();
         let (tx, _rx) = channel::<Input<()>>();
-        let reader = InputReader::spawn(feed.read, Some(signals), tx).unwrap();
+        let reader = InputReader::spawn(feed.read, Some(signals), tx, false).unwrap();
         let held = reader.finish();
         assert!(held.is_some());
         // Still installed, so a second install is refused until it is dropped.
@@ -460,7 +470,7 @@ mod tests {
     fn a_reader_whose_receiver_is_gone_still_shuts_down() {
         let feed = Feed::new();
         let (tx, rx) = channel::<Input<()>>();
-        let reader = InputReader::spawn(feed.read, None, tx).unwrap();
+        let reader = InputReader::spawn(feed.read, None, tx, false).unwrap();
         drop(rx);
         feed.send(b"a");
         std::thread::sleep(Duration::from_millis(50));

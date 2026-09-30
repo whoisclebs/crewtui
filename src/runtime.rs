@@ -402,7 +402,12 @@ impl<A: App> Program<A> {
             None
         };
         let mut terminal = Terminal::enter_on(input, output, self.options)?;
-        let reader = InputReader::spawn(input, signals, self.tx.clone())?;
+        let reader = InputReader::spawn(
+            input,
+            signals,
+            self.tx.clone(),
+            self.options.keyboard_enhancement,
+        )?;
         let effects = Effects::new(self.tx);
         let result = event_loop(self.app, &self.rx, &effects, &mut terminal, self.max_fps);
         // Stop reading, but keep the handlers until `terminal` has dropped.

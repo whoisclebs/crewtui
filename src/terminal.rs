@@ -247,7 +247,14 @@ impl State {
         let mut raw = self.original;
         make_raw(&mut raw);
         set_termios(self.input, libc::TCSAFLUSH, &raw)?;
-        write_all_fd(self.output, &enable_sequence(&self.options))
+        let mut sequence = Vec::new();
+        if self.options.keyboard_enhancement {
+            // What an earlier entry pushed is still there, and `restore` pops
+            // once. Popping first, from an empty stack too, leaves one.
+            sequence.extend_from_slice(b"\x1b[<u");
+        }
+        sequence.extend_from_slice(&enable_sequence(&self.options));
+        write_all_fd(self.output, &sequence)
     }
 
     /// Undoes everything `activate` did. Only the first call does any work.
@@ -609,7 +616,11 @@ mod tests {
         assert!(!pty.is_raw());
         term.resume().unwrap();
         assert!(pty.is_raw());
-        assert_eq!(pty.output(), ALL_ON);
+        // The kitty flags are popped first, so that the one pop when the
+        // terminal is dropped leaves nothing behind.
+        let mut expected = b"\x1b[<u".to_vec();
+        expected.extend_from_slice(ALL_ON);
+        assert_eq!(pty.output(), expected);
         drop(term);
         assert!(same(&pty.termios(), &original));
         assert_eq!(pty.output(), ALL_OFF);

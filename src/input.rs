@@ -140,7 +140,7 @@ pub enum KeyCode {
     F(u8),
 }
 
-/// Shift, Ctrl and Alt.
+/// Shift, Ctrl, Alt and Super.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct KeyModifiers(u8);
 
@@ -264,18 +264,18 @@ fn with_alt(step: Step, consumed_extra: usize) -> Step {
 }
 
 /// Parses the first thing in `buf`, which is not empty.
-fn parse_one(buf: &[u8]) -> Step {
+fn parse_one(buf: &[u8], kitty: bool) -> Step {
     if buf[0] == ESC {
-        parse_escape(buf)
+        parse_escape(buf, kitty)
     } else {
         parse_plain(buf)
     }
 }
 
-fn parse_escape(buf: &[u8]) -> Step {
+fn parse_escape(buf: &[u8], kitty: bool) -> Step {
     match buf.get(1) {
         None => Step::NeedMore,
-        Some(b'[') => parse_csi(buf),
+        Some(b'[') => parse_csi(buf, kitty),
         Some(b'O') => parse_ss3(buf),
         // Three ESCs in a row: the first is a key press of its own. Without
         // this, a long run of ESC bytes would recurse once per byte.
@@ -283,7 +283,7 @@ fn parse_escape(buf: &[u8]) -> Step {
             Step::Event(key(KeyCode::Esc, KeyModifiers::NONE), 1)
         }
         // ESC before anything else is Alt with that key.
-        Some(_) => with_alt(parse_one(&buf[1..]), 1),
+        Some(_) => with_alt(parse_one(&buf[1..], kitty), 1),
     }
 }
 
@@ -307,7 +307,7 @@ fn parse_ss3(buf: &[u8]) -> Step {
     Step::Event(key(code, KeyModifiers::NONE), 3)
 }
 
-fn parse_csi(buf: &[u8]) -> Step {
+fn parse_csi(buf: &[u8], kitty: bool) -> Step {
     let mut i = 2;
     while let Some(&b) = buf.get(i) {
         match b {
@@ -319,7 +319,7 @@ fn parse_csi(buf: &[u8]) -> Step {
                     Step::Skip(6)
                 };
             }
-            0x40..=0x7e => return csi_step(&buf[2..i], b, i + 1),
+            0x40..=0x7e => return csi_step(&buf[2..i], b, i + 1, kitty),
             0x20..=0x3f if i - 2 < MAX_CSI => i += 1,
             0x20..=0x3f => return Step::SkipCsi(i),
             // A control byte or a new ESC: give up on this sequence and let
@@ -331,7 +331,7 @@ fn parse_csi(buf: &[u8]) -> Step {
 }
 
 /// `params` are the bytes between `ESC [` and the final byte.
-fn csi_step(params: &[u8], fin: u8, consumed: usize) -> Step {
+fn csi_step(params: &[u8], fin: u8, consumed: usize, kitty_mode: bool) -> Step {
     if let Some(mouse) = params.strip_prefix(b"<") {
         return match mouse_event(mouse, fin) {
             Some(e) => Step::Event(Event::Mouse(e), consumed),
@@ -366,7 +366,7 @@ fn csi_step(params: &[u8], fin: u8, consumed: usize) -> Step {
     let mod_field = fields.get(1);
     // A modifier field with an event type is the kitty form, where bit 8 is
     // Super. In the xterm form it is Meta, which is Alt.
-    let kitty = fin == b'u' || mod_field.is_some_and(|f| f.len() > 1);
+    let kitty = kitty_mode || fin == b'u' || mod_field.is_some_and(|f| f.len() > 1);
     let mods = mod_field.map_or(KeyModifiers::NONE, |f| {
         if kitty {
             kitty_modifiers(f[0])
@@ -402,7 +402,7 @@ fn csi_step(params: &[u8], fin: u8, consumed: usize) -> Step {
         b'O' if params.is_empty() => return Step::Event(Event::FocusLost, consumed),
         b'u' => return kitty_key(&fields, mods, kind, consumed),
         b'~' => match first {
-            200 if fields.len() == 1 => return Step::PasteStart(consumed),
+            200 if fields.len() == 1 && fields[0].len() == 1 => return Step::PasteStart(consumed),
             1 | 7 => KeyCode::Home,
             2 => KeyCode::Insert,
             3 => KeyCode::Delete,
@@ -439,13 +439,34 @@ fn kitty_key(fields: &[Vec<u32>], mods: KeyModifiers, kind: KeyEventKind, consum
         57412 => KeyCode::Char('-'),
         57413 => KeyCode::Char('+'),
         57415 => KeyCode::Char('='),
+        57416 => KeyCode::Char(','),
+        // The keypad with Num Lock off.
+        57417 => KeyCode::Left,
+        57418 => KeyCode::Right,
+        57419 => KeyCode::Up,
+        57420 => KeyCode::Down,
+        57421 => KeyCode::PageUp,
+        57422 => KeyCode::PageDown,
+        57423 => KeyCode::Home,
+        57424 => KeyCode::End,
+        57425 => KeyCode::Insert,
+        57426 => KeyCode::Delete,
         57376..=57398 => KeyCode::F((code - 57376 + 13) as u8),
         57344..=63743 => return Step::Skip(consumed),
         _ => match char::from_u32(code) {
             Some(c) if !c.is_control() => {
                 // Shift alone gives the character that was typed, the way
                 // plain text does: `A`, not `a` with Shift.
-                let typed = shifted.and_then(char::from_u32);
+                // Without the alternate keys, which are not asked for, a
+                // letter's shifted form is its uppercase, so a release
+                // matches the press that arrived as text.
+                let typed = shifted.and_then(char::from_u32).or_else(|| {
+                    let mut up = c.to_uppercase();
+                    match (up.next(), up.next()) {
+                        (Some(u), None) if c.is_alphabetic() => Some(u),
+                        _ => None,
+                    }
+                });
                 if mods == KeyModifiers::SHIFT && typed.is_some() {
                     return Step::Event(
                         Event::Key(
@@ -631,6 +652,8 @@ struct Paste {
 /// got its end marker.
 #[derive(Default)]
 pub struct Parser {
+    /// Whether the terminal was asked for the kitty keyboard protocol.
+    kitty: bool,
     buf: Vec<u8>,
     paste: Option<Paste>,
     /// Inside a CSI sequence that was too long to keep, dropping bytes up to
@@ -642,6 +665,16 @@ impl Parser {
     /// An empty parser.
     pub fn new() -> Self {
         Parser::default()
+    }
+
+    /// A parser for a terminal that was asked for the kitty keyboard
+    /// protocol. The modifiers of a key are then read the kitty way even
+    /// when a key press carries no event type: in `CSI 1;9 A`, 9 is Super,
+    /// where in the xterm form it is Meta. Without this the parser still
+    /// reads a kitty form when the sequence itself shows it is one.
+    pub fn with_keyboard_enhancement(mut self, on: bool) -> Self {
+        self.kitty = on;
+        self
     }
 
     /// Adds bytes read from the terminal.
@@ -661,7 +694,7 @@ impl Parser {
             if self.buf.is_empty() {
                 return None;
             }
-            match parse_one(&self.buf) {
+            match parse_one(&self.buf, self.kitty) {
                 Step::Event(event, n) => {
                     self.buf.drain(..n);
                     return Some(event);
@@ -1145,6 +1178,77 @@ mod tests {
                 String::from_utf8_lossy(bytes)
             );
         }
+    }
+
+    #[test]
+    fn a_parser_told_about_the_protocol_reads_every_modifier_field_the_kitty_way() {
+        let mut p = Parser::new().with_keyboard_enhancement(true);
+        p.feed(b"\x1b[1;9A\x1b[1;9:3A\x1b[15;9~\x1b[1;33A\x1b[97;33u");
+        let got = events(&mut p);
+        let want = vec![
+            kitty(KeyCode::Up, KeyModifiers::SUPER, KeyEventKind::Press),
+            kitty(KeyCode::Up, KeyModifiers::SUPER, KeyEventKind::Release),
+            kitty(KeyCode::F(5), KeyModifiers::SUPER, KeyEventKind::Press),
+            kitty(KeyCode::Up, ALT, KeyEventKind::Press),
+            kitty(KeyCode::Char('a'), ALT, KeyEventKind::Press),
+        ];
+        assert_eq!(got, want);
+        // Without it the press is the xterm form.
+        assert_eq!(parse(b"\x1b[1;9A"), vec![km(KeyCode::Up, ALT)]);
+    }
+
+    #[test]
+    fn the_keypad_with_num_lock_off_sends_navigation_keys() {
+        for (code, want) in [
+            (57417, KeyCode::Left),
+            (57418, KeyCode::Right),
+            (57419, KeyCode::Up),
+            (57420, KeyCode::Down),
+            (57421, KeyCode::PageUp),
+            (57422, KeyCode::PageDown),
+            (57423, KeyCode::Home),
+            (57424, KeyCode::End),
+            (57425, KeyCode::Insert),
+            (57426, KeyCode::Delete),
+        ] {
+            let bytes = format!("\x1b[{code}u");
+            assert_eq!(
+                parse(bytes.as_bytes()),
+                vec![kitty(want, KeyModifiers::NONE, KeyEventKind::Press)]
+            );
+        }
+        assert_eq!(parse(b"\x1b[57416u"), vec![ch(',')]);
+        // KP_BEGIN has no key.
+        assert_eq!(parse(b"\x1b[57427u"), vec![]);
+    }
+
+    #[test]
+    fn the_release_of_a_shifted_letter_matches_the_press_that_came_as_text() {
+        use KeyEventKind::Release;
+        assert_eq!(parse(b"A"), vec![ch('A')]);
+        assert_eq!(
+            parse(b"\x1b[97;2:3u"),
+            vec![kitty(KeyCode::Char('A'), KeyModifiers::NONE, Release)]
+        );
+        // Not for a key with more than shift, or a character without a case.
+        assert_eq!(
+            parse(b"\x1b[97;6:3u"),
+            vec![kitty(KeyCode::Char('a'), CTRL | SHIFT, Release)]
+        );
+        assert_eq!(
+            parse(b"\x1b[49;2:3u"),
+            vec![kitty(KeyCode::Char('1'), SHIFT, Release)]
+        );
+        // `ß` uppercases to two characters, so it stays.
+        assert_eq!(
+            parse("\x1b[223;2:3u".as_bytes()),
+            vec![kitty(KeyCode::Char('ß'), SHIFT, Release)]
+        );
+    }
+
+    #[test]
+    fn a_paste_start_with_a_sub_field_is_not_a_paste() {
+        assert_eq!(parse(b"\x1b[200:1~x"), vec![ch('x')]);
     }
 
     #[test]
