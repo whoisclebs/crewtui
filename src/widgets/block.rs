@@ -229,7 +229,11 @@ impl<'a> Block<'a> {
             }
             let text = truncate(&span.content, remaining);
             remaining -= width(text);
+            let from = x;
             x = buf.set_string(x, area.y, text, base.patch(span.style));
+            if let Some(url) = &span.link {
+                buf.set_link(Rect::new(from, area.y, x - from, 1), Some(url));
+            }
         }
     }
 }
@@ -558,6 +562,27 @@ mod tests {
         buf.set_string(1, 1, "abcd", Style::new());
         Block::bordered().render(area, &mut buf);
         assert_eq!(rows_of(&buf), ["┌────┐", "│abcd│", "└────┘"]);
+    }
+
+    #[test]
+    fn a_link_in_a_title_marks_the_title_cells_only() {
+        let area = Rect::new(0, 0, 12, 3);
+        let mut buf = Buffer::new(area);
+        let title = Line::from(vec![
+            crate::text::Span::raw("a "),
+            crate::text::Span::raw("docs").link("https://e.com"),
+        ]);
+        Block::bordered().title(title).render(area, &mut buf);
+        let marks: String = (0..12)
+            .map(|x| {
+                if buf.link_at(x, 0).is_some() {
+                    '#'
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        assert_eq!(marks, "...####.....", "{marks}");
     }
 
     #[test]

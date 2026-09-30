@@ -214,7 +214,12 @@ impl HistoryState {
             let line = text.lines.last_mut().expect("an entry has a line");
             if !part.is_empty() {
                 match line.spans.last_mut() {
-                    Some(span) => span.content.to_mut().push_str(part),
+                    // Text that streams in after a link is not part of it.
+                    Some(span) if span.link.is_none() => span.content.to_mut().push_str(part),
+                    Some(span) => {
+                        let style = span.style;
+                        line.spans.push(Span::styled((*part).to_owned(), style));
+                    }
                     None => line.spans.push(Span::styled((*part).to_owned(), style)),
                 }
             }
@@ -971,6 +976,26 @@ mod tests {
         s.scroll_to_bottom();
         let (_, n) = measured(|| draw(&s, 25, 20));
         assert!(n <= 25, "a resize while following measured {n} entries");
+    }
+
+    #[test]
+    fn text_streamed_in_after_a_link_is_not_part_of_it() {
+        let mut s = HistoryState::new();
+        s.push(Line::from(vec![
+            Span::raw("see "),
+            Span::raw("docs").link("https://e.com"),
+        ]));
+        s.append(" then more\nnext");
+        let entry = s.entry(0).unwrap();
+        let first = &entry.lines[0].spans;
+        assert_eq!(first[1].content, "docs");
+        assert_eq!(first[1].link.as_deref(), Some("https://e.com"));
+        assert_eq!(first[2].content, " then more");
+        assert_eq!(first[2].link, None);
+        // A link on the last span of a line keeps its style for what follows.
+        s.append(" and on");
+        let last = s.entry(0).unwrap().lines[1].spans.last().unwrap();
+        assert_eq!(last.link, None);
     }
 
     #[test]

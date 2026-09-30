@@ -483,8 +483,6 @@ mod tests {
     use crate::text::Span;
     use crate::{Color, Frame};
 
-    /// The shortcut for a line with no more bytes than columns must agree with
-    /// splitting the line, for every kind of text.
     #[test]
     fn a_span_with_a_link_marks_its_cells_across_wrapped_rows_and_takes_no_room() {
         let area = Rect::new(0, 0, 6, 3);
@@ -540,6 +538,8 @@ mod tests {
         assert_eq!(span.link.as_deref(), Some("https://e.com"));
     }
 
+    /// The shortcut for a line with no more bytes than columns must agree with
+    /// splitting the line, for every kind of text.
     #[test]
     fn the_one_row_shortcut_agrees_with_splitting() {
         let pieces_of = [

@@ -863,7 +863,7 @@ mod tests {
         }
     }
 
-    /// Text of row `y` and the link of each cell, as `text` then `link|link`.
+    /// The link of each of the first `w` cells of row `y`.
     fn links_of(screen: &Screen, w: u16, y: u16) -> Vec<Option<String>> {
         let b = screen.to_buffer();
         (0..w).map(|x| b.link_at(x, y).map(str::to_owned)).collect()

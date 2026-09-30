@@ -143,6 +143,11 @@ impl Screen {
                     i = next;
                     continue;
                 }
+                // An ESC right after an ESC starts over from the second one.
+                if data[i + 1] == 0x1b {
+                    i += 1;
+                    continue;
+                }
                 if data[i + 1] != b'[' {
                     i += 2;
                     continue;
@@ -640,6 +645,20 @@ mod tests {
         wait_timeout(&mut child, Duration::from_secs(10)).expect("still running");
         let out = String::from_utf8_lossy(&pty.output()).into_owned();
         assert!(out.contains("got:hi"), "{out:?}");
+    }
+
+    #[test]
+    fn an_esc_in_a_cut_sequence_starts_the_next_one_instead_of_printing_it() {
+        let mut screen = Screen::new(6, 1);
+        // An OSC 8 cut after its URL began, then a CSI, then text.
+        screen.feed(b"\x1b]8;;http://x");
+        screen.feed(b"\x1b[1mabc");
+        assert_eq!(screen.row(0).trim_end(), "abc");
+        // A CSI cut right after its ESC, then another.
+        let mut screen = Screen::new(6, 1);
+        screen.feed(b"\x1b");
+        screen.feed(b"\x1b[0mxy");
+        assert_eq!(screen.row(0).trim_end(), "xy");
     }
 
     #[test]
