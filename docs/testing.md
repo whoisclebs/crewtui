@@ -26,3 +26,18 @@ Some behavior can't be checked in the test process: a real SIGTERM, a hangup, a 
 `Pty::spawn_self("pty_children::child_entry", mode)` starts the same executable with only that one test selected and `CREWTUI_PTY_CHILD=mode` in the environment. `child_entry` in `src/pty_children.rs` reads the mode, plays the scenario on its stdin and stdout (which are the pty), and exits. In a normal run the variable isn't set and the test passes without doing anything.
 
 To add a scenario, add a match arm in `child_entry` and a test that spawns it, waits, sends whatever it should send, and checks the termios and the bytes on the master.
+
+## What the safety tests cover
+
+`src/pty_children.rs` plays out every way a program can leave, each as its own process on its own pty. After each one the test checks that termios is back to what it was before, and that the bytes the child wrote include the sequence that leaves the alternate screen, shows the cursor and turns the reporting modes off.
+
+- Quitting normally, with the default modes and with mouse, focus and paste reporting all on.
+- Ctrl+C typed in raw mode, which arrives as a key event and quits the app, not as a signal.
+- Returning an error early with `?` while holding a `Terminal`.
+- A panic in `update` and a panic in `view`. The panic message has to appear after the sequence that leaves the alternate screen, or it would be lost on the screen that is about to disappear.
+- A panic with the `Terminal` guard leaked, which stands in for `panic = "abort"`: no destructor runs, so only the panic hook can put the terminal back.
+- SIGTERM, SIGINT and SIGHUP sent from outside, each ending the run with an error that names the signal.
+- The terminal itself going away. There is nothing left to restore, so the check is that the process stops through the error path instead of hanging.
+
+These use real signals and hangups, which is why they run as child processes: a SIGTERM aimed at the test process itself would end the whole test run.
+
