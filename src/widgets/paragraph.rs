@@ -325,6 +325,9 @@ fn draw_pieces(
         HorizontalAlign::Right => free,
     };
     let base = base.patch(line.style);
+    if line.fill {
+        buf.set_style(Rect::new(area.x, y, area.width, 1), base);
+    }
     let mut x = area.x.saturating_add(offset as u16);
     let right = area.right();
     // The cells of a run of pieces with the same link are marked together.
@@ -597,6 +600,74 @@ mod tests {
 
     fn wrapped(text: &str, mode: Wrap, w: u16, h: u16) -> Vec<String> {
         draw(Paragraph::new(text).wrap(mode), w, h)
+    }
+
+    fn bgs(buf: &Buffer, y: u16) -> Vec<Option<Color>> {
+        (0..buf.area().width)
+            .map(|x| buf.get(x, y).unwrap().style().bg)
+            .collect()
+    }
+
+    #[test]
+    fn a_line_style_stops_at_the_text_unless_the_line_is_full_width() {
+        let area = Rect::new(0, 0, 6, 2);
+        let tint = Style::new().bg(Color::Green);
+        let mut buf = Buffer::new(area);
+        let text = Text {
+            lines: vec![
+                Line::raw("ab").style(tint),
+                Line::raw("cd").style(tint).full_width(),
+            ],
+            style: Style::new(),
+        };
+        Paragraph::new(text).render(area, &mut buf);
+        let g = Some(Color::Green);
+        assert_eq!(bgs(&buf, 0), vec![g, g, None, None, None, None]);
+        assert_eq!(bgs(&buf, 1), vec![g; 6]);
+    }
+
+    #[test]
+    fn a_full_width_line_fills_every_wrapped_row_and_the_alignment_gaps() {
+        let area = Rect::new(0, 0, 6, 3);
+        let tint = Style::new().bg(Color::Red);
+        let mut buf = Buffer::new(area);
+        let line = Line::raw("aaa bbb ccc")
+            .style(tint)
+            .full_width()
+            .align(HorizontalAlign::Center);
+        Paragraph::new(line).wrap(Wrap::Word).render(area, &mut buf);
+        for y in 0..3 {
+            assert_eq!(bgs(&buf, y), vec![Some(Color::Red); 6], "row {y}");
+        }
+        assert_eq!(buf.get(1, 0).unwrap().symbol(), "a");
+    }
+
+    #[test]
+    fn a_full_width_line_keeps_span_styles_and_covers_a_wide_glyph_at_the_edge() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::new(area);
+        let line = Line::from(vec![
+            Span::styled("a", Style::new().fg(Color::Yellow)),
+            Span::raw("中中"),
+        ])
+        .style(Style::new().bg(Color::Blue))
+        .full_width();
+        Paragraph::new(line).render(area, &mut buf);
+        assert_eq!(bgs(&buf, 0), vec![Some(Color::Blue); 4]);
+        assert_eq!(buf.get(0, 0).unwrap().style().fg, Some(Color::Yellow));
+        // The second wide glyph did not fit, and its blank is tinted too.
+        assert_eq!(buf.get(3, 0).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn the_text_style_reaches_the_row_end_of_a_full_width_line() {
+        let area = Rect::new(0, 0, 5, 1);
+        let mut buf = Buffer::new(area);
+        let text = Text::raw("x")
+            .style(Style::new().bg(Color::Cyan))
+            .full_width();
+        Paragraph::new(text).render(area, &mut buf);
+        assert_eq!(bgs(&buf, 0), vec![Some(Color::Cyan); 5]);
     }
 
     #[test]

@@ -180,6 +180,9 @@ pub struct Line<'a> {
     pub style: Style,
     /// Overrides the paragraph's alignment for this line.
     pub alignment: Option<HorizontalAlign>,
+    /// Whether the line's style covers the whole row it is drawn on rather
+    /// than only the cells that hold text. See [`Line::full_width`].
+    pub fill: bool,
 }
 
 impl<'a> Line<'a> {
@@ -191,6 +194,29 @@ impl<'a> Line<'a> {
     /// The same line with `style` layered under its spans.
     pub fn style(mut self, style: Style) -> Self {
         self.style = self.style.patch(style);
+        self
+    }
+
+    /// Makes the line's style, and the style of the text it is in, cover the
+    /// whole width of the row instead of stopping where the text does, for a
+    /// tinted row such as a highlighted message or an added line of a diff.
+    /// It applies to every row the line wraps to, and to the space that
+    /// alignment leaves on either side. Only the line's own style and what
+    /// is under it is spread; a span's style stays on its text.
+    ///
+    /// ```
+    /// use crewtui::text::Line;
+    /// use crewtui::widgets::{Paragraph, Widget};
+    /// use crewtui::{Buffer, Color, Rect, Style};
+    ///
+    /// let area = Rect::new(0, 0, 8, 1);
+    /// let mut buf = Buffer::new(area);
+    /// let line = Line::raw("hi").style(Style::new().bg(Color::Green)).full_width();
+    /// Paragraph::new(line).render(area, &mut buf);
+    /// assert_eq!(buf.get(7, 0).unwrap().style().bg, Some(Color::Green));
+    /// ```
+    pub fn full_width(mut self) -> Self {
+        self.fill = true;
         self
     }
 
@@ -211,6 +237,7 @@ impl<'a> Line<'a> {
             spans: self.spans.into_iter().map(Span::into_owned).collect(),
             style: self.style,
             alignment: self.alignment,
+            fill: self.fill,
         }
     }
 }
@@ -300,6 +327,16 @@ impl<'a> Text<'a> {
     /// The same text with `style` layered under its lines.
     pub fn style(mut self, style: Style) -> Self {
         self.style = self.style.patch(style);
+        self
+    }
+
+    /// Makes every line's style cover the whole row, as
+    /// [`Line::full_width`] does for one line. Lines added later are not
+    /// affected.
+    pub fn full_width(mut self) -> Self {
+        for line in &mut self.lines {
+            line.fill = true;
+        }
         self
     }
 

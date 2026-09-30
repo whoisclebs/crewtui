@@ -208,6 +208,7 @@ impl HistoryState {
                     spans: Vec::new(),
                     style: previous.style,
                     alignment: previous.alignment,
+                    fill: previous.fill,
                 };
                 text.lines.push(line);
             }
@@ -665,6 +666,47 @@ mod tests {
 
     fn draw(state: &HistoryState, w: u16, h: u16) -> Vec<String> {
         draw_with(History::new(), state, w, h)
+    }
+
+    #[test]
+    fn a_full_width_entry_tints_its_rows_to_the_edge_and_nothing_else() {
+        let mut s = HistoryState::new();
+        s.push(
+            Text::raw("aaaa bbbb")
+                .full_width()
+                .style(Style::new().bg(Color::Blue)),
+        );
+        s.push("plain");
+        let area = Rect::new(0, 0, 8, 4);
+        let mut buf = Buffer::new(area);
+        History::new().wrap(Wrap::Word).render(area, &mut buf, &s);
+        let bg = |x, y| buf.get(x, y).unwrap().style().bg;
+        // "aaaa bbbb" wraps to two rows, and both are tinted end to end.
+        for y in 0..2 {
+            for x in 0..8 {
+                assert_eq!(bg(x, y), Some(Color::Blue), "({x},{y})");
+            }
+        }
+        assert_eq!(bg(7, 2), None);
+        assert_eq!(bg(0, 2), None);
+    }
+
+    #[test]
+    fn a_streamed_line_of_a_full_width_entry_stays_full_width() {
+        let mut s = HistoryState::new();
+        s.push(
+            Text::raw("a")
+                .full_width()
+                .style(Style::new().bg(Color::Red)),
+        );
+        s.append("b\nc");
+        let entry = s.entry(0).unwrap();
+        assert_eq!(entry.lines.len(), 2);
+        assert!(entry.lines.iter().all(|l| l.fill));
+        let area = Rect::new(0, 0, 5, 2);
+        let mut buf = Buffer::new(area);
+        History::new().render(area, &mut buf, &s);
+        assert_eq!(buf.get(4, 1).unwrap().style().bg, Some(Color::Red));
     }
 
     fn numbered(n: usize) -> HistoryState {
