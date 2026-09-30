@@ -1,6 +1,6 @@
 //! What a view draws into.
 
-use crate::widgets::Widget;
+use crate::widgets::{StatefulWidget, Widget};
 use crate::{Buffer, Rect};
 
 /// The surface [`App::view`](crate::App::view) draws on for one frame.
@@ -27,6 +27,16 @@ impl<'a> Frame<'a> {
     /// clipped.
     pub fn render_widget(&mut self, widget: impl Widget, area: Rect) {
         widget.render(area.intersection(self.buffer.area()), self.buffer);
+    }
+
+    /// Draws a widget that keeps `state` between frames, inside `area`.
+    pub fn render_stateful_widget<W: StatefulWidget>(
+        &mut self,
+        widget: W,
+        area: Rect,
+        state: &mut W::State,
+    ) {
+        widget.render(area.intersection(self.buffer.area()), self.buffer, state);
     }
 
     /// The buffer to draw into.
