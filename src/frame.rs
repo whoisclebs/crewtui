@@ -1,5 +1,6 @@
 //! What a view draws into.
 
+use crate::widgets::Widget;
 use crate::{Buffer, Rect};
 
 /// The surface [`App::view`](crate::App::view) draws on for one frame.
@@ -20,6 +21,12 @@ impl<'a> Frame<'a> {
     /// The area of the whole terminal.
     pub fn area(&self) -> Rect {
         self.buffer.area()
+    }
+
+    /// Draws `widget` inside `area`. Whatever falls outside the frame is
+    /// clipped.
+    pub fn render_widget(&mut self, widget: impl Widget, area: Rect) {
+        widget.render(area.intersection(self.buffer.area()), self.buffer);
     }
 
     /// The buffer to draw into.
