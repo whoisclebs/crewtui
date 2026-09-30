@@ -215,6 +215,9 @@ pub(crate) trait Host: Write {
     fn size(&self) -> io::Result<(u16, u16)>;
     /// Goes back to raw mode after the process was stopped and continued.
     fn resume(&mut self) -> io::Result<()>;
+    /// Gives the terminal back, stops the process until it is continued, and
+    /// takes the terminal again.
+    fn suspend(&mut self) -> io::Result<()>;
     /// Whether the terminal was left with the cursor hidden. A fake host
     /// says yes, like a terminal entered with the default options.
     fn cursor_hidden(&self) -> bool {
@@ -231,6 +234,12 @@ impl Host for Terminal {
         Terminal::resume(self)
     }
 
+    fn suspend(&mut self) -> io::Result<()> {
+        self.restore()?;
+        Signals::stop_process()?;
+        Terminal::resume(self)
+    }
+
     fn cursor_hidden(&self) -> bool {
         Terminal::cursor_hidden(self)
     }
@@ -242,9 +251,10 @@ impl Host for Terminal {
 /// feeds each event through the app, and draws after every batch of
 /// changes, at most [`Program::max_fps`] times a second. It returns the app
 /// when `update` returns [`Cmd::quit`], and an error if the terminal fails
-/// or the process is told to stop. The terminal is restored on every way
-/// out, with one exception: a process stopped from outside with SIGTSTP is
-/// not restored while it is stopped, and gets its raw mode back on SIGCONT.
+/// or the process is told to end. The terminal is restored on every way
+/// out. A process stopped from outside with SIGTSTP gives the terminal back
+/// before it stops, so the shell is usable, and takes it again when it is
+/// continued.
 pub struct Program<A: App> {
     app: A,
     options: TerminalOptions,
@@ -374,6 +384,13 @@ fn handle<A: App, H: Host>(
             *dirty = true;
             Ok(false)
         }
+        Input::Signal(Signal::Suspend) => {
+            host.suspend()?;
+            renderer.invalidate();
+            renderer.cursor_was_reset();
+            *dirty = true;
+            Ok(false)
+        }
         Input::Signal(signal) => Err(io::Error::new(io::ErrorKind::Interrupted, signal)),
     }
 }
@@ -452,6 +469,7 @@ mod tests {
         sizes: RefCell<VecDeque<(u16, u16)>>,
         last: (u16, u16),
         resumed: u32,
+        suspended: u32,
         fail_writes: bool,
         cursor_left_visible: bool,
     }
@@ -463,6 +481,7 @@ mod tests {
                 sizes: RefCell::new(VecDeque::new()),
                 last: (width, height),
                 resumed: 0,
+                suspended: 0,
                 fail_writes: false,
                 cursor_left_visible: false,
             }
@@ -497,6 +516,11 @@ mod tests {
 
         fn resume(&mut self) -> io::Result<()> {
             self.resumed += 1;
+            Ok(())
+        }
+
+        fn suspend(&mut self) -> io::Result<()> {
+            self.suspended += 1;
             Ok(())
         }
 
@@ -776,6 +800,25 @@ mod tests {
             let inner = err.get_ref().and_then(|e| e.downcast_ref::<Signal>());
             assert_eq!(inner, Some(&signal));
         }
+    }
+
+    #[test]
+    fn a_stop_signal_from_outside_suspends_the_host_and_repaints_when_it_returns() {
+        let mut host = FakeHost::new(20, 3);
+        let (tx, rx) = channel();
+        let effects = Effects::new(tx.clone());
+        let (app, frames) = Counter::with_frames();
+        let handle = spawn_driver(tx.clone(), move |tx| {
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
+            tx.send(Input::Signal(Signal::Suspend)).unwrap();
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
+            tx.send(key('q')).unwrap();
+        });
+        event_loop(app, &rx, &effects, &mut host, 0).unwrap();
+        handle.join().unwrap();
+        assert_eq!(host.suspended, 1);
+        let clears = host.out.windows(4).filter(|w| *w == b"\x1b[2J").count();
+        assert_eq!(clears, 2, "{:?}", String::from_utf8_lossy(&host.out));
     }
 
     #[test]

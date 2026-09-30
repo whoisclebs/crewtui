@@ -27,15 +27,21 @@ pub enum Signal {
     Resize,
     /// SIGCONT: the process resumed after being stopped.
     Continue,
+    /// SIGTSTP, sent from outside, for example by a job-control shell. Typing
+    /// Ctrl+Z in raw mode doesn't produce it; that arrives as a key event.
+    /// The loop restores the terminal, stops the process, and takes the
+    /// terminal again when it is continued.
+    Suspend,
 }
 
 impl Signal {
-    const ALL: [(Signal, libc::c_int); 5] = [
+    const ALL: [(Signal, libc::c_int); 6] = [
         (Signal::Interrupt, libc::SIGINT),
         (Signal::Terminate, libc::SIGTERM),
         (Signal::Hangup, libc::SIGHUP),
         (Signal::Resize, libc::SIGWINCH),
         (Signal::Continue, libc::SIGCONT),
+        (Signal::Suspend, libc::SIGTSTP),
     ];
 
     fn from_byte(b: u8) -> Option<Signal> {
@@ -51,11 +57,35 @@ impl fmt::Display for Signal {
             Signal::Hangup => "hung up (SIGHUP)",
             Signal::Resize => "terminal resized (SIGWINCH)",
             Signal::Continue => "continued (SIGCONT)",
+            Signal::Suspend => "stopped (SIGTSTP)",
         })
     }
 }
 
 impl std::error::Error for Signal {}
+
+/// The signal that stops the process. It is SIGTSTP, so a job-control shell
+/// sees an ordinary stop. The default action of SIGTSTP is discarded in an
+/// orphaned process group, which is what the child of a test on a pty is, so
+/// tests switch to SIGSTOP.
+#[cfg(not(test))]
+fn stop_signal() -> libc::c_int {
+    libc::SIGTSTP
+}
+
+#[cfg(test)]
+static STOP_WITH: std::sync::atomic::AtomicI32 = AtomicI32::new(libc::SIGTSTP);
+
+#[cfg(test)]
+fn stop_signal() -> libc::c_int {
+    STOP_WITH.load(Ordering::SeqCst)
+}
+
+/// Makes a test child stop with SIGSTOP instead of SIGTSTP.
+#[cfg(test)]
+pub(crate) fn stop_with_sigstop() {
+    STOP_WITH.store(libc::SIGSTOP, Ordering::SeqCst);
+}
 
 /// Write end of the pipe, read by the handler. `-1` while nothing is installed.
 static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
@@ -187,9 +217,10 @@ fn pipe() -> io::Result<(RawFd, RawFd)> {
 /// back. Poll [`AsRawFd::as_raw_fd`] for readability, then call
 /// [`Signals::pending`].
 ///
-/// A SIGINT or SIGHUP that was being ignored when [`Signals::install`] ran,
-/// as it is under `nohup` or for a background job, stays ignored, so
-/// [`Signal::Interrupt`] and [`Signal::Hangup`] are never delivered then.
+/// A SIGINT, SIGHUP or SIGTSTP that was being ignored when
+/// [`Signals::install`] ran, as it is under `nohup` or in a shell script,
+/// stays ignored, so [`Signal::Interrupt`], [`Signal::Hangup`] and
+/// [`Signal::Suspend`] are never delivered then.
 #[derive(Debug)]
 pub struct Signals {
     read_fd: RawFd,
@@ -228,7 +259,7 @@ impl Signals {
                     return Err(io::Error::last_os_error());
                 }
                 let ignored = old.sa_sigaction == libc::SIG_IGN;
-                if ignored && (sig == libc::SIGINT || sig == libc::SIGHUP) {
+                if ignored && (sig == libc::SIGINT || sig == libc::SIGHUP || sig == libc::SIGTSTP) {
                     continue;
                 }
                 let mut action: libc::sigaction = std::mem::zeroed();
@@ -243,6 +274,30 @@ impl Signals {
             signals.previous.push((sig, old));
         }
         Ok(signals)
+    }
+
+    /// Stops the whole process the way an unhandled SIGTSTP would, and returns
+    /// once it is continued. Our handler for SIGTSTP is put aside while it is
+    /// stopped, since with it installed the process would not stop, and put
+    /// back after.
+    pub(crate) fn stop_process() -> io::Result<()> {
+        // SAFETY: both actions are fully initialized before use, and `ours`
+        // is valid for a write.
+        unsafe {
+            let mut default: libc::sigaction = std::mem::zeroed();
+            default.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut default.sa_mask);
+            let mut ours: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(libc::SIGTSTP, &default, &mut ours) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            libc::raise(stop_signal());
+            // Execution goes on here after SIGCONT.
+            if libc::sigaction(libc::SIGTSTP, &ours, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 
     /// Signals that arrived since the last call, oldest first. Never blocks.

@@ -101,6 +101,10 @@ fn child_entry() {
         "early_return" => early_return(),
         "leak_and_panic" => leak_and_panic(),
         "all_modes" => run_probe("normal", ALL_MODES),
+        "stoppable" => {
+            crate::signals::stop_with_sigstop();
+            run_probe("normal", TerminalOptions::default())
+        }
         "agent" => crate::agent_example::run(crate::agent_example::Pace::INSTANT, false),
         "agent_stress" => crate::agent_example::run(crate::agent_example::Pace::INSTANT, true),
         other => run_probe(other, TerminalOptions::default()),
@@ -118,7 +122,7 @@ fn child_entry() {
 
 #[cfg(test)]
 mod tests {
-    use crate::testing::{Pty, kill, same, wait_timeout, write_fd};
+    use crate::testing::{Pty, kill, same, wait_timeout, wait_until_stopped, write_fd};
     use std::os::unix::process::ExitStatusExt;
     use std::process::Child;
     use std::time::Duration;
@@ -325,6 +329,37 @@ mod tests {
         let status = s.finish();
         assert_eq!(status.code(), Some(2), "{status:?} {}", s.text());
         assert!(s.text().contains(expect), "{}", s.text());
+        s.assert_restored(LEAVE);
+    }
+
+    #[test]
+    fn a_stop_from_outside_gives_the_terminal_back_and_a_continue_takes_it_again() {
+        let mut s = Scenario::start("stoppable");
+        s.signal(libc::SIGTSTP);
+        assert!(wait_until_stopped(&s.child, LIMIT), "{}", s.text());
+        // While it is stopped the shell must be usable.
+        s.seen.extend(s.pty.output());
+        s.assert_restored(LEAVE);
+        assert!(!s.pty.is_raw(), "the terminal is still raw while stopped");
+        let left_at = s.seen.len();
+        s.signal(libc::SIGCONT);
+        let enter = b"\x1b[?1049h";
+        let mut back = false;
+        let deadline = std::time::Instant::now() + LIMIT;
+        while !back && std::time::Instant::now() < deadline {
+            s.seen.extend(s.pty.output());
+            back = s.seen[left_at..].windows(enter.len()).any(|w| w == enter);
+        }
+        assert!(
+            back,
+            "the child never took the terminal again: {}",
+            s.text()
+        );
+        assert!(s.pty.is_raw(), "the terminal is not raw after the continue");
+        // It is a working program again.
+        s.type_bytes(b"q");
+        let status = s.finish();
+        assert_eq!(status.code(), Some(0), "{status:?} {}", s.text());
         s.assert_restored(LEAVE);
     }
 
