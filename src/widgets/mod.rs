@@ -5,6 +5,21 @@
 //! area it is given and keeps no state of its own; anything that persists
 //! between frames, such as a scroll position, lives in a state value the app
 //! owns.
+//!
+//! The state types (`ListState`, `TableState`, `InputState`, `HistoryState`)
+//! follow one convention. `new()` is empty, and a `with_*` constructor takes
+//! the initial content: `InputState::with_text`, `ListState::with_selected`,
+//! `HistoryState::with_entries`. Afterwards the app changes them with `&mut`
+//! methods in `update`: `set_*`, `select*`, `push`, `insert_*`. Methods that
+//! take text accept anything `AsRef<str>`. Selection helpers such as
+//! `select_next(len)` take the length of the collection, since the state
+//! doesn't hold it.
+//!
+//! What drawing works out, like a scroll offset, is kept in a `Cell` inside
+//! the state so that `view`, which only has `&self`, can remember it. That
+//! makes the state types `!Sync`: they belong to the thread that runs the
+//! app. A state that other threads need to read has to be cloned into
+//! something they can share.
 
 mod block;
 mod history;
