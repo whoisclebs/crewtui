@@ -10,17 +10,11 @@ use crate::{
 };
 
 fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent {
-        code,
-        modifiers: KeyModifiers::NONE,
-    }
+    KeyEvent::new(code, KeyModifiers::NONE)
 }
 
 fn ctrl(c: char) -> KeyEvent {
-    KeyEvent {
-        code: KeyCode::Char(c),
-        modifiers: KeyModifiers::CTRL,
-    }
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CTRL)
 }
 
 fn press(agent: &mut Agent, event: Event) -> String {
