@@ -1,6 +1,6 @@
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::Widget;
+use super::{Block, Widget};
 use crate::text::{HorizontalAlign, Line, Text, grapheme_width};
 use crate::{Buffer, Rect, Style};
 
@@ -43,6 +43,7 @@ pub enum Wrap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paragraph<'a> {
     text: Text<'a>,
+    block: Option<Block<'a>>,
     style: Style,
     wrap: Wrap,
     align: HorizontalAlign,
@@ -54,11 +55,19 @@ impl<'a> Paragraph<'a> {
     pub fn new(text: impl Into<Text<'a>>) -> Self {
         Paragraph {
             text: text.into(),
+            block: None,
             style: Style::new(),
             wrap: Wrap::None,
             align: HorizontalAlign::Left,
             scroll: 0,
         }
+    }
+
+    /// A block drawn around the text. The text goes in the block's inner
+    /// area.
+    pub fn block(mut self, block: Block<'a>) -> Self {
+        self.block = Some(block);
+        self
     }
 
     /// The style under everything else, applied to the whole area.
@@ -302,6 +311,17 @@ impl Paragraph<'_> {
 impl Widget for Paragraph<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let area = area.intersection(buf.area());
+        if area.is_empty() {
+            return;
+        }
+        let area = match &self.block {
+            Some(block) => {
+                let inner = block.inner(area);
+                block.clone().render(area, buf);
+                inner
+            }
+            None => area,
+        };
         if area.is_empty() {
             return;
         }

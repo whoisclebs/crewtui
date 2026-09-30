@@ -6,8 +6,10 @@
 //! between frames, such as a scroll position, lives in a state value the app
 //! owns.
 
+mod block;
 mod paragraph;
 
+pub use block::{Block, BorderType, Borders};
 pub use paragraph::{Paragraph, Wrap};
 
 use crate::text::{Line, Span, Text};
