@@ -1,7 +1,7 @@
 use std::cell::Cell;
 
 use super::paragraph::draw_line;
-use super::{Block, StatefulWidget, Widget};
+use super::{Block, StatefulWidget, Widget, offset_for};
 use crate::text::{HorizontalAlign, Text, width};
 use crate::{Buffer, Rect, Style};
 
@@ -175,18 +175,6 @@ impl<'a> List<'a> {
     }
 }
 
-/// The smallest offset that keeps item `selected` in a viewport of `rows`
-/// rows, walking up from it and no further than the viewport is tall.
-fn offset_for(items: &[ListItem<'_>], selected: usize, rows: usize) -> usize {
-    let mut used = items[selected].height();
-    let mut offset = selected;
-    while offset > 0 && used + items[offset - 1].height() <= rows {
-        offset -= 1;
-        used += items[offset].height();
-    }
-    offset
-}
-
 impl StatefulWidget for List<'_> {
     type State = ListState;
 
@@ -223,7 +211,7 @@ impl StatefulWidget for List<'_> {
             } else {
                 // Move down only as far as needed, never back up past where
                 // the list already is.
-                offset = offset.max(offset_for(&self.items, selected, rows));
+                offset = offset.max(offset_for(|i| self.items[i].height(), selected, rows));
             }
         }
         state.offset.set(offset);
