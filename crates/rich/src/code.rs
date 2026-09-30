@@ -1,4 +1,6 @@
 use crewtui::text::{Line, Span, Text};
+
+use crate::util::expand_tabs;
 use crewtui::widgets::{Block, Paragraph, Widget};
 use crewtui::{Buffer, Color, Constraint, Layout, Rect, Style};
 
@@ -250,7 +252,9 @@ enum Kind {
 /// Splits `code` into lines of styled spans for `language`, which is a name
 /// like `rust`, `py` or `json` (case does not matter). A language the
 /// scanner doesn't know, or an empty name, gives plain lines. Block comments
-/// and strings that run over several lines keep their style on each.
+/// and backtick strings that run over several lines keep their style on each;
+/// other strings end with their line. Tabs become spaces, four columns to a
+/// stop, since a tab can't be drawn.
 ///
 /// ```
 /// use crewtui_rich::{highlight, HighlightStyles};
@@ -264,13 +268,15 @@ pub fn highlight(code: &str, language_name: &str, styles: &HighlightStyles) -> V
     let Some(lang) = language(language_name) else {
         return code
             .lines()
-            .map(|l| Line::from(Span::styled(l.to_owned(), styles.plain)))
+            .map(|l| Line::from(Span::styled(expand_tabs(l).into_owned(), styles.plain)))
             .collect();
     };
     let mut open_block = false;
     let mut open_quote: Option<char> = None;
     code.lines()
         .map(|line| {
+            let line = expand_tabs(line);
+            let line = line.as_ref();
             let tokens = scan_line(line, lang, &mut open_block, &mut open_quote);
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut last: Option<Kind> = None;
@@ -317,7 +323,6 @@ fn scan_line<'a>(
 ) -> Vec<(&'a str, Kind)> {
     let mut out = Vec::new();
     let mut i = 0;
-    let bytes = line.as_bytes();
     while i < line.len() {
         // Inside a block comment or a string from an earlier line.
         if *open_block {
@@ -418,7 +423,6 @@ fn scan_line<'a>(
         let len = c.len_utf8();
         out.push((&line[i..i + len], Kind::Plain));
         i += len;
-        let _ = bytes;
     }
     out
 }
@@ -545,7 +549,7 @@ impl Widget for CodeBlock<'_> {
         let text = self.to_text();
         let count = text.lines.len();
         let gutter = if self.line_numbers && count > 0 {
-            let last = self.first_line + count - 1;
+            let last = self.first_line.saturating_add(count - 1);
             last.to_string().len() as u16 + 1
         } else {
             0
@@ -558,7 +562,7 @@ impl Widget for CodeBlock<'_> {
             let lines: Vec<Line<'static>> = (0..count)
                 .map(|i| {
                     Line::from(Span::styled(
-                        format!("{:>width$}", self.first_line + i),
+                        format!("{:>width$}", self.first_line.saturating_add(i)),
                         self.styles.gutter,
                     ))
                 })
@@ -637,7 +641,9 @@ mod tests {
             "rust", "python", "js", "go", "c", "json", "sh", "toml", "nope", "",
         ] {
             for input in inputs {
-                let want: Vec<&str> = input.lines().collect();
+                let expanded: Vec<String> =
+                    input.lines().map(|l| expand_tabs(l).into_owned()).collect();
+                let want: Vec<&str> = expanded.iter().map(String::as_str).collect();
                 let got = plain(input, lang);
                 assert_eq!(
                     got.split('\n').collect::<Vec<_>>().len().max(1),
@@ -742,5 +748,31 @@ mod tests {
         CodeBlock::new("x")
             .block(Block::bordered())
             .render(Rect::new(0, 0, 5, 3), &mut buf);
+    }
+
+    #[test]
+    fn code_indented_with_tabs_keeps_its_indentation() {
+        let lines = highlight(
+            "func f() {\n\treturn 1\n\t\tx()\n}",
+            "go",
+            &HighlightStyles::default(),
+        );
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text, ["func f() {", "    return 1", "        x()", "}"]);
+        let plain = highlight("\tx", "", &HighlightStyles::default());
+        assert_eq!(plain[0].spans[0].content, "    x");
+    }
+
+    #[test]
+    fn a_first_line_number_at_the_top_of_usize_does_not_overflow() {
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buf = Buffer::new(area);
+        CodeBlock::new("a\nb\nc")
+            .line_numbers(true)
+            .first_line(usize::MAX)
+            .render(area, &mut buf);
     }
 }

@@ -1,8 +1,22 @@
+use std::collections::HashMap;
+
 use crewtui::text::{Line, Span, Text};
 use crewtui::widgets::{Paragraph, Widget, Wrap};
 use crewtui::{Buffer, Color, Rect, Style};
 
 use crate::code::{HighlightStyles, highlight};
+
+/// Quotes nested deeper than this are shown as the text they are written in.
+const MAX_QUOTE_DEPTH: usize = 16;
+/// How far past a `[` the parser looks for the `]`, past a `<` for the `>`,
+/// and past a `](` for the end of the link. Longer than this is not a link.
+/// The limit keeps unbalanced input from costing time that grows with the
+/// square of its length.
+const LABEL_WINDOW: usize = 400;
+const URL_WINDOW: usize = 2048;
+const AUTOLINK_WINDOW: usize = 256;
+/// Markup nested deeper than this is not worth the stack it takes.
+const MAX_INLINE_DEPTH: usize = 16;
 
 /// The styles [`Markdown`] gives to what it renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,16 +72,23 @@ impl Default for MarkdownStyles {
 ///
 /// This is a subset of CommonMark, enough for what a model or a README
 /// writes: ATX headings, paragraphs with hard breaks, `*emphasis*`,
-/// `**strong**`, `~~strikethrough~~`, `` `code` ``, `[links](url)` and
-/// `<autolinks>`, bullet and numbered lists (nested by indentation), block
-/// quotes, horizontal rules, and fenced and indented code with the syntax
-/// highlighting of [`highlight`]. Links are real terminal hyperlinks. It does
-/// not do tables, setext headings, reference links, HTML or images, which
-/// are shown as the text they are written in.
+/// `**strong**`, `***both***`, `~~strikethrough~~`, `` `code` ``,
+/// `[links](url)` and `<autolinks>`, bullet and numbered lists (nested by
+/// indentation), block quotes, horizontal rules, and fenced and indented
+/// code with the syntax highlighting of [`highlight`]. It does not do
+/// tables, setext headings, reference links, HTML or images, which are shown
+/// as the text they are written in.
+///
+/// Links are real terminal hyperlinks, but only for `http`, `https`,
+/// `mailto`, `ftp` and `file` URLs. Any other link, such as `javascript:` or
+/// a relative path, is shown as its text, styled like a link, and goes
+/// nowhere.
 ///
 /// The result does not depend on a width. Draw it with a wrapping
 /// `Paragraph`, or put it in a `History`. `Markdown` is also a widget that
-/// does the first of those.
+/// does the first of those. The text keeps whatever characters the source
+/// had, control characters included. `Buffer` drops them when it draws, so
+/// draw it through a widget and don't print the spans yourself.
 ///
 /// ```
 /// use crewtui_rich::Markdown;
@@ -80,7 +101,7 @@ pub struct Markdown<'a> {
     source: &'a str,
     styles: MarkdownStyles,
     code_styles: HighlightStyles,
-    rule_width: usize,
+    rule_width: Option<usize>,
 }
 
 impl<'a> Markdown<'a> {
@@ -90,7 +111,7 @@ impl<'a> Markdown<'a> {
             source,
             styles: MarkdownStyles::default(),
             code_styles: HighlightStyles::default(),
-            rule_width: 40,
+            rule_width: None,
         }
     }
 
@@ -106,18 +127,23 @@ impl<'a> Markdown<'a> {
         self
     }
 
-    /// How many columns wide a horizontal rule is drawn. It is cut at the
-    /// edge of a narrower area. 40 by default.
+    /// How many columns wide a horizontal rule is. Without this a rule is 40
+    /// columns in [`Markdown::to_text`], and as wide as the area when the
+    /// markdown is drawn as a widget.
     pub fn rule_width(mut self, columns: usize) -> Self {
-        self.rule_width = columns;
+        self.rule_width = Some(columns);
         self
     }
 
     /// The rendered text.
     pub fn to_text(&self) -> Text<'static> {
+        self.render_text(self.rule_width.unwrap_or(40))
+    }
+
+    fn render_text(&self, rule_width: usize) -> Text<'static> {
         let lines: Vec<&str> = self.source.lines().collect();
         let mut out = Vec::new();
-        self.blocks(&lines, &mut out);
+        self.blocks(&lines, &mut out, rule_width, 0);
         // No blank line at the end.
         while out.last().is_some_and(is_blank) {
             out.pop();
@@ -128,7 +154,9 @@ impl<'a> Markdown<'a> {
         }
     }
 
-    fn blocks(&self, lines: &[&str], out: &mut Vec<Line<'static>>) {
+    fn blocks(&self, lines: &[&str], out: &mut Vec<Line<'static>>, rule: usize, depth: usize) {
+        // The indent of each list level that is open, for nesting.
+        let mut list_stack: Vec<usize> = Vec::new();
         let mut i = 0;
         while i < lines.len() {
             let line = lines[i];
@@ -137,120 +165,135 @@ impl<'a> Markdown<'a> {
                     out.push(Line::default());
                 }
                 i += 1;
-            } else if let Some((fence, lang)) = fence_start(line) {
-                let mut code = Vec::new();
-                i += 1;
-                while i < lines.len() && !is_fence_end(lines[i], &fence) {
-                    code.push(lines[i]);
+                continue;
+            }
+            let Some(item) = list_item(line) else {
+                list_stack.clear();
+                if let Some((fence, lang)) = fence_start(line) {
+                    let mut code = Vec::new();
                     i += 1;
+                    while i < lines.len() && !is_fence_end(lines[i], &fence) {
+                        code.push(lines[i]);
+                        i += 1;
+                    }
+                    i += 1; // the closing fence, or the end
+                    self.code(&code.join("\n"), &lang, out);
+                } else if let Some((level, text)) = heading(line) {
+                    let style = self.styles.heading[level - 1];
+                    out.push(Line {
+                        spans: self.inline(text, style),
+                        ..Line::default()
+                    });
+                    i += 1;
+                } else if is_rule(line) {
+                    out.push(Line::from(Span::styled("─".repeat(rule), self.styles.rule)));
+                    i += 1;
+                } else if depth < MAX_QUOTE_DEPTH && quote_body(line).is_some() {
+                    let start = i;
+                    while i < lines.len() && quote_body(lines[i]).is_some() {
+                        i += 1;
+                    }
+                    let inner: Vec<&str> = lines[start..i]
+                        .iter()
+                        .filter_map(|l| quote_body(l))
+                        .collect();
+                    let mut quoted = Vec::new();
+                    self.blocks(&inner, &mut quoted, rule, depth + 1);
+                    for mut q in quoted {
+                        q.spans.insert(0, Span::styled("│ ", self.styles.quote));
+                        q.style = q.style.patch(self.styles.quote);
+                        out.push(q);
+                    }
+                } else if indent_of(line) >= 4 && out.last().is_none_or(is_blank) {
+                    let mut code = Vec::new();
+                    while i < lines.len()
+                        && (indent_of(lines[i]) >= 4 || lines[i].trim().is_empty())
+                    {
+                        code.push(strip_indent(lines[i], 4));
+                        i += 1;
+                    }
+                    while code.last().is_some_and(|l| l.trim().is_empty()) {
+                        code.pop();
+                    }
+                    self.code(&code.join("\n"), "", out);
+                } else {
+                    i = self.paragraph(lines, i, out);
                 }
-                i += 1; // the closing fence, or the end
-                self.code(&code.join("\n"), &lang, out);
-            } else if let Some((level, text)) = heading(line) {
-                let style = self.styles.heading[level - 1];
-                let spans = self.inline(text, style);
+                continue;
+            };
+            // A list item, and the lines that continue it: indented, and not
+            // a block of their own.
+            i += 1;
+            let mut text = item.text.to_owned();
+            while i < lines.len()
+                && !lines[i].trim().is_empty()
+                && !starts_block(lines[i])
+                && indent_of(lines[i]) > item.indent
+            {
+                text.push(' ');
+                text.push_str(lines[i].trim());
+                i += 1;
+            }
+            while list_stack.last().is_some_and(|&top| top > item.indent) {
+                list_stack.pop();
+            }
+            if list_stack.last() != Some(&item.indent) {
+                list_stack.push(item.indent);
+            }
+            let level = list_stack.len() - 1;
+            let marker = match item.marker {
+                Marker::Bullet => ["• ", "◦ ", "▪ "][level.min(2)].to_owned(),
+                Marker::Number(n) => format!("{n}. "),
+            };
+            let mut spans = vec![Span::styled(
+                format!("{}{}", "  ".repeat(level.min(16)), marker),
+                self.styles.bullet,
+            )];
+            spans.extend(self.inline(text.trim(), Style::new()));
+            out.push(Line {
+                spans,
+                ..Line::default()
+            });
+        }
+    }
+
+    /// A paragraph starting at `lines[i]`, which runs until a blank line or
+    /// another block. Returns the index after it.
+    fn paragraph(&self, lines: &[&str], mut i: usize, out: &mut Vec<Line<'static>>) -> usize {
+        let mut pieces: Vec<(String, bool)> = Vec::new();
+        while i < lines.len() && !lines[i].trim().is_empty() {
+            if !pieces.is_empty() && starts_block(lines[i]) {
+                break;
+            }
+            let raw = lines[i];
+            let more = i + 1 < lines.len()
+                && !lines[i + 1].trim().is_empty()
+                && !starts_block(lines[i + 1]);
+            // A backslash ends a line only if nothing escapes it, and a break
+            // needs a line after it.
+            let backslashes = raw.chars().rev().take_while(|&c| c == '\\').count();
+            let slash = more && backslashes % 2 == 1;
+            let hard = more && (raw.ends_with("  ") || slash);
+            let body = raw.trim();
+            let body = if slash { &body[..body.len() - 1] } else { body };
+            pieces.push((body.trim_end().to_owned(), hard));
+            i += 1;
+        }
+        let mut current = String::new();
+        for (k, (body, hard)) in pieces.iter().enumerate() {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(body);
+            if *hard || k + 1 == pieces.len() {
                 out.push(Line {
-                    spans,
+                    spans: self.inline(&current, Style::new()),
                     ..Line::default()
                 });
-                i += 1;
-            } else if is_rule(line) {
-                out.push(Line::from(Span::styled(
-                    "─".repeat(self.rule_width),
-                    self.styles.rule,
-                )));
-                i += 1;
-            } else if quote_body(line).is_some() {
-                let start = i;
-                while i < lines.len() && quote_body(lines[i]).is_some() {
-                    i += 1;
-                }
-                let inner: Vec<&str> = lines[start..i]
-                    .iter()
-                    .filter_map(|l| quote_body(l))
-                    .collect();
-                let mut quoted = Vec::new();
-                self.blocks(&inner, &mut quoted);
-                for mut q in quoted {
-                    q.spans.insert(0, Span::styled("│ ", self.styles.quote));
-                    q.style = q.style.patch(self.styles.quote);
-                    out.push(q);
-                }
-            } else if let Some(item) = list_item(line) {
-                i += 1;
-                let mut text = item.text.to_owned();
-                // Lines that continue the item: indented, and not a block of
-                // their own.
-                while i < lines.len()
-                    && !lines[i].trim().is_empty()
-                    && !starts_block(lines[i])
-                    && indent_of(lines[i]) > item.indent
-                {
-                    text.push(' ');
-                    text.push_str(lines[i].trim());
-                    i += 1;
-                }
-                let depth = item.indent / 2;
-                let marker = match item.marker {
-                    Marker::Bullet => ["• ", "◦ ", "▪ "][depth.min(2)].to_owned(),
-                    Marker::Number(n) => format!("{n}. "),
-                };
-                let mut spans = vec![Span::styled(
-                    format!("{}{}", "  ".repeat(depth), marker),
-                    self.styles.bullet,
-                )];
-                spans.extend(self.inline(text.trim(), Style::new()));
-                out.push(Line {
-                    spans,
-                    ..Line::default()
-                });
-            } else if indent_of(line) >= 4 && out.last().is_none_or(is_blank) {
-                let mut code = Vec::new();
-                while i < lines.len() && (indent_of(lines[i]) >= 4 || lines[i].trim().is_empty()) {
-                    code.push(strip_indent(lines[i], 4));
-                    i += 1;
-                }
-                while code.last().is_some_and(|l| l.trim().is_empty()) {
-                    code.pop();
-                }
-                self.code(&code.join("\n"), "", out);
-            } else {
-                // A paragraph runs until a blank line or another block.
-                let mut pieces: Vec<(String, bool)> = Vec::new();
-                while i < lines.len() && !lines[i].trim().is_empty() {
-                    if !pieces.is_empty() && starts_block(lines[i]) {
-                        break;
-                    }
-                    let raw = lines[i];
-                    let more = i + 1 < lines.len()
-                        && !lines[i + 1].trim().is_empty()
-                        && !starts_block(lines[i + 1]);
-                    // A backslash ends a line only if nothing escapes it, and
-                    // a break needs a line after it.
-                    let backslashes = raw.chars().rev().take_while(|&c| c == '\\').count();
-                    let slash = more && backslashes % 2 == 1;
-                    let hard = more && (raw.ends_with("  ") || slash);
-                    let body = raw.trim();
-                    let body = if slash { &body[..body.len() - 1] } else { body };
-                    pieces.push((body.trim_end().to_owned(), hard));
-                    i += 1;
-                }
-                let mut current = String::new();
-                for (k, (body, hard)) in pieces.iter().enumerate() {
-                    if !current.is_empty() {
-                        current.push(' ');
-                    }
-                    current.push_str(body);
-                    if *hard || k + 1 == pieces.len() {
-                        out.push(Line {
-                            spans: self.inline(&current, Style::new()),
-                            ..Line::default()
-                        });
-                        current.clear();
-                    }
-                }
+                current.clear();
             }
         }
+        i
     }
 
     fn code(&self, code: &str, lang: &str, out: &mut Vec<Line<'static>>) {
@@ -282,11 +325,11 @@ impl<'a> Markdown<'a> {
         out: &mut Vec<Span<'static>>,
         depth: usize,
     ) {
-        // Markup nested this deep is not worth the stack it takes.
-        if depth > 16 {
+        if depth > MAX_INLINE_DEPTH {
             push(out, text, base, link);
             return;
         }
+        let mut scan = Scan::new(text);
         let mut literal = String::new();
         let flush = |literal: &mut String, out: &mut Vec<Span<'static>>| {
             if !literal.is_empty() {
@@ -295,7 +338,6 @@ impl<'a> Markdown<'a> {
             }
         };
         let mut i = 0;
-        let bytes = text.as_bytes();
         while i < text.len() {
             let rest = &text[i..];
             let c = rest.chars().next().unwrap_or(' ');
@@ -311,17 +353,17 @@ impl<'a> Markdown<'a> {
                 }
                 '`' => {
                     let run = rest.chars().take_while(|&c| c == '`').count();
-                    match find_closing_backticks(&rest[run..], run) {
+                    match scan.ticks_end(i + run, run) {
                         Some(end) => {
                             flush(&mut literal, out);
-                            let code = &rest[run..run + end];
+                            let code = &text[i + run..end];
                             let code = code
                                 .strip_prefix(' ')
                                 .and_then(|c| c.strip_suffix(' '))
                                 .filter(|c| !c.trim().is_empty())
                                 .unwrap_or(code);
                             push(out, code, base.patch(self.styles.code), link);
-                            i += run + end + run;
+                            i = end + run;
                         }
                         None => {
                             literal.push_str(&rest[..run]);
@@ -331,30 +373,27 @@ impl<'a> Markdown<'a> {
                 }
                 '*' | '_' | '~' => {
                     let run = rest.chars().take_while(|&x| x == c).count();
-                    let width = if c == '~' { 2 } else { run.min(2) };
-                    let before = text[..i].chars().next_back();
-                    let opens = !(c == '_' && before.is_some_and(char::is_alphanumeric))
-                        && rest[run.min(width)..]
-                            .chars()
-                            .next()
-                            .is_some_and(|n| !n.is_whitespace())
-                        && !(c == '~' && run < 2);
-                    let found = opens
-                        .then(|| find_closing(&text[i + width..], c, width))
-                        .flatten();
-                    match found {
-                        Some(end) if end > 0 => {
+                    match self.emphasis(&mut scan, i, run, c) {
+                        Some((lead, width, end)) => {
+                            literal.extend(std::iter::repeat_n(c, lead));
                             flush(&mut literal, out);
-                            let inner = &text[i + width..i + width + end];
+                            let start = i + lead + width;
                             let style = match (c, width) {
                                 ('~', _) => self.styles.strikethrough,
+                                (_, 1) => self.styles.emphasis,
                                 (_, 2) => self.styles.strong,
-                                _ => self.styles.emphasis,
+                                _ => self.styles.strong.patch(self.styles.emphasis),
                             };
-                            self.inline_into(inner, base.patch(style), link, out, depth + 1);
-                            i += width + end + width;
+                            self.inline_into(
+                                &text[start..end],
+                                base.patch(style),
+                                link,
+                                out,
+                                depth + 1,
+                            );
+                            i = end + width;
                         }
-                        _ => {
+                        None => {
                             literal.push_str(&rest[..run]);
                             i += run;
                         }
@@ -363,10 +402,13 @@ impl<'a> Markdown<'a> {
                 '[' => match parse_link(rest) {
                     Some((label, url, used)) => {
                         flush(&mut literal, out);
+                        // Only URLs a terminal can open and that can't do
+                        // harm become links; the label is still shown.
+                        let link_url = link_ok(url).then_some(url);
                         self.inline_into(
                             label,
                             base.patch(self.styles.link),
-                            Some(url),
+                            link_url,
                             out,
                             depth + 1,
                         );
@@ -393,17 +435,148 @@ impl<'a> Markdown<'a> {
                     i += c.len_utf8();
                 }
             }
-            let _ = bytes;
         }
         flush(&mut literal, out);
+    }
+
+    /// Tries to open emphasis with the run of `run` copies of `c` at `at`.
+    /// On success returns how many of them stay literal before the
+    /// delimiter, the width of the delimiter, and where the text that closes
+    /// it starts. A run longer than the delimiter uses its last characters.
+    fn emphasis(
+        &self,
+        scan: &mut Scan<'_>,
+        at: usize,
+        run: usize,
+        c: char,
+    ) -> Option<(usize, usize, usize)> {
+        let text = scan.text;
+        let before = text[..at].chars().next_back();
+        let widths: &[usize] = match c {
+            '~' if run >= 2 => &[2],
+            '~' => return None,
+            _ if run >= 3 => &[3, 2, 1],
+            _ if run == 2 => &[2, 1],
+            _ => &[1],
+        };
+        for &width in widths {
+            let lead = run.min(3).max(width) - width + (run - run.min(3));
+            let start = at + lead;
+            let after = text[start + width..].chars().next();
+            let opens = after.is_some_and(|a| !a.is_whitespace())
+                && !(c == '_' && before.is_some_and(char::is_alphanumeric) && lead == 0);
+            if !opens {
+                continue;
+            }
+            if let Some(end) = scan.closer(start + width, c, width, 0) {
+                if end > start + width {
+                    return Some((lead, width, end));
+                }
+            }
+        }
+        None
     }
 }
 
 impl Widget for Markdown<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new(self.to_text())
-            .wrap(Wrap::Word)
-            .render(area, buf);
+        let text = self.render_text(self.rule_width.unwrap_or(usize::from(area.width)));
+        Paragraph::new(text).wrap(Wrap::Word).render(area, buf);
+    }
+}
+
+/// What the scanning for closing delimiters has learned about one text, so
+/// that input with many openers and no closers is not searched to the end
+/// once for each.
+struct Scan<'t> {
+    text: &'t str,
+    /// For a delimiter character and width: the earliest start from which no
+    /// closer exists. A later start has none either.
+    no_closer: HashMap<(char, usize), usize>,
+    /// The same for a run of backticks of some length.
+    no_ticks: HashMap<usize, usize>,
+}
+
+impl<'t> Scan<'t> {
+    fn new(text: &'t str) -> Self {
+        Scan {
+            text,
+            no_closer: HashMap::new(),
+            no_ticks: HashMap::new(),
+        }
+    }
+
+    /// Where a run of exactly `n` backticks starts, at or after `from`.
+    fn ticks_end(&mut self, from: usize, n: usize) -> Option<usize> {
+        if self.no_ticks.get(&n).is_some_and(|&f| from >= f) {
+            return None;
+        }
+        let text = self.text;
+        let mut i = from;
+        while i < text.len() {
+            if text[i..].starts_with('`') {
+                let run = text[i..].chars().take_while(|&c| c == '`').count();
+                if run == n {
+                    return Some(i);
+                }
+                i += run;
+            } else {
+                i += text[i..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        let f = self.no_ticks.entry(n).or_insert(from);
+        *f = (*f).min(from);
+        None
+    }
+
+    /// Where the delimiter that closes emphasis of `width` copies of `c`
+    /// starts, looking from `from`: a run that is not after a space, and for
+    /// `_` not before a letter. A run that could open emphasis of its own,
+    /// with its closer, is skipped whole.
+    fn closer(&mut self, from: usize, c: char, width: usize, depth: usize) -> Option<usize> {
+        if self.no_closer.get(&(c, width)).is_some_and(|&f| from >= f) {
+            return None;
+        }
+        let text = self.text;
+        let mut i = from;
+        while i < text.len() {
+            let rest = &text[i..];
+            if let Some(after) = rest.strip_prefix('\\') {
+                i += 1 + after.chars().next().map_or(0, char::len_utf8);
+            } else if rest.starts_with('`') {
+                let run = rest.chars().take_while(|&x| x == '`').count();
+                match self.ticks_end(i + run, run) {
+                    Some(end) => i = end + run,
+                    None => i += run,
+                }
+            } else if rest.starts_with(c) {
+                let run = rest.chars().take_while(|&x| x == c).count();
+                let before = text[..i].chars().next_back();
+                let after = text[i + run..].chars().next();
+                let alnum_before = before.is_some_and(char::is_alphanumeric);
+                let alnum_after = after.is_some_and(char::is_alphanumeric);
+                let can_close =
+                    before.is_some_and(|b| !b.is_whitespace()) && !(c == '_' && alnum_after);
+                let can_open =
+                    after.is_some_and(|a| !a.is_whitespace()) && !(c == '_' && alnum_before);
+                if can_close && run >= width {
+                    return Some(i);
+                }
+                if can_open && depth < 8 && c != '~' {
+                    let inner = run.min(2);
+                    if let Some(end) = self.closer(i + run, c, inner, depth + 1) {
+                        i = end + inner;
+                        continue;
+                    }
+                }
+                i += run;
+            } else {
+                i += rest.chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        let f = self.no_closer.entry((c, width)).or_insert(from);
+        *f = (*f).min(from);
+        None
     }
 }
 
@@ -587,63 +760,22 @@ fn starts_block(line: &str) -> bool {
         || list_item(line).is_some()
 }
 
-/// The length of the text before a run of exactly `n` backticks.
-fn find_closing_backticks(text: &str, n: usize) -> Option<usize> {
-    let mut i = 0;
-    while i < text.len() {
-        if text[i..].starts_with('`') {
-            let run = text[i..].chars().take_while(|&c| c == '`').count();
-            if run == n {
-                return Some(i);
-            }
-            i += run;
-        } else {
-            i += text[i..].chars().next().map_or(1, char::len_utf8);
-        }
+/// `s` cut to at most `n` bytes, on a character boundary.
+fn cut(s: &str, n: usize) -> &str {
+    let mut end = n.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
     }
-    None
+    &s[..end]
 }
 
-/// The length of the text before the delimiter that closes an emphasis
-/// opened with `width` copies of `c`: not after a space, and for `_` not
-/// inside a word.
-fn find_closing(text: &str, c: char, width: usize) -> Option<usize> {
-    let delim: String = std::iter::repeat_n(c, width).collect();
-    let mut i = 0;
-    while i < text.len() {
-        let rest = &text[i..];
-        if let Some(after) = rest.strip_prefix('\\') {
-            i += 1 + after.chars().next().map_or(0, char::len_utf8);
-        } else if rest.starts_with('`') {
-            let run = rest.chars().take_while(|&x| x == '`').count();
-            match find_closing_backticks(&rest[run..], run) {
-                Some(end) => i += run + end + run,
-                None => i += run,
-            }
-        } else if rest.starts_with(&delim) {
-            let before = text[..i].chars().next_back();
-            let after = rest[delim.len()..].chars().next();
-            let ok_before = before.is_some_and(|b| !b.is_whitespace());
-            let ok_after = !(c == '_' && after.is_some_and(char::is_alphanumeric));
-            // A longer run of the same character is not this delimiter.
-            let longer = after == Some(c) && width == 1;
-            if ok_before && ok_after && !longer {
-                return Some(i);
-            }
-            i += delim.len();
-        } else {
-            i += rest.chars().next().map_or(1, char::len_utf8);
-        }
-    }
-    None
-}
-
-/// `[label](url)` at the start of `text`: the label, the URL, and how many
-/// bytes it took.
+/// `[label](url "title")` at the start of `text`: the label, the URL, and
+/// how many bytes it took. Parentheses in the URL must be balanced.
 fn parse_link(text: &str) -> Option<(&str, &str, usize)> {
+    let window = cut(text, LABEL_WINDOW);
     let mut depth = 0usize;
     let mut close = None;
-    let mut chars = text.char_indices().peekable();
+    let mut chars = window.char_indices();
     while let Some((i, c)) = chars.next() {
         match c {
             '\\' => {
@@ -661,26 +793,93 @@ fn parse_link(text: &str) -> Option<(&str, &str, usize)> {
         }
     }
     let close = close?;
-    let after = text[close + 1..].strip_prefix('(')?;
-    let end = after.find(')')?;
-    let inside = after[..end].trim();
-    // A title after the URL is dropped.
-    let url = inside.split_whitespace().next().unwrap_or("");
-    if url.is_empty() || url.contains(['<', '>']) {
+    let dest_start = close + 2;
+    if !text[close + 1..].starts_with('(') {
         return None;
     }
-    Some((&text[1..close], url, close + 2 + end + 1))
+    let tail = cut(&text[dest_start..], URL_WINDOW);
+    let trimmed = tail.trim_start_matches([' ', '\t']);
+    let skipped = tail.len() - trimmed.len();
+    let (url, mut at) = if let Some(inner) = trimmed.strip_prefix('<') {
+        let end = inner.find('>')?;
+        let url = &inner[..end];
+        if url.contains(char::is_whitespace) {
+            return None;
+        }
+        (url, skipped + 1 + end + 1)
+    } else {
+        let mut parens = 0usize;
+        let mut end = trimmed.len();
+        let mut it = trimmed.char_indices();
+        while let Some((i, c)) = it.next() {
+            match c {
+                '\\' => {
+                    it.next();
+                }
+                '(' => parens += 1,
+                ')' if parens == 0 => {
+                    end = i;
+                    break;
+                }
+                ')' => parens -= 1,
+                c if c.is_whitespace() => {
+                    end = i;
+                    break;
+                }
+                c if c.is_control() => return None,
+                _ => {}
+            }
+        }
+        (&trimmed[..end], skipped + end)
+    };
+    if url.is_empty() {
+        return None;
+    }
+    // An optional title, then the closing parenthesis.
+    let mut rest = tail[at..].trim_start_matches([' ', '\t']);
+    at = tail.len() - rest.len();
+    if let Some(quote) = rest
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\'' | '('))
+    {
+        let closer = if quote == '(' { ')' } else { quote };
+        let mut it = rest[1..].char_indices();
+        let mut end = None;
+        while let Some((i, c)) = it.next() {
+            if c == '\\' {
+                it.next();
+            } else if c == closer {
+                end = Some(i);
+                break;
+            }
+        }
+        let end = end?;
+        rest = rest[1 + end + 1..].trim_start_matches([' ', '\t']);
+        at = tail.len() - rest.len();
+    }
+    if !rest.starts_with(')') {
+        return None;
+    }
+    let used = dest_start + at + 1;
+    Some((&text[1..close], url, used))
 }
 
 /// `<https://...>` at the start of `text`.
 fn autolink(text: &str) -> Option<(&str, usize)> {
-    let end = text.find('>')?;
+    let window = cut(text, AUTOLINK_WINDOW);
+    let end = window.find('>')?;
     let url = &text[1..end];
-    let ok = ["http://", "https://", "mailto:", "ftp://"]
+    (link_ok(url) && !url.contains(char::is_whitespace)).then_some((url, end + 1))
+}
+
+/// Whether a link to `url` should be a hyperlink: a scheme a terminal can
+/// open and that does not run anything.
+fn link_ok(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    ["http://", "https://", "mailto:", "ftp://", "file://"]
         .iter()
-        .any(|p| url.starts_with(p))
-        && !url.contains(char::is_whitespace);
-    ok.then_some((url, end + 1))
+        .any(|p| lower.starts_with(p))
 }
 
 #[cfg(test)]
@@ -1012,5 +1211,157 @@ mod tests {
         assert_eq!(buf.link_at(3, 0), Some("https://e.com"));
         assert_eq!(buf.link_at(6, 0), Some("https://e.com"));
         assert_eq!(buf.link_at(7, 0), None);
+    }
+
+    #[test]
+    fn emphasis_inside_emphasis_and_runs_of_three() {
+        let s = MarkdownStyles::default();
+        let both = s.strong.patch(s.emphasis);
+        assert_eq!(
+            styles_of("*a **b** c*", 0),
+            vec![
+                ("a ".to_owned(), s.emphasis),
+                ("b".to_owned(), s.emphasis.patch(s.strong)),
+                (" c".to_owned(), s.emphasis),
+            ]
+        );
+        assert_eq!(styles_of("***both***", 0), vec![("both".to_owned(), both)]);
+        assert_eq!(
+            styles_of("**a *b***", 0),
+            vec![
+                ("a ".to_owned(), s.strong),
+                ("b".to_owned(), s.strong.patch(s.emphasis)),
+            ]
+        );
+        // A run longer than what closes leaves the rest as text, like
+        // CommonMark: `**a*` is a star and then emphasis.
+        assert_eq!(
+            styles_of("**a*", 0),
+            vec![("*".to_owned(), Style::new()), ("a".to_owned(), s.emphasis)]
+        );
+    }
+
+    #[test]
+    fn a_link_url_can_hold_balanced_parentheses_and_a_title() {
+        for (src, url, rest) in [
+            ("[a](http://x/(y))", "http://x/(y)", ""),
+            ("[a](http://x/(y) \"t\") z", "http://x/(y)", " z"),
+            ("[a](<http://x/y>) z", "http://x/y", " z"),
+            ("[a](http://x 'title')", "http://x", ""),
+            ("[a](  http://x  )", "http://x", ""),
+        ] {
+            let t = Markdown::new(src).to_text();
+            let spans = &t.lines[0].spans;
+            assert_eq!(spans[0].content, "a", "{src}");
+            assert_eq!(spans[0].link.as_deref(), Some(url), "{src}");
+            let after: String = spans[1..].iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(after, rest, "{src}");
+        }
+        // Unbalanced, or no URL: not a link.
+        for src in ["[a](http://x/(y)", "[a]()", "[a](", "[a](http://x \"open)"] {
+            let t = Markdown::new(src).to_text();
+            assert!(t.lines[0].spans.iter().all(|s| s.link.is_none()), "{src}");
+        }
+    }
+
+    #[test]
+    fn only_urls_a_terminal_can_open_become_hyperlinks() {
+        for src in [
+            "[a](javascript:alert(1))",
+            "[a](data:text/html;base64,AAAA)",
+            "[a](docs/readme.md)",
+            "[a](#top)",
+            "[a](//example.com)",
+        ] {
+            let t = Markdown::new(src).to_text();
+            let span = &t.lines[0].spans[0];
+            assert_eq!(span.content, "a", "{src}");
+            assert_eq!(span.link, None, "{src}");
+            assert_eq!(span.style, MarkdownStyles::default().link, "{src}");
+        }
+        for url in [
+            "HTTP://e.com",
+            "https://e.com/x",
+            "mailto:a@e.com",
+            "ftp://e.com",
+            "file:///tmp/x",
+        ] {
+            let t = Markdown::new(&format!("[a]({url})")).to_text();
+            assert_eq!(t.lines[0].spans[0].link.as_deref(), Some(url));
+        }
+        assert_eq!(render("<javascript:alert(1)>"), ["<javascript:alert(1)>"]);
+    }
+
+    #[test]
+    fn a_rule_fills_the_area_it_is_drawn_in_and_does_not_wrap() {
+        let mut buf = Buffer::new(Rect::new(0, 0, 10, 4));
+        Markdown::new("---\nafter").render(Rect::new(0, 0, 10, 4), &mut buf);
+        let row = |y| -> String { (0..10).map(|x| buf.get(x, y).unwrap().symbol()).collect() };
+        assert_eq!(row(0), "──────────");
+        assert_eq!(row(1).trim_end(), "after");
+        // A width given by the caller wins.
+        let mut buf = Buffer::new(Rect::new(0, 0, 10, 2));
+        Markdown::new("---")
+            .rule_width(3)
+            .render(Rect::new(0, 0, 10, 2), &mut buf);
+        assert_eq!(buf.get(2, 0).unwrap().symbol(), "─");
+        assert_eq!(buf.get(3, 0).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn nesting_follows_the_indents_whatever_their_size() {
+        assert_eq!(
+            render("- a\n    - b\n        - c\n    - d\n- e"),
+            ["• a", "  ◦ b", "    ▪ c", "  ◦ d", "• e"]
+        );
+        assert_eq!(render("- a\n - b\n  - c"), ["• a", "  ◦ b", "    ▪ c"]);
+    }
+
+    #[test]
+    fn a_very_deep_quote_does_not_overflow_the_stack() {
+        let src = format!("{}x", "> ".repeat(20_000));
+        let started = std::time::Instant::now();
+        let t = Markdown::new(&src).to_text();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let text: String = t.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            text.ends_with('x'),
+            "{}",
+            &text[text.len().saturating_sub(20)..]
+        );
+        assert_eq!(text.chars().filter(|&c| c == '│').count(), MAX_QUOTE_DEPTH);
+    }
+
+    #[test]
+    fn input_with_many_openers_and_no_closers_is_not_quadratic() {
+        let cases: &[&str] = &[
+            "*a ", " _a", "**a ", "~~a ", "*`a ", "[", "[a", "[a](", "<", "`a ", "a\r*b\r",
+            "***a ", "_a_b", "**a *b ", "> *a ", "- *a\n", "[a](b) *", "\\*a ", "*a\\ ", "`` a ` ",
+        ];
+        for case in cases {
+            let src = case.repeat(20_000 / case.len().max(1));
+            let started = std::time::Instant::now();
+            let t = Markdown::new(&src).to_text();
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(3),
+                "{case:?} took {took:?}"
+            );
+            // And nothing was lost: every word is still there.
+            let text: String = t
+                .lines
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+                .collect();
+            assert!(!text.is_empty(), "{case:?}");
+        }
     }
 }

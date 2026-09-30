@@ -18,6 +18,7 @@
 mod code;
 mod diff;
 mod markdown;
+mod util;
 
 pub use code::{CodeBlock, HighlightStyles, highlight};
 pub use diff::{Diff, DiffStyles};

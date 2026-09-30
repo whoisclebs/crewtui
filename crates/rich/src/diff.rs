@@ -1,4 +1,6 @@
 use crewtui::text::{Line, Span, Text};
+
+use crate::util::expand_tabs;
 use crewtui::widgets::{Block, Paragraph, Widget};
 use crewtui::{Buffer, Color, Rect, Style};
 
@@ -121,7 +123,7 @@ impl<'a> Diff<'a> {
                     Kind::Removed => s.removed,
                     Kind::Context => s.context,
                 };
-                spans.push(Span::styled(row.text.to_owned(), style));
+                spans.push(Span::styled(expand_tabs(row.text).into_owned(), style));
                 Line {
                     spans,
                     ..Line::default()
@@ -151,9 +153,12 @@ struct Row<'a> {
     new: Option<usize>,
 }
 
-/// What each line of `source` is, and its old and new line numbers.
+/// What each line of `source` is, and its old and new line numbers. A hunk
+/// ends when the lines its header counted have all been seen, so a file
+/// header or a signature after it is not taken for part of it.
 fn classify(source: &str) -> Vec<Row<'_>> {
-    let mut in_hunk = false;
+    // Lines still to come on each side of the hunk we are in.
+    let mut left: Option<(usize, usize)> = None;
     let (mut old, mut new) = (0usize, 0usize);
     source
         .lines()
@@ -164,48 +169,77 @@ fn classify(source: &str) -> Vec<Row<'_>> {
                 old: None,
                 new: None,
             };
-            if let Some((o, n)) = hunk_start(text) {
-                in_hunk = true;
+            if let Some(((o, oc), (n, nc))) = hunk_start(text) {
                 (old, new) = (o, n);
-                plain(Kind::Hunk)
-            } else if text.starts_with("diff ") || (!in_hunk && is_file_header(text)) {
-                in_hunk = false;
-                plain(Kind::Header)
-            } else if in_hunk && text.starts_with('+') {
-                new += 1;
+                left = (oc > 0 || nc > 0).then_some((oc, nc));
+                return plain(Kind::Hunk);
+            }
+            let Some((old_left, new_left)) = left else {
+                return plain(if text.starts_with("diff ") || is_file_header(text) {
+                    Kind::Header
+                } else {
+                    Kind::Context
+                });
+            };
+            let row = if text.starts_with('+') && new_left > 0 {
+                left = Some((old_left, new_left - 1));
+                new = new.saturating_add(1);
                 Row {
                     new: Some(new - 1),
                     ..plain(Kind::Added)
                 }
-            } else if in_hunk && text.starts_with('-') {
-                old += 1;
+            } else if text.starts_with('-') && old_left > 0 {
+                left = Some((old_left - 1, new_left));
+                old = old.saturating_add(1);
                 Row {
                     old: Some(old - 1),
                     ..plain(Kind::Removed)
                 }
-            } else if in_hunk && (text.starts_with(' ') || text.is_empty()) {
-                old += 1;
-                new += 1;
+            } else if (text.starts_with(' ') || text.is_empty()) && old_left > 0 && new_left > 0 {
+                left = Some((old_left - 1, new_left - 1));
+                old = old.saturating_add(1);
+                new = new.saturating_add(1);
                 Row {
                     old: Some(old - 1),
                     new: Some(new - 1),
                     ..plain(Kind::Context)
                 }
+            } else if text.starts_with('\\') {
+                // `\ No newline at end of file` belongs to the line before.
+                plain(Kind::Context)
             } else {
-                // `\ No newline at end of file`, `index ...`, and the rest.
-                plain(if in_hunk { Kind::Context } else { Kind::Header })
+                // The hunk is over, and this is what comes next.
+                left = None;
+                return plain(if text.starts_with("diff ") || is_file_header(text) {
+                    Kind::Header
+                } else {
+                    Kind::Context
+                });
+            };
+            if left == Some((0, 0)) {
+                left = None;
             }
+            row
         })
         .collect()
 }
 
-/// `@@ -old,count +new,count @@ ...`: where the old and new numbering start.
-fn hunk_start(line: &str) -> Option<(usize, usize)> {
+/// `@@ -old,count +new,count @@ ...`: where the old and new numbering start
+/// and how many lines each side has in the hunk. A missing count is one.
+fn hunk_start(line: &str) -> Option<((usize, usize), (usize, usize))> {
     let rest = line.strip_prefix("@@ -")?;
     let (old, rest) = rest.split_once(' ')?;
     let new = rest.strip_prefix('+')?.split(' ').next()?;
-    let first = |s: &str| s.split(',').next()?.parse().ok();
-    Some((first(old)?, first(new)?))
+    let parse = |s: &str| -> Option<(usize, usize)> {
+        let mut it = s.split(',');
+        let start = it.next()?.parse().ok()?;
+        let count = match it.next() {
+            Some(c) => c.parse().ok()?,
+            None => 1,
+        };
+        Some((start, count))
+    };
+    Some((parse(old)?, parse(new)?))
 }
 
 fn is_file_header(line: &str) -> bool {
@@ -286,7 +320,7 @@ mod tests {
 
     #[test]
     fn the_number_columns_are_as_wide_as_the_biggest_number() {
-        let t = Diff::new("@@ -98,2 +98,2 @@\n a\n b\n c\n")
+        let t = Diff::new("@@ -98,3 +98,3 @@\n a\n b\n c\n")
             .line_numbers(true)
             .to_text();
         assert_eq!(spans(&t, 1), " 98  98  a");
@@ -321,7 +355,7 @@ mod tests {
         let t = Diff::new("just words\n@@ garbage @@\n\\ No newline at end of file\n\n").to_text();
         assert_eq!(t.lines.len(), 4);
         assert_eq!(spans(&t, 0), "just words");
-        assert_eq!(style_of(&t, 1), s.header);
+        assert_eq!(style_of(&t, 1), s.context);
         assert_eq!(Diff::new("").to_text().lines.len(), 0);
         // Numbers with nothing to number.
         let _ = Diff::new("").line_numbers(true).to_text();
@@ -346,5 +380,63 @@ mod tests {
                 .block(Block::bordered())
                 .render(area, &mut buf);
         }
+    }
+
+    #[test]
+    fn line_numbers_that_would_overflow_saturate() {
+        let t = Diff::new("@@ -1 +18446744073709551615 @@\n+a\n")
+            .line_numbers(true)
+            .to_text();
+        assert_eq!(t.lines.len(), 2);
+        let t = Diff::new("@@ -18446744073709551615,3 +18446744073709551615,3 @@\n a\n b\n c\n")
+            .line_numbers(true)
+            .to_text();
+        assert_eq!(t.lines.len(), 4);
+    }
+
+    #[test]
+    fn a_hunk_ends_when_its_counts_run_out() {
+        let s = DiffStyles::default();
+        // Two files with no `diff` line between them, like `diff -u` makes.
+        let src = "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y\n--- c\n+++ d\n@@ -1 +1 @@\n-p\n+q\n";
+        let t = Diff::new(src).to_text();
+        let styles: Vec<Style> = (0..t.lines.len()).map(|i| style_of(&t, i)).collect();
+        assert_eq!(
+            styles,
+            [
+                s.header, s.header, s.hunk, s.removed, s.added, s.header, s.header, s.hunk,
+                s.removed, s.added
+            ]
+        );
+        // The signature `git format-patch` ends with is not part of the hunk.
+        let src = "@@ -1,2 +1,2 @@\n a\n-b\n+c\n-- \n2.43.0\n";
+        let t = Diff::new(src).line_numbers(true).to_text();
+        assert_eq!(style_of(&t, 4), s.context);
+        assert!(
+            !spans(&t, 4).starts_with(|c: char| c.is_ascii_digit()),
+            "{:?}",
+            spans(&t, 4)
+        );
+        assert!(
+            spans(&t, 4).trim_start().starts_with("-- "),
+            "{:?}",
+            spans(&t, 4)
+        );
+        // No-newline markers belong to the line before them.
+        let t = Diff::new("@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n").to_text();
+        assert_eq!(style_of(&t, 2), s.context);
+        assert_eq!(style_of(&t, 3), s.added);
+        // A hunk with zero counts on one side.
+        let t = Diff::new("@@ -0,0 +1,2 @@\n+a\n+b\n")
+            .line_numbers(true)
+            .to_text();
+        assert_eq!(spans(&t, 1), "  1 +a");
+        assert_eq!(spans(&t, 2), "  2 +b");
+    }
+
+    #[test]
+    fn tabs_are_expanded() {
+        let t = Diff::new("@@ -1 +1 @@\n+\ty\n").to_text();
+        assert_eq!(spans(&t, 1), "+   y");
     }
 }
