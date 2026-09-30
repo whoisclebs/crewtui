@@ -1,6 +1,6 @@
 //! What to turn on in the terminal, and the escape sequences that do it.
 
-/// Which terminal modes [`Terminal::enter`] turns on. Raw mode is always
+/// Which terminal modes [`Terminal::enter`](crate::Terminal::enter) turns on. Raw mode is always
 /// enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
