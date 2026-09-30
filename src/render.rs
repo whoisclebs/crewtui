@@ -383,18 +383,26 @@ mod tests {
             // Most frames tweak the previous content a little; that is the
             // case where stale halves of wide glyphs show up.
             let mut ops = Vec::new();
+            let mut scene_styles = Vec::new();
             for _ in 0..(next() % 6) {
                 let x = (next() % (w as u64 + 2)) as u16;
                 let y = (next() % h as u64) as u16;
                 let s = pieces[(next() % pieces.len() as u64) as usize];
                 let st = styles[(next() % styles.len() as u64) as usize];
                 ops.push((x, y, s, st));
+                if next() % 3 == 0 {
+                    // Style one cell alone: for a wide glyph, either half.
+                    scene_styles.push((next() as u16 % w, y, styles[(next() % 4) as usize]));
+                }
             }
             if frame == 0 || next() % 4 == 0 {
                 scene.reset();
             }
             for (x, y, s, st) in ops {
                 scene.set_string(x, y, s, st);
+            }
+            for (x, y, st) in scene_styles {
+                scene.set_style(Rect::new(x, y, 1, 1), st);
             }
             let bytes = r.draw(|b| *b = scene.clone()).to_vec();
             screen.feed(&bytes);

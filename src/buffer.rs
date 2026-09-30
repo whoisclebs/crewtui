@@ -92,19 +92,19 @@ impl Cell {
     }
 
     /// Layers `style` on top of the current one.
-    pub fn patch_style(&mut self, style: Style) -> &mut Self {
+    pub(crate) fn patch_style(&mut self, style: Style) -> &mut Self {
         self.style = self.style.patch(style);
         self
     }
 
     /// Replaces the style outright.
-    pub fn set_style(&mut self, style: Style) -> &mut Self {
+    pub(crate) fn set_style(&mut self, style: Style) -> &mut Self {
         self.style = style;
         self
     }
 
     /// Back to a blank, unstyled cell.
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         *self = Cell::blank();
     }
 }
@@ -168,8 +168,9 @@ impl Buffer {
         self.index_of(x, y).map(|i| &self.cells[i])
     }
 
-    /// Mutable access to the cell at `(x, y)`.
-    pub fn get_mut(&mut self, x: u16, y: u16) -> Option<&mut Cell> {
+    /// Mutable access to the cell at `(x, y)`. Internal: writes must keep
+    /// wide glyphs intact, so they go through the `Buffer` methods.
+    pub(crate) fn get_mut(&mut self, x: u16, y: u16) -> Option<&mut Cell> {
         self.index_of(x, y).map(|i| &mut self.cells[i])
     }
 
