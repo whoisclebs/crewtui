@@ -312,7 +312,7 @@ impl Signals {
         // The handler may run on another thread, a moment after `raise`
         // returned. In an orphaned process group nothing runs, and this
         // waits for nothing.
-        for _ in 0..50 {
+        for _ in 0..250 {
             if CONTINUES.load(Ordering::SeqCst) != continues {
                 return Ok(true);
             }
