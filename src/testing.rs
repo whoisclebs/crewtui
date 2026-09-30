@@ -312,6 +312,19 @@ impl Pty {
         drain_fd(self.master, 100)
     }
 
+    /// Reads output into `seen` until it contains `needle`. Returns false if
+    /// `limit` passes first.
+    pub(crate) fn read_until(&self, needle: &[u8], limit: Duration, seen: &mut Vec<u8>) -> bool {
+        let deadline = Instant::now() + limit;
+        while !seen.windows(needle.len()).any(|w| w == needle) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            seen.extend(drain_fd(self.master, 50));
+        }
+        true
+    }
+
     /// Sets the size the terminal reports.
     pub(crate) fn set_size(&self, columns: u16, rows: u16) {
         let ws = libc::winsize {
@@ -386,6 +399,12 @@ impl Pty {
                 .env(CHILD_MODE, mode),
         )
     }
+}
+
+/// Sends `sig` to `child`.
+pub(crate) fn kill(child: &Child, sig: libc::c_int) {
+    // SAFETY: `kill` takes a pid and a signal number.
+    assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, sig) }, 0);
 }
 
 /// The environment variable that tells a re-run test executable which
