@@ -20,13 +20,23 @@ use crate::{Buffer, Rect, Style};
 /// [`InputState::handle_key`] and every paste to [`InputState::insert_str`].
 /// Drawing remembers the horizontal scroll and where the cursor was drawn in
 /// cells, which is why the widget only needs `&InputState`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InputState {
     text: String,
     cursor: usize,
     scroll: Cell<usize>,
     cursor_position: Cell<Option<(u16, u16)>>,
 }
+
+/// Two states are equal when they hold the same text with the cursor in the
+/// same place. What drawing remembered is not part of it.
+impl PartialEq for InputState {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.cursor == other.cursor
+    }
+}
+
+impl Eq for InputState {}
 
 /// Start of the cluster that ends at `at`.
 fn prev_boundary(text: &str, at: usize) -> usize {
@@ -140,7 +150,7 @@ impl InputState {
         }
         let start = prev_boundary(&self.text, self.cursor);
         self.text.replace_range(start..self.cursor, "");
-        self.cursor = start;
+        self.cursor = snap(&self.text, start);
         true
     }
 
@@ -151,6 +161,9 @@ impl InputState {
         }
         let end = next_boundary(&self.text, self.cursor);
         self.text.replace_range(self.cursor..end, "");
+        // What is left on both sides can join into one cluster, such as two
+        // regional indicators once the letter between them is gone.
+        self.cursor = snap(&self.text, self.cursor);
         true
     }
 
@@ -243,7 +256,7 @@ impl InputState {
             return false;
         }
         self.text.replace_range(start..self.cursor, "");
-        self.cursor = start;
+        self.cursor = snap(&self.text, start);
         true
     }
 
@@ -870,8 +883,8 @@ mod tests {
     #[test]
     fn random_edits_keep_the_cursor_on_a_boundary() {
         let pieces = [
-            "a", "é", "e\u{301}", "\u{301}", "中", "😀", FAMILY, "🇧🇷", "👍🏽", " ", "\n", "ab",
-            "\u{200d}", "x y",
+            "🇧", "🇷", "\u{1100}", "\u{1161}", "a", "é", "e\u{301}", "\u{301}", "中", "😀", FAMILY,
+            "🇧🇷", "👍🏽", " ", "\n", "ab", "\u{200d}", "x y",
         ];
         let mut seed = 0x9e3779b97f4a7c15u64;
         let mut next = move |m: u64| {
@@ -921,6 +934,44 @@ mod tests {
             assert!(!text.chars().any(char::is_control));
             draw(Input::new(), &s, 1 + next(9) as u16);
         }
+    }
+
+    #[test]
+    fn deleting_between_two_halves_of_a_cluster_keeps_the_cursor_on_a_boundary() {
+        // Regional indicators pair up, and so do Hangul jamo.
+        for (before, mid, after) in [("🇧", "x", "🇷"), ("\u{1100}", "x", "\u{1161}")] {
+            let joined = format!("{before}{after}");
+            let mut s = InputState::with_text(format!("{before}{mid}{after}"));
+            s.move_left();
+            assert!(s.backspace());
+            assert_eq!(s.text(), joined);
+            assert_eq!(s.cursor(), s.text().len(), "backspace");
+            s.insert_char('z');
+            assert_eq!(s.text(), format!("{joined}z"));
+
+            let mut s = InputState::with_text(format!("{before}{mid}{after}"));
+            s.home();
+            s.move_right();
+            assert!(s.delete());
+            assert_eq!(s.text(), joined);
+            assert_eq!(s.cursor(), s.text().len(), "delete");
+
+            let mut s = InputState::with_text(format!("{before}{mid}{after}"));
+            s.move_left();
+            assert!(s.delete_word_back());
+            assert_eq!(s.text(), after);
+        }
+    }
+
+    #[test]
+    fn drawing_does_not_change_equality() {
+        let a = InputState::with_text("abc");
+        let b = InputState::with_text("abc");
+        draw(Input::new(), &a, 2);
+        assert_eq!(a, b);
+        let mut c = InputState::with_text("abc");
+        c.move_left();
+        assert_ne!(a, c);
     }
 
     #[test]

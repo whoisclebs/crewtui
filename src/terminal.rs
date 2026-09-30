@@ -305,6 +305,11 @@ impl Terminal {
         })
     }
 
+    /// Whether entering left the cursor hidden.
+    pub(crate) fn cursor_hidden(&self) -> bool {
+        self.state.options.hide_cursor
+    }
+
     /// The terminal size as `(columns, rows)`.
     pub fn size(&self) -> io::Result<(u16, u16)> {
         window_size(self.state.output)

@@ -44,7 +44,9 @@ impl Screen {
             pending_wrap: false,
             pen: Style::new(),
             pending: Vec::new(),
-            cursor_visible: true,
+            // The terminal hides it on entering, and that is what the
+            // renderer's output is checked against.
+            cursor_visible: false,
         }
     }
 
