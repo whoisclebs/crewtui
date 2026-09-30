@@ -57,6 +57,31 @@ A streamed token writes a few hundred bytes on average instead of redrawing the 
 
 A width change is the expensive case. The frame itself is under a millisecond, because only what is on screen has to be counted again. The last row is different. A scrollbar needs the total number of rows, and after a width change that means counting every entry again: 75 ms for 20,000 entries here. It is paid once per width, and cached after that, but an app that drags its window edge with a scrollbar on a very long transcript will feel it. Making that cheaper is tracked in #54.
 
+## The reference app under stress
+
+`a_long_transcript_with_streaming_never_repaints_the_screen_per_token` in `src/agent_tests.rs` runs the agent from `examples/agent.rs` headless. It starts with 20,000 lines of history and streams six answers of 400 tokens into it. A token step sends the token, a newline every 9 tokens, a spinner tick every third token, a tool call every 40 tokens (ten per answer), a background clock tick every 50 tokens (the app turns every fifth tick into a note), and a typed character every 25 tokens. A frame is drawn after every token step, which is more often than the runtime draws. After each answer the screen is resized to 90x30 and back to 120x40.
+
+The frame sizes don't depend on timing, so the test asserts on them with limits about a quarter above what the code writes today:
+
+- no token frame writes half of a full repaint or more;
+- the mean over all token frames stays under 420 bytes, and the median under 32;
+- both resizes repaint, and a frame drawn twice with nothing in between writes nothing the second time.
+
+On a 120x40 screen a full repaint is 6,455 bytes. Over the 2,400 token frames (`cargo test --release --lib a_long_transcript -- --nocapture` prints these):
+
+| | Bytes | Time |
+|---|---|---|
+| median | 23 | 232 µs |
+| mean | 334 | |
+| 99th percentile | 2,780 | 479 µs |
+| max | 2,993 | |
+
+The times are from one run and move by tens of percent between runs, so the test only prints them. Most tokens change a few cells of the last line, hence the median of 23 bytes. A token that starts a new line scrolls the history pane and every row of it changes; that is the 2.8 KB tail. A terminal scroll region would make it cheaper, and it was not tried.
+
+To see where a frame's time goes, the run was split into stages with a timer around each, in a scratch test that is not kept. Updating the state costs about 0.1 µs per token, drawing the view 190 µs, and diffing plus building the bytes 20 µs. Nearly all of the view is `History`, which wraps and draws the rows on screen.
+
+The slow frame is the resize. A width change with a scrollbar has to measure every entry again to know the total number of rows, and each of the twelve resize frames in the run took 28 to 33 ms. It is the case tracked in #54. It doesn't happen while streaming, only when the window size changes.
+
 ## Running it
 
 ```
