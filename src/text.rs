@@ -111,6 +111,8 @@ mod tests {
         assert_eq!(wrap("ab\n\ncd", 5), vec!["ab", "", "cd"]);
         assert_eq!(wrap("ab\r\ncd", 5), vec!["ab", "cd"]);
         assert_eq!(wrap("", 5), vec![""]);
+        // A trailing newline leaves an empty last line, as in an editor.
+        assert_eq!(wrap("ab\n", 5), vec!["ab", ""]);
     }
 
     #[test]

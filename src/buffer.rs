@@ -40,6 +40,10 @@ impl Symbol {
     }
 }
 
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// One terminal cell: a grapheme cluster and its style.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Cell {
@@ -79,9 +83,10 @@ impl Cell {
         }
     }
 
-    /// Replaces the text, keeping the style. This does not maintain the
-    /// wide-glyph invariant; prefer [`Buffer::set_string`].
-    pub fn set_symbol(&mut self, symbol: &str) -> &mut Self {
+    /// Replaces the text, keeping the style. Doesn't maintain the wide-glyph
+    /// invariant, so it stays internal; outside code goes through
+    /// [`Buffer::set_string`].
+    pub(crate) fn set_symbol(&mut self, symbol: &str) -> &mut Self {
         self.symbol = Symbol::new(symbol);
         self
     }
@@ -215,7 +220,15 @@ impl Buffer {
         col.min(u16::MAX as usize) as u16
     }
 
+    /// Joins a zero-width cluster onto the last drawn cell. It is dropped
+    /// when that would change how many columns the cell takes, since the
+    /// cell layout (and the terminal's cursor) would then disagree, and
+    /// when it is a bidirectional control, which could reorder text
+    /// outside the buffer.
     fn append_to_previous(&mut self, col: usize, y: u16, g: &str) {
+        if g.chars().any(is_bidi_control) {
+            return;
+        }
         let mut x = col;
         while x > self.area.x as usize {
             x -= 1;
@@ -226,7 +239,9 @@ impl Buffer {
                 continue;
             }
             let joined = format!("{}{}", cell.symbol(), g);
-            cell.set_symbol(&joined);
+            if grapheme_width(&joined) == grapheme_width(cell.symbol()) {
+                cell.set_symbol(&joined);
+            }
             return;
         }
     }
@@ -455,6 +470,42 @@ mod tests {
         let mut b = Buffer::new(Rect::new(0, 0, 4, 1));
         b.set_string(0, 0, "\u{301}a", Style::new());
         assert_eq!(row_text(&b, 0), "a   ");
+    }
+
+    #[test]
+    fn a_standalone_mark_after_a_control_char_attaches_when_width_is_unchanged() {
+        // The tab splits the cluster, so the mark arrives on its own.
+        let mut b = Buffer::new(Rect::new(0, 0, 5, 1));
+        let end = b.set_string(0, 0, "中\t\u{301}x", Style::new());
+        assert_eq!(end, 3);
+        assert_eq!(b.get(0, 0).unwrap().symbol(), "中\u{301}");
+        assert!(b.get(1, 0).unwrap().is_continuation());
+        assert_eq!(b.get(2, 0).unwrap().symbol(), "x");
+        assert_wide_invariant(&b);
+
+        let mut b = Buffer::new(Rect::new(0, 0, 3, 1));
+        b.set_string(0, 0, "a\t\u{301}", Style::new());
+        assert_eq!(b.get(0, 0).unwrap().symbol(), "a\u{301}");
+    }
+
+    #[test]
+    fn a_mark_that_would_widen_the_cell_is_dropped() {
+        // U+2764 alone is one column; with U+FE0F it becomes two.
+        let mut b = Buffer::new(Rect::new(0, 0, 5, 1));
+        let end = b.set_string(0, 0, "\u{2764}\t\u{fe0f}x", Style::new());
+        assert_eq!(end, 2);
+        assert_eq!(b.get(0, 0).unwrap().symbol(), "\u{2764}");
+        assert_eq!(b.get(1, 0).unwrap().symbol(), "x");
+        assert_wide_invariant(&b);
+    }
+
+    #[test]
+    fn bidi_controls_are_not_written() {
+        let mut b = Buffer::new(Rect::new(0, 0, 4, 1));
+        b.set_string(0, 0, "a\u{202e}b", Style::new());
+        assert_eq!(row_text(&b, 0), "ab  ");
+        b.set_string(0, 0, "a\t\u{202e}b", Style::new());
+        assert_eq!(row_text(&b, 0), "ab  ");
     }
 
     #[test]
