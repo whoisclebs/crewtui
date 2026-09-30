@@ -7,17 +7,8 @@
 //! glyph when one half is overwritten.
 #![allow(unsafe_code)]
 
-use std::ffi::CStr;
-use std::io;
-use std::os::fd::{FromRawFd, RawFd};
-use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant};
-
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::terminal::{get_termios, last_error};
 use crate::text::grapheme_width;
 use crate::{Buffer, Cell, Color, Modifier, Rect, Style};
 
@@ -364,251 +355,277 @@ fn ansi(n: usize) -> Color {
     ][n]
 }
 
-/// A pseudo-terminal pair: the app side is `slave`, the test reads what
-/// the app wrote from `master`.
-pub(crate) struct Pty {
-    pub(crate) master: RawFd,
-    pub(crate) slave: RawFd,
-}
+#[cfg(unix)]
+pub(crate) use pty::*;
 
-static OPEN: Mutex<()> = Mutex::new(());
+/// Pseudo-terminals and child processes, which only exist on Unix.
+#[cfg(unix)]
+mod pty {
+    use std::ffi::CStr;
+    use std::io;
+    use std::os::fd::{FromRawFd, RawFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::sync::{Mutex, PoisonError};
+    use std::time::{Duration, Instant};
 
-impl Pty {
-    pub(crate) fn open() -> Pty {
-        let _guard = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: plain libc calls; `ptsname` returns a pointer into a
-        // static buffer, which the lock above keeps other threads from
-        // overwriting until it is copied and used.
-        unsafe {
-            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            assert!(master >= 0, "posix_openpt: {}", last_error());
-            assert_eq!(libc::grantpt(master), 0);
-            assert_eq!(libc::unlockpt(master), 0);
-            let name = CStr::from_ptr(libc::ptsname(master)).to_owned();
-            let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
-            assert!(slave >= 0, "open slave: {}", last_error());
-            let flags = libc::fcntl(master, libc::F_GETFL);
-            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            // Children must not inherit these: a master kept open in the
-            // child would stop a hangup from ever happening.
-            libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
-            Pty { master, slave }
+    use crate::terminal::{get_termios, last_error};
+
+    /// A pseudo-terminal pair: the app side is `slave`, the test reads what
+    /// the app wrote from `master`.
+    pub(crate) struct Pty {
+        pub(crate) master: RawFd,
+        pub(crate) slave: RawFd,
+    }
+
+    static OPEN: Mutex<()> = Mutex::new(());
+
+    impl Pty {
+        pub(crate) fn open() -> Pty {
+            let _guard = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+            // SAFETY: plain libc calls; `ptsname` returns a pointer into a
+            // static buffer, which the lock above keeps other threads from
+            // overwriting until it is copied and used.
+            unsafe {
+                let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+                assert!(master >= 0, "posix_openpt: {}", last_error());
+                assert_eq!(libc::grantpt(master), 0);
+                assert_eq!(libc::unlockpt(master), 0);
+                let name = CStr::from_ptr(libc::ptsname(master)).to_owned();
+                let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+                assert!(slave >= 0, "open slave: {}", last_error());
+                let flags = libc::fcntl(master, libc::F_GETFL);
+                libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                // Children must not inherit these: a master kept open in the
+                // child would stop a hangup from ever happening.
+                libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
+                Pty { master, slave }
+            }
+        }
+
+        /// Everything the app has written so far.
+        pub(crate) fn output(&self) -> Vec<u8> {
+            drain_fd(self.master, 100)
+        }
+
+        /// What the app has written, but for at most `limit` even if it keeps
+        /// writing.
+        pub(crate) fn output_within(&self, limit: Duration) -> Vec<u8> {
+            drain_fd_until(self.master, 100, Some(Instant::now() + limit))
+        }
+
+        /// Reads output into `seen` until it contains `needle`. Returns false if
+        /// `limit` passes first.
+        pub(crate) fn read_until(
+            &self,
+            needle: &[u8],
+            limit: Duration,
+            seen: &mut Vec<u8>,
+        ) -> bool {
+            let deadline = Instant::now() + limit;
+            while !seen.windows(needle.len()).any(|w| w == needle) {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                seen.extend(drain_fd(self.master, 50));
+            }
+            true
+        }
+
+        /// Sets the size the terminal reports.
+        pub(crate) fn set_size(&self, columns: u16, rows: u16) {
+            let ws = libc::winsize {
+                ws_row: rows,
+                ws_col: columns,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            // SAFETY: `TIOCSWINSZ` reads one `winsize` through the pointer.
+            assert_eq!(
+                unsafe { libc::ioctl(self.master, libc::TIOCSWINSZ, &ws) },
+                0
+            );
+        }
+
+        pub(crate) fn termios(&self) -> libc::termios {
+            get_termios(self.slave).unwrap()
+        }
+
+        pub(crate) fn is_raw(&self) -> bool {
+            self.termios().c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG) == 0
         }
     }
 
-    /// Everything the app has written so far.
-    pub(crate) fn output(&self) -> Vec<u8> {
-        drain_fd(self.master, 100)
-    }
-
-    /// What the app has written, but for at most `limit` even if it keeps
-    /// writing.
-    pub(crate) fn output_within(&self, limit: Duration) -> Vec<u8> {
-        drain_fd_until(self.master, 100, Some(Instant::now() + limit))
-    }
-
-    /// Reads output into `seen` until it contains `needle`. Returns false if
-    /// `limit` passes first.
-    pub(crate) fn read_until(&self, needle: &[u8], limit: Duration, seen: &mut Vec<u8>) -> bool {
-        let deadline = Instant::now() + limit;
-        while !seen.windows(needle.len()).any(|w| w == needle) {
-            if Instant::now() >= deadline {
-                return false;
-            }
-            seen.extend(drain_fd(self.master, 50));
+    impl Pty {
+        /// Closes the master side, which hangs up the terminal: processes that
+        /// have it as their controlling terminal get SIGHUP.
+        pub(crate) fn close_master(&mut self) {
+            // SAFETY: closes the descriptor once; `Drop` skips it afterwards.
+            unsafe { libc::close(self.master) };
+            self.master = -1;
         }
-        true
-    }
 
-    /// Sets the size the terminal reports.
-    pub(crate) fn set_size(&self, columns: u16, rows: u16) {
-        let ws = libc::winsize {
-            ws_row: rows,
-            ws_col: columns,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: `TIOCSWINSZ` reads one `winsize` through the pointer.
-        assert_eq!(
-            unsafe { libc::ioctl(self.master, libc::TIOCSWINSZ, &ws) },
-            0
-        );
-    }
-
-    pub(crate) fn termios(&self) -> libc::termios {
-        get_termios(self.slave).unwrap()
-    }
-
-    pub(crate) fn is_raw(&self) -> bool {
-        self.termios().c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG) == 0
-    }
-}
-
-impl Pty {
-    /// Closes the master side, which hangs up the terminal: processes that
-    /// have it as their controlling terminal get SIGHUP.
-    pub(crate) fn close_master(&mut self) {
-        // SAFETY: closes the descriptor once; `Drop` skips it afterwards.
-        unsafe { libc::close(self.master) };
-        self.master = -1;
-    }
-
-    /// Starts `cmd` with this terminal as its stdin, stdout, stderr and
-    /// controlling terminal, in a session of its own. That last part is what
-    /// makes hangups and terminal-generated signals reach it.
-    pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
-        let dup = || -> io::Result<Stdio> {
-            // SAFETY: `dup` returns a new descriptor that `Stdio` then owns.
-            let fd = unsafe { libc::dup(self.slave) };
-            if fd < 0 {
-                return Err(last_error());
-            }
-            Ok(unsafe { Stdio::from_raw_fd(fd) })
-        };
-        cmd.stdin(dup()?).stdout(dup()?).stderr(dup()?);
-        // SAFETY: runs between fork and exec in the child and only calls
-        // async-signal-safe functions (`setsid`, `ioctl`).
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() < 0 {
+        /// Starts `cmd` with this terminal as its stdin, stdout, stderr and
+        /// controlling terminal, in a session of its own. That last part is what
+        /// makes hangups and terminal-generated signals reach it.
+        pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
+            let dup = || -> io::Result<Stdio> {
+                // SAFETY: `dup` returns a new descriptor that `Stdio` then owns.
+                let fd = unsafe { libc::dup(self.slave) };
+                if fd < 0 {
                     return Err(last_error());
                 }
-                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(last_error());
-                }
-                Ok(())
-            });
+                Ok(unsafe { Stdio::from_raw_fd(fd) })
+            };
+            cmd.stdin(dup()?).stdout(dup()?).stderr(dup()?);
+            // SAFETY: runs between fork and exec in the child and only calls
+            // async-signal-safe functions (`setsid`, `ioctl`).
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(last_error());
+                    }
+                    if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                        return Err(last_error());
+                    }
+                    Ok(())
+                });
+            }
+            cmd.spawn()
         }
-        cmd.spawn()
-    }
 
-    /// Reruns this test executable as a child on this terminal, running
-    /// only `test` (a full path such as `pty_children::child_entry`) with
-    /// `mode` in the environment. The test decides what to do from the
-    /// mode; see `crate::pty_children`.
-    pub(crate) fn spawn_self(&self, test: &str, mode: &str) -> io::Result<Child> {
-        let exe = std::env::current_exe()?;
-        self.spawn(
-            Command::new(exe)
-                .args(["--exact", test, "--nocapture", "--test-threads=1"])
-                .env(CHILD_MODE, mode),
-        )
-    }
-}
-
-/// Sends `sig` to `child`.
-pub(crate) fn kill(child: &Child, sig: libc::c_int) {
-    // SAFETY: `kill` takes a pid and a signal number.
-    assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, sig) }, 0);
-}
-
-/// Waits until `child` has been stopped by a signal, and returns which one,
-/// or `None` if that didn't happen within `limit`.
-pub(crate) fn wait_until_stopped(child: &Child, limit: Duration) -> Option<libc::c_int> {
-    let deadline = Instant::now() + limit;
-    while Instant::now() < deadline {
-        let mut status = 0;
-        // SAFETY: `status` is valid for a write, and WNOHANG returns at once.
-        let got = unsafe {
-            libc::waitpid(
-                child.id() as libc::pid_t,
-                &mut status,
-                libc::WUNTRACED | libc::WNOHANG,
+        /// Reruns this test executable as a child on this terminal, running
+        /// only `test` (a full path such as `pty_children::child_entry`) with
+        /// `mode` in the environment. The test decides what to do from the
+        /// mode; see `crate::pty_children`.
+        pub(crate) fn spawn_self(&self, test: &str, mode: &str) -> io::Result<Child> {
+            let exe = std::env::current_exe()?;
+            self.spawn(
+                Command::new(exe)
+                    .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                    .env(CHILD_MODE, mode),
             )
-        };
-        if got > 0 && libc::WIFSTOPPED(status) {
-            return Some(libc::WSTOPSIG(status));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    None
-}
-
-/// The environment variable that tells a re-run test executable which
-/// scenario to play out.
-pub(crate) const CHILD_MODE: &str = "CREWTUI_PTY_CHILD";
-
-/// Waits for `child` to exit, up to `limit`. `None` means it is still running.
-pub(crate) fn wait_timeout(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
-    let deadline = Instant::now() + limit;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            _ => return None,
         }
     }
-}
 
-impl Drop for Pty {
-    fn drop(&mut self) {
-        // SAFETY: both descriptors were opened by `open` and are closed once.
-        unsafe {
-            if self.master >= 0 {
-                libc::close(self.master);
+    /// Sends `sig` to `child`.
+    pub(crate) fn kill(child: &Child, sig: libc::c_int) {
+        // SAFETY: `kill` takes a pid and a signal number.
+        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, sig) }, 0);
+    }
+
+    /// Waits until `child` has been stopped by a signal, and returns which one,
+    /// or `None` if that didn't happen within `limit`.
+    pub(crate) fn wait_until_stopped(child: &Child, limit: Duration) -> Option<libc::c_int> {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            let mut status = 0;
+            // SAFETY: `status` is valid for a write, and WNOHANG returns at once.
+            let got = unsafe {
+                libc::waitpid(
+                    child.id() as libc::pid_t,
+                    &mut status,
+                    libc::WUNTRACED | libc::WNOHANG,
+                )
+            };
+            if got > 0 && libc::WIFSTOPPED(status) {
+                return Some(libc::WSTOPSIG(status));
             }
-            libc::close(self.slave);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    /// The environment variable that tells a re-run test executable which
+    /// scenario to play out.
+    pub(crate) const CHILD_MODE: &str = "CREWTUI_PTY_CHILD";
+
+    /// Waits for `child` to exit, up to `limit`. `None` means it is still running.
+    pub(crate) fn wait_timeout(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + limit;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                _ => return None,
+            }
         }
     }
-}
 
-pub(crate) fn same(a: &libc::termios, b: &libc::termios) -> bool {
-    a.c_iflag == b.c_iflag
-        && a.c_oflag == b.c_oflag
-        && a.c_cflag == b.c_cflag
-        && a.c_lflag == b.c_lflag
-        && a.c_cc == b.c_cc
-}
-
-/// Reads what is available on `fd`, waiting up to `idle_ms` for more.
-pub(crate) fn drain_fd(fd: RawFd, idle_ms: libc::c_int) -> Vec<u8> {
-    drain_fd_until(fd, idle_ms, None)
-}
-
-/// Like `drain_fd`, but also returns once `deadline` has passed, so a child
-/// that never stops writing can't keep the caller here forever.
-pub(crate) fn drain_fd_until(
-    fd: RawFd,
-    idle_ms: libc::c_int,
-    deadline: Option<Instant>,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            return out;
+    impl Drop for Pty {
+        fn drop(&mut self) {
+            // SAFETY: both descriptors were opened by `open` and are closed once.
+            unsafe {
+                if self.master >= 0 {
+                    libc::close(self.master);
+                }
+                libc::close(self.slave);
+            }
         }
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `pfd` is valid for one entry; `buf` for its length.
-        unsafe {
-            if libc::poll(&mut pfd, 1, idle_ms) <= 0 {
+    }
+
+    pub(crate) fn same(a: &libc::termios, b: &libc::termios) -> bool {
+        a.c_iflag == b.c_iflag
+            && a.c_oflag == b.c_oflag
+            && a.c_cflag == b.c_cflag
+            && a.c_lflag == b.c_lflag
+            && a.c_cc == b.c_cc
+    }
+
+    /// Reads what is available on `fd`, waiting up to `idle_ms` for more.
+    pub(crate) fn drain_fd(fd: RawFd, idle_ms: libc::c_int) -> Vec<u8> {
+        drain_fd_until(fd, idle_ms, None)
+    }
+
+    /// Like `drain_fd`, but also returns once `deadline` has passed, so a child
+    /// that never stops writing can't keep the caller here forever.
+    pub(crate) fn drain_fd_until(
+        fd: RawFd,
+        idle_ms: libc::c_int,
+        deadline: Option<Instant>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
                 return out;
             }
-            let mut buf = [0u8; 512];
-            let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
-            if n <= 0 {
-                return out;
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `pfd` is valid for one entry; `buf` for its length.
+            unsafe {
+                if libc::poll(&mut pfd, 1, idle_ms) <= 0 {
+                    return out;
+                }
+                let mut buf = [0u8; 512];
+                let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+                if n <= 0 {
+                    return out;
+                }
+                out.extend_from_slice(&buf[..n as usize]);
             }
-            out.extend_from_slice(&buf[..n as usize]);
         }
+    }
+
+    /// Writes all of `bytes` to `fd`, which must be a pty master.
+    pub(crate) fn write_fd(fd: RawFd, bytes: &[u8]) {
+        // SAFETY: the pointer and length come from a live slice.
+        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        assert_eq!(n, bytes.len() as isize, "short write to the pty");
     }
 }
 
-/// Writes all of `bytes` to `fd`, which must be a pty master.
-pub(crate) fn write_fd(fd: RawFd, bytes: &[u8]) {
-    // SAFETY: the pointer and length come from a live slice.
-    let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-    assert_eq!(n, bytes.len() as isize, "short write to the pty");
-}
-
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
+    use std::time::Duration;
 
     fn sh(script: &str) -> Command {
         let mut cmd = Command::new("sh");

@@ -6,63 +6,27 @@
 //! next to its other inputs and turns the bytes back into [`Signal`]s.
 #![allow(unsafe_code)]
 
-use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
-/// A signal the framework cares about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Signal {
-    /// SIGINT, sent from outside. Typing Ctrl+C in raw mode doesn't produce
-    /// it; that arrives as a key event.
-    Interrupt,
-    /// SIGTERM.
-    Terminate,
-    /// SIGHUP, for example when the terminal window closes.
-    Hangup,
-    /// SIGWINCH: the terminal was resized.
-    Resize,
-    /// SIGCONT: the process resumed after being stopped.
-    Continue,
-    /// SIGTSTP, sent from outside, for example by a job-control shell. Typing
-    /// Ctrl+Z in raw mode doesn't produce it; that arrives as a key event.
-    /// The loop restores the terminal, stops the process, and takes the
-    /// terminal again when it is continued.
-    Suspend,
+use crate::signal::Signal;
+
+/// The signals this module installs handlers for, in the order of the byte
+/// the handler writes for each.
+const ALL: [(Signal, libc::c_int); 6] = [
+    (Signal::Interrupt, libc::SIGINT),
+    (Signal::Terminate, libc::SIGTERM),
+    (Signal::Hangup, libc::SIGHUP),
+    (Signal::Resize, libc::SIGWINCH),
+    (Signal::Continue, libc::SIGCONT),
+    (Signal::Suspend, libc::SIGTSTP),
+];
+
+fn from_byte(b: u8) -> Option<Signal> {
+    ALL.get(b as usize).map(|(s, _)| *s)
 }
-
-impl Signal {
-    const ALL: [(Signal, libc::c_int); 6] = [
-        (Signal::Interrupt, libc::SIGINT),
-        (Signal::Terminate, libc::SIGTERM),
-        (Signal::Hangup, libc::SIGHUP),
-        (Signal::Resize, libc::SIGWINCH),
-        (Signal::Continue, libc::SIGCONT),
-        (Signal::Suspend, libc::SIGTSTP),
-    ];
-
-    fn from_byte(b: u8) -> Option<Signal> {
-        Signal::ALL.get(b as usize).map(|(s, _)| *s)
-    }
-}
-
-impl fmt::Display for Signal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Signal::Interrupt => "interrupted (SIGINT)",
-            Signal::Terminate => "terminated (SIGTERM)",
-            Signal::Hangup => "hung up (SIGHUP)",
-            Signal::Resize => "terminal resized (SIGWINCH)",
-            Signal::Continue => "continued (SIGCONT)",
-            Signal::Suspend => "stopped (SIGTSTP)",
-        })
-    }
-}
-
-impl std::error::Error for Signal {}
 
 /// The signal that stops the process. It is SIGTSTP, so a job-control shell
 /// sees an ordinary stop. The default action of SIGTSTP is discarded in an
@@ -121,7 +85,7 @@ fn errno_location() -> *mut libc::c_int {
 /// Only async-signal-safe calls: an atomic load, `write`, and errno
 /// save and restore.
 extern "C" fn handler(sig: libc::c_int) {
-    let Some(code) = Signal::ALL.iter().position(|&(_, s)| s == sig) else {
+    let Some(code) = ALL.iter().position(|&(_, s)| s == sig) else {
         return;
     };
     if sig == libc::SIGCONT {
@@ -256,7 +220,7 @@ impl Signals {
         signals.pending()?;
         WRITE_FD.store(write_fd, Ordering::SeqCst);
 
-        for (_, sig) in Signal::ALL {
+        for (_, sig) in ALL {
             // SAFETY: `action` is fully initialized before use, `old` is
             // valid for a write, and `handler` has the signature `sigaction`
             // expects for a handler without `SA_SIGINFO`.
@@ -329,11 +293,7 @@ impl Signals {
             // SAFETY: the pointer and length come from a live buffer.
             let n = unsafe { libc::read(self.read_fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
-                out.extend(
-                    buf[..n as usize]
-                        .iter()
-                        .filter_map(|&b| Signal::from_byte(b)),
-                );
+                out.extend(buf[..n as usize].iter().filter_map(|&b| from_byte(b)));
                 continue;
             }
             if n == 0 {
@@ -399,7 +359,7 @@ mod tests {
     fn each_signal_arrives_as_its_own_value() {
         let _s = serial();
         let mut signals = Signals::install().unwrap();
-        for (expected, sig) in Signal::ALL {
+        for (expected, sig) in ALL {
             raise(sig);
             assert_eq!(signals.pending().unwrap(), vec![expected], "{expected:?}");
         }
@@ -476,13 +436,13 @@ mod tests {
     #[test]
     fn a_second_install_fails_until_the_first_is_dropped_and_handlers_come_back() {
         let _s = serial();
-        let before: Vec<_> = Signal::ALL.iter().map(|&(_, s)| disposition(s)).collect();
+        let before: Vec<_> = ALL.iter().map(|&(_, s)| disposition(s)).collect();
         let first = Signals::install().unwrap();
         let err = Signals::install().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_ne!(disposition(libc::SIGTERM), before[1]);
         drop(first);
-        let after: Vec<_> = Signal::ALL.iter().map(|&(_, s)| disposition(s)).collect();
+        let after: Vec<_> = ALL.iter().map(|&(_, s)| disposition(s)).collect();
         assert_eq!(before, after);
         drop(Signals::install().unwrap());
     }

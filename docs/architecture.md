@@ -47,7 +47,7 @@ The main thread blocks in one place, a channel receiver. The reader thread waits
 
 When something changes, the loop draws, but no more than `max_fps` times a second. It applies everything that is already waiting before it draws, so a burst of messages costs one frame. Quitting doesn't draw a last frame.
 
-Signals are turned into loop behavior in one place. SIGWINCH resizes the renderer, which repaints, and gives the app an `Event::Resize`. SIGTSTP, sent from outside, restores the terminal and stops the process, so the shell that gets control back is usable; the loop takes the terminal again and repaints once it is continued. SIGCONT re-enters raw mode and invalidates the renderer. SIGINT, SIGTERM and SIGHUP end the run with an `Interrupted` error that wraps the signal, and the terminal is restored on the way out like on any other exit. Ctrl+C typed in raw mode is not a signal: it reaches the app as a key event, and the app decides whether it quits.
+Signals are turned into loop behavior in one place. This is the Unix description; the Windows console is below. SIGWINCH resizes the renderer, which repaints, and gives the app an `Event::Resize`. SIGTSTP, sent from outside, restores the terminal and stops the process, so the shell that gets control back is usable; the loop takes the terminal again and repaints once it is continued. SIGCONT re-enters raw mode and invalidates the renderer. SIGINT, SIGTERM and SIGHUP end the run with an `Interrupted` error that wraps the signal, and the terminal is restored on the way out like on any other exit. Ctrl+C typed in raw mode is not a signal: it reaches the app as a key event, and the app decides whether it quits.
 
 The loop itself is a function over a small `Host` trait (write bytes, report the size, resume raw mode). That is what lets the tests drive it without a terminal, with one test that runs a real `Program` on a pty.
 
@@ -74,3 +74,13 @@ The unit of the buffer is a grapheme cluster, not a `char` or a byte, and its wi
 `Terminal` enters raw mode and the modes selected in `TerminalOptions` (alternate screen, hidden cursor, mouse, focus reports, bracketed paste) and undoes them when it is dropped, so early returns and `?` restore the terminal too. Restoring is idempotent and reports the first error it hits without skipping the rest of the steps. A panic hook restores the terminal of the panicking thread before the message is printed, so the message lands on the normal screen and not the alternate one. SIGINT, SIGTERM and SIGHUP end the run with an error and the same restore (see the loop above).
 
 The tests for all of this run a real child process on a pty and check the terminal modes and the termios settings afterwards; see [testing](testing.md).
+
+## Windows
+
+The Windows backend puts the console in virtual terminal mode: escape sequences on output, and escape sequences on input, both in UTF-8. Everything above the terminal, the renderer, the parser and the loop, is the same code as on Unix. Only three files differ: `terminal_windows.rs` (console modes and their restore), `reader_windows.rs` and `signals_windows.rs`.
+
+The reader waits on the console input, a wake-up event and the signal event with `WaitForMultipleObjects`. The console reports each character of an escape sequence as its own key record; the reader turns them back into UTF-8 bytes (`utf16.rs` joins surrogate pairs that arrive split) and feeds the same `Parser`. A resize is its own record and becomes `Signal::Resize`.
+
+Console control events are the signals. Ctrl+Break, closing the window, logging off and shutting down end the run with the same `Interrupted` error as on Unix. Windows ends the process when the handler for a close, logoff or shutdown returns, so that handler waits up to four seconds for the loop to restore the console. Ctrl+C typed in raw mode is a key, as on Unix. There is no job control, so `Ctrl+Z` is just a key and nothing suspends the process.
+
+It needs Windows 10 version 1809 or later, the first with virtual terminal input. The pty tests only run on Unix; the Windows job in CI runs the tests that don't need a terminal.
