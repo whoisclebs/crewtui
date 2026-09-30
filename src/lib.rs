@@ -3,6 +3,7 @@
 
 mod buffer;
 mod geometry;
+mod input;
 mod render;
 #[cfg(unix)]
 mod signals;
@@ -15,6 +16,7 @@ pub mod text;
 
 pub use buffer::{Buffer, Cell};
 pub use geometry::Rect;
+pub use input::{Event, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind, Parser};
 pub use render::Renderer;
 #[cfg(unix)]
 pub use signals::{Signal, Signals};
