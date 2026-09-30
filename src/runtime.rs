@@ -437,7 +437,7 @@ pub(crate) fn event_loop<A: App, H: Host>(
         let input = if dirty {
             let wait = last_draw.map_or(Duration::ZERO, |t| interval.saturating_sub(t.elapsed()));
             if wait.is_zero() {
-                renderer.present_frame(&mut *host, |frame| app.view(frame))?;
+                renderer.present(&mut *host, |frame| app.view(frame))?;
                 last_draw = Some(Instant::now());
                 dirty = false;
                 continue;

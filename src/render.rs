@@ -53,22 +53,18 @@ impl Renderer {
         self.known = false;
     }
 
-    /// Draws one frame. `f` receives a blank buffer covering the whole
-    /// screen and must not resize it. The returned bytes are what to write
-    /// to the terminal.
+    /// Draws one frame. `f` receives a [`Frame`] whose buffer is blank and
+    /// covers the whole screen, and must not resize it. The returned bytes
+    /// are what to write to the terminal.
     ///
     /// If the caller can't write them, or only some of them get through, it
     /// must call [`Renderer::invalidate`]. [`Renderer::present`] does this.
-    pub fn draw(&mut self, f: impl FnOnce(&mut Buffer)) -> &[u8] {
-        self.draw_frame(|frame| f(frame.buffer_mut()))
-    }
-
-    /// Like [`Renderer::draw`], but `f` gets a [`Frame`], so it can also ask
-    /// for the terminal cursor with [`Frame::set_cursor`]. The cursor is
-    /// shown at that cell after the frame is drawn, and hidden when nothing
-    /// asks for it. A frame that changes nothing and leaves the cursor where
-    /// it was writes no bytes.
-    pub fn draw_frame(&mut self, f: impl FnOnce(&mut Frame<'_>)) -> &[u8] {
+    ///
+    /// `f` can ask for the terminal cursor with [`Frame::set_cursor`]. The
+    /// cursor is shown at that cell after the frame is drawn, and hidden when
+    /// nothing asks for it. A frame that changes nothing and leaves the
+    /// cursor where it was writes no bytes.
+    pub fn draw(&mut self, f: impl FnOnce(&mut Frame<'_>)) -> &[u8] {
         let area = self.current.area();
         self.current.reset();
         let mut frame = Frame::new(&mut self.current);
@@ -132,18 +128,9 @@ impl Renderer {
     pub fn present<W: Write>(
         &mut self,
         out: &mut W,
-        f: impl FnOnce(&mut Buffer),
-    ) -> io::Result<()> {
-        self.present_frame(out, |frame| f(frame.buffer_mut()))
-    }
-
-    /// Like [`Renderer::present`], for a view that gets a [`Frame`].
-    pub fn present_frame<W: Write>(
-        &mut self,
-        out: &mut W,
         f: impl FnOnce(&mut Frame<'_>),
     ) -> io::Result<()> {
-        if self.draw_frame(f).is_empty() {
+        if self.draw(f).is_empty() {
             return Ok(());
         }
         let result = out.write_all(&self.out).and_then(|()| out.flush());
@@ -281,11 +268,35 @@ fn write_color(out: &mut Vec<u8>, color: Color, base: u8) {
 
 #[cfg(test)]
 mod tests {
+    /// The tests mostly draw straight into the buffer.
+    trait BufferRenderer {
+        fn draw_buf(&mut self, f: impl FnOnce(&mut Buffer)) -> &[u8];
+        fn present_buf<W: Write>(
+            &mut self,
+            out: &mut W,
+            f: impl FnOnce(&mut Buffer),
+        ) -> io::Result<()>;
+    }
+
+    impl BufferRenderer for Renderer {
+        fn draw_buf(&mut self, f: impl FnOnce(&mut Buffer)) -> &[u8] {
+            self.draw(|frame| f(frame.buffer_mut()))
+        }
+
+        fn present_buf<W: Write>(
+            &mut self,
+            out: &mut W,
+            f: impl FnOnce(&mut Buffer),
+        ) -> io::Result<()> {
+            self.present(out, |frame| f(frame.buffer_mut()))
+        }
+    }
+
     use super::*;
     use crate::testing::Screen;
 
     fn text(r: &mut Renderer, rows: &[&str]) -> Vec<u8> {
-        r.draw(|b| {
+        r.draw_buf(|b| {
             for (y, row) in rows.iter().enumerate() {
                 b.set_string(0, y as u16, row, Style::new());
             }
@@ -341,7 +352,7 @@ mod tests {
         let mut r = Renderer::new(8, 1);
         text(&mut r, &["abc"]);
         let out = r
-            .draw(|b| {
+            .draw_buf(|b| {
                 b.set_string(0, 0, "abc", Style::new().fg(Color::Red).bold());
             })
             .to_vec();
@@ -352,7 +363,7 @@ mod tests {
     fn style_only_change_rewrites_the_symbol() {
         let mut r = Renderer::new(8, 1);
         text(&mut r, &["a"]);
-        let out = r.draw(|b| {
+        let out = r.draw_buf(|b| {
             b.set_string(0, 0, "a", Style::new().bg(Color::Rgb(1, 2, 3)));
         });
         assert_eq!(out, b"\x1b[1;1H\x1b[0;48;2;1;2;3ma\x1b[0m");
@@ -371,10 +382,10 @@ mod tests {
     #[test]
     fn a_style_change_on_the_right_half_of_a_wide_glyph_redraws_it() {
         let mut r = Renderer::new(8, 1);
-        r.draw(|b| {
+        r.draw_buf(|b| {
             b.set_string(0, 0, "中", Style::new());
         });
-        let out = r.draw(|b| {
+        let out = r.draw_buf(|b| {
             b.set_string(0, 0, "中", Style::new());
             b.set_style(Rect::new(1, 0, 1, 1), Style::new().bg(Color::Red));
         });
@@ -385,10 +396,10 @@ mod tests {
     fn a_closure_that_resizes_the_buffer_gets_a_blank_frame_not_a_panic() {
         let mut r = Renderer::new(4, 2);
         text(&mut r, &["ab"]);
-        let out = r.draw(|b| b.resize(Rect::new(0, 0, 8, 3))).to_vec();
+        let out = r.draw_buf(|b| b.resize(Rect::new(0, 0, 8, 3))).to_vec();
         assert_eq!(out, b"\x1b[1;1H  ");
         assert_eq!(r.area(), Rect::new(0, 0, 4, 2));
-        assert!(r.draw(|_| {}).is_empty());
+        assert!(r.draw_buf(|_| {}).is_empty());
     }
 
     #[test]
@@ -426,7 +437,7 @@ mod tests {
     fn every_color_form_produces_valid_sgr() {
         let mut r = Renderer::new(4, 1);
         let out = r
-            .draw(|b| {
+            .draw_buf(|b| {
                 let s = Style::new()
                     .fg(Color::Indexed(200))
                     .bg(Color::BrightBlue)
@@ -458,12 +469,12 @@ mod tests {
     fn present_skips_the_write_for_an_unchanged_frame() {
         let mut r = Renderer::new(4, 1);
         let mut sink = Vec::new();
-        r.present(&mut sink, |b| {
+        r.present_buf(&mut sink, |b| {
             b.set_string(0, 0, "hi", Style::new());
         })
         .unwrap();
         let len = sink.len();
-        r.present(&mut sink, |b| {
+        r.present_buf(&mut sink, |b| {
             b.set_string(0, 0, "hi", Style::new());
         })
         .unwrap();
@@ -509,26 +520,26 @@ mod tests {
             b.set_string(2, 0, "final 中", s1);
         };
         let mut probe = Renderer::new(12, 2);
-        probe.draw(draw1);
-        let frame2_len = probe.draw(draw2).len();
+        probe.draw_buf(draw1);
+        let frame2_len = probe.draw_buf(draw2).len();
         assert!(frame2_len > 20);
 
         for limit in 0..frame2_len {
             let mut r = Renderer::new(12, 2);
             let mut screen = Screen::new(12, 2);
             let mut first = Vec::new();
-            r.present(&mut first, draw1).unwrap();
+            r.present_buf(&mut first, draw1).unwrap();
             screen.feed(&first);
 
             let mut cut = Cut {
                 sent: Vec::new(),
                 limit,
             };
-            assert!(r.present(&mut cut, draw2).is_err(), "limit {limit}");
+            assert!(r.present_buf(&mut cut, draw2).is_err(), "limit {limit}");
             screen.feed(&cut.sent);
 
             let mut rest = Vec::new();
-            r.present(&mut rest, draw3).unwrap();
+            r.present_buf(&mut rest, draw3).unwrap();
             screen.feed(&rest);
 
             let mut want = Buffer::new(r.area());
@@ -601,13 +612,13 @@ mod tests {
             for (x, y, st) in scene_styles {
                 scene.set_style(Rect::new(x, y, 1, 1), st);
             }
-            let bytes = r.draw(|b| *b = scene.clone()).to_vec();
+            let bytes = r.draw_buf(|b| *b = scene.clone()).to_vec();
             screen.feed(&bytes);
             assert_eq!(screen.to_buffer(), scene, "frame {frame}: screen diverged");
         }
     }
     fn with_cursor(r: &mut Renderer, rows: &[&str], at: Option<(u16, u16)>) -> Vec<u8> {
-        r.draw_frame(|f| {
+        r.draw(|f| {
             for (y, row) in rows.iter().enumerate() {
                 f.buffer_mut().set_string(0, y as u16, row, Style::new());
             }
@@ -767,7 +778,7 @@ mod tests {
                         sent: Vec::new(),
                         limit,
                     };
-                    let _ = r.present_frame(&mut cut, |f| {
+                    let _ = r.present(&mut cut, |f| {
                         f.buffer_mut().set_string(0, 0, "cd", Style::new());
                         if let Some((x, y)) = want {
                             f.set_cursor(x, y);
