@@ -132,8 +132,8 @@ impl InputState {
 
     /// Inserts text at the cursor, which is how a paste goes in. Control
     /// characters, newlines included, are dropped.
-    pub fn insert_str(&mut self, text: &str) {
-        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    pub fn insert_str(&mut self, text: impl AsRef<str>) {
+        let clean: String = text.as_ref().chars().filter(|c| !c.is_control()).collect();
         if clean.is_empty() {
             return;
         }
