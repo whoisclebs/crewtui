@@ -215,6 +215,11 @@ pub(crate) trait Host: Write {
     fn size(&self) -> io::Result<(u16, u16)>;
     /// Goes back to raw mode after the process was stopped and continued.
     fn resume(&mut self) -> io::Result<()>;
+    /// Whether the terminal was left with the cursor hidden. A fake host
+    /// says yes, like a terminal entered with the default options.
+    fn cursor_hidden(&self) -> bool {
+        true
+    }
 }
 
 impl Host for Terminal {
@@ -224,6 +229,10 @@ impl Host for Terminal {
 
     fn resume(&mut self) -> io::Result<()> {
         Terminal::resume(self)
+    }
+
+    fn cursor_hidden(&self) -> bool {
+        Terminal::cursor_hidden(self)
     }
 }
 
@@ -360,6 +369,8 @@ fn handle<A: App, H: Host>(
         Input::Signal(Signal::Continue) => {
             host.resume()?;
             renderer.invalidate();
+            // The cursor may be back to whatever the terminal defaults to.
+            renderer.cursor_was_reset();
             *dirty = true;
             Ok(false)
         }
@@ -381,6 +392,10 @@ pub(crate) fn event_loop<A: App, H: Host>(
 ) -> io::Result<A> {
     let (width, height) = host.size()?;
     let mut renderer = Renderer::new(width, height);
+    if !host.cursor_hidden() {
+        // The renderer assumes a hidden cursor until told otherwise.
+        renderer.cursor_was_reset();
+    }
     let interval = if max_fps == 0 {
         Duration::ZERO
     } else {
@@ -394,7 +409,7 @@ pub(crate) fn event_loop<A: App, H: Host>(
         let input = if dirty {
             let wait = last_draw.map_or(Duration::ZERO, |t| interval.saturating_sub(t.elapsed()));
             if wait.is_zero() {
-                renderer.present(&mut *host, |buffer| app.view(&mut Frame::new(buffer)))?;
+                renderer.present_frame(&mut *host, |frame| app.view(frame))?;
                 last_draw = Some(Instant::now());
                 dirty = false;
                 continue;
@@ -438,6 +453,7 @@ mod tests {
         last: (u16, u16),
         resumed: u32,
         fail_writes: bool,
+        cursor_left_visible: bool,
     }
 
     impl FakeHost {
@@ -448,6 +464,7 @@ mod tests {
                 last: (width, height),
                 resumed: 0,
                 fail_writes: false,
+                cursor_left_visible: false,
             }
         }
     }
@@ -481,6 +498,10 @@ mod tests {
         fn resume(&mut self) -> io::Result<()> {
             self.resumed += 1;
             Ok(())
+        }
+
+        fn cursor_hidden(&self) -> bool {
+            !self.cursor_left_visible
         }
     }
 
@@ -774,6 +795,19 @@ mod tests {
         assert_eq!(host.resumed, 1);
         let clears = host.out.windows(4).filter(|w| *w == b"\x1b[2J").count();
         assert_eq!(clears, 2, "{:?}", String::from_utf8_lossy(&host.out));
+    }
+
+    #[test]
+    fn a_terminal_entered_with_a_visible_cursor_gets_it_hidden_by_the_first_frame() {
+        let mut host = FakeHost::new(20, 3);
+        host.cursor_left_visible = true;
+        run(&mut host, vec![key('q')], 0).unwrap();
+        let hides = host.out.windows(6).filter(|w| *w == b"\x1b[?25l").count();
+        assert_eq!(hides, 1, "{:?}", String::from_utf8_lossy(&host.out));
+
+        let mut host = FakeHost::new(20, 3);
+        run(&mut host, vec![key('q')], 0).unwrap();
+        assert!(!host.out.windows(6).any(|w| w == b"\x1b[?25l"));
     }
 
     #[test]

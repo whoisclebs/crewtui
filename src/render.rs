@@ -2,7 +2,7 @@
 
 use std::io::{self, Write};
 
-use crate::{Buffer, Color, Modifier, Rect, Style};
+use crate::{Buffer, Color, Frame, Modifier, Rect, Style};
 
 /// Keeps the previous frame and produces the bytes that move the terminal
 /// from it to the next one.
@@ -20,6 +20,10 @@ pub struct Renderer {
     current: Buffer,
     known: bool,
     out: Vec<u8>,
+    /// Where the cursor was last placed, and whether it is showing.
+    cursor: Option<(u16, u16)>,
+    /// `None` when a cut write or a reset terminal left it unknown.
+    cursor_shown: Option<bool>,
 }
 
 impl Renderer {
@@ -31,6 +35,8 @@ impl Renderer {
             current: Buffer::new(area),
             known: false,
             out: Vec::new(),
+            cursor: None,
+            cursor_shown: Some(false),
         }
     }
 
@@ -54,9 +60,20 @@ impl Renderer {
     /// If the caller can't write them, or only some of them get through, it
     /// must call [`Renderer::invalidate`]. [`Renderer::present`] does this.
     pub fn draw(&mut self, f: impl FnOnce(&mut Buffer)) -> &[u8] {
+        self.draw_frame(|frame| f(frame.buffer_mut()))
+    }
+
+    /// Like [`Renderer::draw`], but `f` gets a [`Frame`], so it can also ask
+    /// for the terminal cursor with [`Frame::set_cursor`]. The cursor is
+    /// shown at that cell after the frame is drawn, and hidden when nothing
+    /// asks for it. A frame that changes nothing and leaves the cursor where
+    /// it was writes no bytes.
+    pub fn draw_frame(&mut self, f: impl FnOnce(&mut Frame<'_>)) -> &[u8] {
         let area = self.current.area();
         self.current.reset();
-        f(&mut self.current);
+        let mut frame = Frame::new(&mut self.current);
+        f(&mut frame);
+        let cursor = frame.cursor();
         if self.current.area() != area {
             // The frame was drawn on a buffer of another size; there is no
             // meaningful way to diff it, so show a blank one.
@@ -70,7 +87,40 @@ impl Renderer {
         }
         diff(&self.previous, &self.current, &mut self.out);
         std::mem::swap(&mut self.previous, &mut self.current);
+        self.place_cursor(cursor.filter(|&(x, y)| area.contains(x, y)));
         &self.out
+    }
+
+    /// Emits what it takes to put the cursor where the frame wants it. Cells
+    /// written this frame moved the terminal's cursor, so it is placed again
+    /// whenever anything was written.
+    fn place_cursor(&mut self, want: Option<(u16, u16)>) {
+        let wrote = !self.out.is_empty();
+        match want {
+            Some((x, y)) => {
+                if wrote || self.cursor != want || self.cursor_shown != Some(true) {
+                    let _ = write!(self.out, "\x1b[{};{}H", y + 1, x + 1);
+                }
+                if self.cursor_shown != Some(true) {
+                    self.out.extend_from_slice(b"\x1b[?25h");
+                    self.cursor_shown = Some(true);
+                }
+            }
+            None => {
+                if self.cursor_shown != Some(false) {
+                    self.out.extend_from_slice(b"\x1b[?25l");
+                    self.cursor_shown = Some(false);
+                }
+            }
+        }
+        self.cursor = want;
+    }
+
+    /// Forgets whether the terminal's cursor is showing, after something
+    /// reset the terminal modes behind the renderer's back.
+    pub(crate) fn cursor_was_reset(&mut self) {
+        self.cursor_shown = None;
+        self.cursor = None;
     }
 
     /// Draws one frame and writes it to `out` in a single `write_all`,
@@ -84,7 +134,16 @@ impl Renderer {
         out: &mut W,
         f: impl FnOnce(&mut Buffer),
     ) -> io::Result<()> {
-        if self.draw(f).is_empty() {
+        self.present_frame(out, |frame| f(frame.buffer_mut()))
+    }
+
+    /// Like [`Renderer::present`], for a view that gets a [`Frame`].
+    pub fn present_frame<W: Write>(
+        &mut self,
+        out: &mut W,
+        f: impl FnOnce(&mut Frame<'_>),
+    ) -> io::Result<()> {
+        if self.draw_frame(f).is_empty() {
             return Ok(());
         }
         let result = out.write_all(&self.out).and_then(|()| out.flush());
@@ -103,6 +162,10 @@ impl Renderer {
     /// process that took over the terminal. Resizing does it implicitly.
     pub fn invalidate(&mut self) {
         self.known = false;
+        // A frame that was cut may or may not have got its cursor commands
+        // through, so the next one says explicitly what it wants.
+        self.cursor_shown = None;
+        self.cursor = None;
     }
 }
 
@@ -381,7 +444,10 @@ mod tests {
         let first = text(&mut r, &["ab中", "c"]);
         assert!(text(&mut r, &["ab中", "c"]).is_empty());
         r.invalidate();
-        assert_eq!(text(&mut r, &["ab中", "c"]), first);
+        // The one difference: it can't assume the cursor is hidden.
+        let mut again = first.clone();
+        again.extend_from_slice(b"\x1b[?25l");
+        assert_eq!(text(&mut r, &["ab中", "c"]), again);
         assert!(text(&mut r, &["ab中", "c"]).is_empty());
     }
 
@@ -535,6 +601,188 @@ mod tests {
             let bytes = r.draw(|b| *b = scene.clone()).to_vec();
             screen.feed(&bytes);
             assert_eq!(screen.to_buffer(), scene, "frame {frame}: screen diverged");
+        }
+    }
+    fn with_cursor(r: &mut Renderer, rows: &[&str], at: Option<(u16, u16)>) -> Vec<u8> {
+        r.draw_frame(|f| {
+            for (y, row) in rows.iter().enumerate() {
+                f.buffer_mut().set_string(0, y as u16, row, Style::new());
+            }
+            if let Some((x, y)) = at {
+                f.set_cursor(x, y);
+            }
+        })
+        .to_vec()
+    }
+
+    #[test]
+    fn a_frame_without_a_cursor_leaves_it_hidden_and_writes_nothing_extra() {
+        let mut r = Renderer::new(6, 2);
+        let mut screen = Screen::new(6, 2);
+        let out = with_cursor(&mut r, &["ab"], None);
+        assert!(!out.windows(6).any(|w| w == b"\x1b[?25h"));
+        screen.feed(&out);
+        assert!(with_cursor(&mut r, &["ab"], None).is_empty());
+    }
+
+    #[test]
+    fn the_cursor_is_shown_where_the_frame_asks_for_it() {
+        let mut r = Renderer::new(6, 3);
+        let mut screen = Screen::new(6, 3);
+        screen.feed(&with_cursor(&mut r, &["ab"], Some((4, 2))));
+        assert_eq!(screen.cursor(), ((4, 2), true));
+        assert_eq!(screen.row(0), "ab    ");
+    }
+
+    #[test]
+    fn a_cursor_that_stays_put_on_an_unchanged_frame_costs_no_bytes() {
+        let mut r = Renderer::new(6, 3);
+        with_cursor(&mut r, &["ab"], Some((4, 2)));
+        assert!(with_cursor(&mut r, &["ab"], Some((4, 2))).is_empty());
+    }
+
+    #[test]
+    fn moving_only_the_cursor_writes_just_the_move() {
+        let mut r = Renderer::new(6, 3);
+        let mut screen = Screen::new(6, 3);
+        screen.feed(&with_cursor(&mut r, &["ab"], Some((4, 2))));
+        let out = with_cursor(&mut r, &["ab"], Some((1, 0)));
+        assert_eq!(out, b"\x1b[1;2H");
+        screen.feed(&out);
+        assert_eq!(screen.cursor(), ((1, 0), true));
+    }
+
+    #[test]
+    fn writing_cells_puts_the_cursor_back_where_the_frame_wants_it() {
+        let mut r = Renderer::new(6, 3);
+        let mut screen = Screen::new(6, 3);
+        screen.feed(&with_cursor(&mut r, &["ab"], Some((2, 0))));
+        // The cell writes move the terminal's cursor; the frame's cursor
+        // must be placed again afterwards even though it did not change.
+        screen.feed(&with_cursor(&mut r, &["ab", "cd"], Some((2, 0))));
+        assert_eq!(screen.cursor(), ((2, 0), true));
+        assert_eq!(screen.row(1), "cd    ");
+    }
+
+    #[test]
+    fn dropping_the_cursor_hides_it_once() {
+        let mut r = Renderer::new(6, 3);
+        let mut screen = Screen::new(6, 3);
+        screen.feed(&with_cursor(&mut r, &["ab"], Some((2, 0))));
+        let out = with_cursor(&mut r, &["ab"], None);
+        assert_eq!(out, b"\x1b[?25l");
+        screen.feed(&out);
+        assert!(!screen.cursor().1);
+        assert!(with_cursor(&mut r, &["ab"], None).is_empty());
+    }
+
+    #[test]
+    fn a_cursor_outside_the_frame_counts_as_none() {
+        let mut r = Renderer::new(6, 3);
+        let mut screen = Screen::new(6, 3);
+        screen.feed(&with_cursor(&mut r, &["ab"], Some((1, 1))));
+        assert!(screen.cursor().1);
+        screen.feed(&with_cursor(&mut r, &["ab"], Some((6, 0))));
+        assert!(!screen.cursor().1);
+        screen.feed(&with_cursor(&mut r, &["ab"], Some((0, 3))));
+        assert!(!screen.cursor().1);
+    }
+
+    #[test]
+    fn a_reset_terminal_gets_the_cursor_shown_again() {
+        let mut r = Renderer::new(6, 3);
+        with_cursor(&mut r, &["ab"], Some((2, 0)));
+        r.cursor_was_reset();
+        r.invalidate();
+        let mut screen = Screen::new(6, 3);
+        screen.feed(&with_cursor(&mut r, &["ab"], Some((2, 0))));
+        assert_eq!(screen.cursor(), ((2, 0), true));
+    }
+
+    #[test]
+    fn the_cursor_survives_random_frames_and_lands_where_asked() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = move |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let (w, h) = (7u16, 3u16);
+        let mut r = Renderer::new(w, h);
+        let mut screen = Screen::new(w, h);
+        for frame in 0..500 {
+            let rows: Vec<String> = (0..h)
+                .map(|_| ["", "ab", "中c", "abcdefg"][next(4) as usize].to_string())
+                .collect();
+            let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+            let at = (next(3) != 0).then(|| (next(w as u64 + 1) as u16, next(h as u64 + 1) as u16));
+            screen.feed(&with_cursor(&mut r, &refs, at));
+            let inside = at.filter(|&(x, y)| x < w && y < h);
+            match inside {
+                Some((x, y)) => {
+                    assert_eq!(
+                        screen.cursor(),
+                        ((x as usize, y as usize), true),
+                        "frame {frame}"
+                    )
+                }
+                None => assert!(!screen.cursor().1, "frame {frame}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_the_terminal_lost_is_shown_again_without_a_repaint() {
+        let mut r = Renderer::new(6, 3);
+        let mut screen = Screen::new(6, 3);
+        screen.feed(&with_cursor(&mut r, &["ab"], Some((2, 0))));
+        screen.feed(b"\x1b[?25l");
+        r.cursor_was_reset();
+        screen.feed(&with_cursor(&mut r, &["ab"], Some((2, 0))));
+        assert_eq!(screen.cursor(), ((2, 0), true));
+    }
+
+    #[test]
+    fn a_frame_cut_before_its_cursor_commands_is_repaired() {
+        // Cut at every byte, with the cursor wanted on and off, so the cut
+        // lands before, inside and after the show and hide commands.
+        for want in [Some((2u16, 0u16)), None] {
+            for prior in [Some((1u16, 1u16)), None] {
+                let mut probe = Renderer::new(6, 2);
+                let mut all = Vec::new();
+                with_cursor(&mut probe, &["ab"], prior);
+                probe.invalidate();
+                all.extend(with_cursor(&mut probe, &["cd"], want));
+                for limit in 0..=all.len() {
+                    let mut r = Renderer::new(6, 2);
+                    let mut screen = Screen::new(6, 2);
+                    // The terminal hides the cursor when it is entered.
+                    screen.feed(b"\x1b[?25l");
+                    screen.feed(&with_cursor(&mut r, &["ab"], prior));
+                    let mut cut = Cut {
+                        sent: Vec::new(),
+                        limit,
+                    };
+                    let _ = r.present_frame(&mut cut, |f| {
+                        f.buffer_mut().set_string(0, 0, "cd", Style::new());
+                        if let Some((x, y)) = want {
+                            f.set_cursor(x, y);
+                        }
+                    });
+                    screen.feed(&cut.sent);
+                    // The next frame is the same one, and must fix the screen.
+                    screen.feed(&with_cursor(&mut r, &["cd"], want));
+                    match want {
+                        Some((x, y)) => assert_eq!(
+                            screen.cursor(),
+                            ((x as usize, y as usize), true),
+                            "limit {limit}"
+                        ),
+                        None => assert!(!screen.cursor().1, "limit {limit}"),
+                    }
+                }
+            }
         }
     }
 }

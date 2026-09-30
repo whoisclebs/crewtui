@@ -7,6 +7,7 @@
 //! owns.
 
 mod block;
+mod input;
 mod list;
 mod paragraph;
 mod progress;
@@ -14,6 +15,7 @@ mod scrollbar;
 mod spinner;
 
 pub use block::{Block, BorderType, Borders};
+pub use input::{Input, InputState};
 pub use list::{List, ListItem, ListState};
 pub use paragraph::{Paragraph, Wrap};
 pub use progress::Progress;
