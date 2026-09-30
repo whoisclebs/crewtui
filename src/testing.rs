@@ -5,9 +5,15 @@
 //! screen) plus the behaviors that matter for correctness: pending wrap
 //! after writing the last column, and erasing the other half of a wide
 //! glyph when one half is overwritten.
+#![allow(unsafe_code)]
+
+use std::ffi::CStr;
+use std::os::fd::RawFd;
+use std::sync::{Mutex, PoisonError};
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::terminal::{get_termios, last_error};
 use crate::text::grapheme_width;
 use crate::{Buffer, Cell, Color, Modifier, Rect, Style};
 
@@ -34,6 +40,14 @@ impl Screen {
             pen: Style::new(),
             pending: Vec::new(),
         }
+    }
+
+    /// The text of row `y`, one symbol per cell, continuation cells omitted.
+    pub(crate) fn row(&self, y: usize) -> String {
+        self.cells[y * self.width..(y + 1) * self.width]
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
     }
 
     pub(crate) fn to_buffer(&self) -> Buffer {
@@ -147,6 +161,8 @@ impl Screen {
                 self.cells.iter_mut().for_each(Cell::reset);
             }
             'm' => self.sgr(&nums),
+            // Private modes such as alternate screen; not modeled.
+            'h' | 'l' => {}
             other => panic!("unmodeled CSI final {other:?}"),
         }
     }
@@ -252,4 +268,111 @@ fn ansi(n: usize) -> Color {
         Color::BrightCyan,
         Color::BrightWhite,
     ][n]
+}
+
+/// A pseudo-terminal pair: the app side is `slave`, the test reads what
+/// the app wrote from `master`.
+pub(crate) struct Pty {
+    pub(crate) master: RawFd,
+    pub(crate) slave: RawFd,
+}
+
+static OPEN: Mutex<()> = Mutex::new(());
+
+impl Pty {
+    pub(crate) fn open() -> Pty {
+        let _guard = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: plain libc calls; `ptsname` returns a pointer into a
+        // static buffer, which the lock above keeps other threads from
+        // overwriting until it is copied and used.
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0, "posix_openpt: {}", last_error());
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+            let name = CStr::from_ptr(libc::ptsname(master)).to_owned();
+            let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+            assert!(slave >= 0, "open slave: {}", last_error());
+            let flags = libc::fcntl(master, libc::F_GETFL);
+            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            Pty { master, slave }
+        }
+    }
+
+    /// Everything the app has written so far.
+    pub(crate) fn output(&self) -> Vec<u8> {
+        drain_fd(self.master, 100)
+    }
+
+    /// Sets the size the terminal reports.
+    pub(crate) fn set_size(&self, columns: u16, rows: u16) {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `TIOCSWINSZ` reads one `winsize` through the pointer.
+        assert_eq!(
+            unsafe { libc::ioctl(self.master, libc::TIOCSWINSZ, &ws) },
+            0
+        );
+    }
+
+    pub(crate) fn termios(&self) -> libc::termios {
+        get_termios(self.slave).unwrap()
+    }
+
+    pub(crate) fn is_raw(&self) -> bool {
+        self.termios().c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG) == 0
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // SAFETY: both descriptors were opened by `open` and are closed once.
+        unsafe {
+            libc::close(self.master);
+            libc::close(self.slave);
+        }
+    }
+}
+
+pub(crate) fn same(a: &libc::termios, b: &libc::termios) -> bool {
+    a.c_iflag == b.c_iflag
+        && a.c_oflag == b.c_oflag
+        && a.c_cflag == b.c_cflag
+        && a.c_lflag == b.c_lflag
+        && a.c_cc == b.c_cc
+}
+
+/// Reads what is available on `fd`, waiting up to `idle_ms` for more.
+pub(crate) fn drain_fd(fd: RawFd, idle_ms: libc::c_int) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is valid for one entry; `buf` for its length.
+        unsafe {
+            if libc::poll(&mut pfd, 1, idle_ms) <= 0 {
+                return out;
+            }
+            let mut buf = [0u8; 512];
+            let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+            if n <= 0 {
+                return out;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+    }
+}
+
+/// Writes all of `bytes` to `fd`, which must be a pty master.
+pub(crate) fn write_fd(fd: RawFd, bytes: &[u8]) {
+    // SAFETY: the pointer and length come from a live slice.
+    let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    assert_eq!(n, bytes.len() as isize, "short write to the pty");
 }

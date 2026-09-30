@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, PoisonError};
 use std::thread::{self, ThreadId};
 
-fn last_error() -> io::Error {
+pub(crate) fn last_error() -> io::Error {
     io::Error::last_os_error()
 }
 
@@ -22,7 +22,7 @@ fn is_tty(fd: RawFd) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
-fn get_termios(fd: RawFd) -> io::Result<libc::termios> {
+pub(crate) fn get_termios(fd: RawFd) -> io::Result<libc::termios> {
     let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
     // SAFETY: `t` is valid for writes of a `termios`; it is only read after
     // `tcgetattr` reports success, which means it filled the struct in.
@@ -358,88 +358,7 @@ impl std::fmt::Debug for Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CStr;
-    use std::os::fd::RawFd;
-
-    /// A pseudo-terminal pair: the app side is `slave`, the test reads what
-    /// the app wrote from `master`.
-    struct Pty {
-        master: RawFd,
-        slave: RawFd,
-    }
-
-    static OPEN: Mutex<()> = Mutex::new(());
-
-    impl Pty {
-        fn open() -> Pty {
-            let _guard = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
-            // SAFETY: plain libc calls; `ptsname` returns a pointer into a
-            // static buffer, which the lock above keeps other threads from
-            // overwriting until it is copied and used.
-            unsafe {
-                let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-                assert!(master >= 0, "posix_openpt: {}", last_error());
-                assert_eq!(libc::grantpt(master), 0);
-                assert_eq!(libc::unlockpt(master), 0);
-                let name = CStr::from_ptr(libc::ptsname(master)).to_owned();
-                let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
-                assert!(slave >= 0, "open slave: {}", last_error());
-                let flags = libc::fcntl(master, libc::F_GETFL);
-                libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                Pty { master, slave }
-            }
-        }
-
-        /// Everything the app has written so far.
-        fn output(&self) -> Vec<u8> {
-            let mut out = Vec::new();
-            loop {
-                let mut pfd = libc::pollfd {
-                    fd: self.master,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: `pfd` is valid for one entry; `buf` for its length.
-                unsafe {
-                    if libc::poll(&mut pfd, 1, 100) <= 0 {
-                        return out;
-                    }
-                    let mut buf = [0u8; 512];
-                    let n = libc::read(self.master, buf.as_mut_ptr().cast(), buf.len());
-                    if n <= 0 {
-                        return out;
-                    }
-                    out.extend_from_slice(&buf[..n as usize]);
-                }
-            }
-        }
-
-        fn termios(&self) -> libc::termios {
-            get_termios(self.slave).unwrap()
-        }
-
-        fn is_raw(&self) -> bool {
-            self.termios().c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG) == 0
-        }
-    }
-
-    impl Drop for Pty {
-        fn drop(&mut self) {
-            // SAFETY: both descriptors were opened by `open` and are closed once.
-            unsafe {
-                libc::close(self.master);
-                libc::close(self.slave);
-            }
-        }
-    }
-
-    fn same(a: &libc::termios, b: &libc::termios) -> bool {
-        a.c_iflag == b.c_iflag
-            && a.c_oflag == b.c_oflag
-            && a.c_cflag == b.c_cflag
-            && a.c_lflag == b.c_lflag
-            && a.c_cc == b.c_cc
-    }
+    use crate::testing::{Pty, same};
 
     fn enter(pty: &Pty, options: TerminalOptions) -> Terminal {
         Terminal::enter_on(pty.slave, pty.slave, options).unwrap()
