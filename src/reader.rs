@@ -7,6 +7,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -48,7 +49,17 @@ impl InputReader {
         let (wake_read, wake_write) = new_pipe()?;
         let thread = thread::Builder::new()
             .name("crewtui-input".into())
-            .spawn(move || read_loop(input, wake_read, signals, &tx, escape_timeout_ms))
+            .spawn(move || {
+                let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                    read_loop(input, wake_read, signals, &tx, escape_timeout_ms)
+                }));
+                outcome.unwrap_or_else(|_| {
+                    // Other senders keep the channel open, so a silent death
+                    // would leave the loop waiting forever.
+                    let _ = tx.send(Input::Failed(io::Error::other("the input thread panicked")));
+                    None
+                })
+            })
             .inspect_err(|_| close_pair(wake_read, wake_write))?;
         Ok(InputReader {
             wake_write,

@@ -2,11 +2,11 @@
 
 use std::fmt;
 use std::io::{self, Write};
-use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use crate::effects::{Effects, Sender};
 use crate::reader::InputReader;
 use crate::{Event, Frame, Renderer, Signal, Signals, Terminal, TerminalOptions};
 
@@ -69,14 +69,28 @@ pub trait App {
 }
 
 /// What `update` asks the runtime to do next.
+///
+/// A `Cmd` describes an effect; the runtime carries it out. Work that
+/// blocks, such as a network request or reading a file, goes in
+/// [`Cmd::perform`] or [`Cmd::spawn`] and runs on a worker thread. Its
+/// result comes back as a message, so state only ever changes in `update`.
+///
+/// To repeat something on a timer, return [`Cmd::after`] again from the
+/// `update` that handles the tick. Nothing needs cancelling: when the
+/// program ends, pending timers are dropped, and so are jobs that had not
+/// started yet.
 pub struct Cmd<M> {
-    kind: CmdKind,
-    _message: PhantomData<fn() -> M>,
+    kind: CmdKind<M>,
 }
 
-enum CmdKind {
+enum CmdKind<M> {
     None,
     Quit,
+    Repaint,
+    Batch(Vec<Cmd<M>>),
+    Perform(Box<dyn FnOnce() -> M + Send>),
+    Spawn(Box<dyn FnOnce(Sender<M>) + Send>),
+    After(Duration, M),
 }
 
 impl<M> Cmd<M> {
@@ -84,7 +98,6 @@ impl<M> Cmd<M> {
     pub const fn none() -> Self {
         Cmd {
             kind: CmdKind::None,
-            _message: PhantomData,
         }
     }
 
@@ -92,7 +105,52 @@ impl<M> Cmd<M> {
     pub const fn quit() -> Self {
         Cmd {
             kind: CmdKind::Quit,
-            _message: PhantomData,
+        }
+    }
+
+    /// Clear the screen and draw everything again, for when something
+    /// outside the program may have scribbled on the terminal.
+    pub const fn repaint() -> Self {
+        Cmd {
+            kind: CmdKind::Repaint,
+        }
+    }
+
+    /// Run several commands. They start in the order given.
+    pub fn batch(cmds: impl IntoIterator<Item = Cmd<M>>) -> Self {
+        Cmd {
+            kind: CmdKind::Batch(cmds.into_iter().collect()),
+        }
+    }
+}
+
+impl<M: Send + 'static> Cmd<M> {
+    /// Runs `work` on a worker thread and sends its result to `update`.
+    ///
+    /// At most eight jobs run at once; the rest wait their turn, so a job
+    /// that blocks for a long time occupies one of those slots. A job that
+    /// panics produces no message.
+    pub fn perform(work: impl FnOnce() -> M + Send + 'static) -> Self {
+        Cmd {
+            kind: CmdKind::Perform(Box::new(work)),
+        }
+    }
+
+    /// Runs `work` on a worker thread with a [`Sender`], for work that
+    /// produces many messages, such as a stream of tokens. `send` starts
+    /// returning [`Closed`](crate::Closed) once the program has ended, which
+    /// is the signal to stop. It takes one of the same eight slots as
+    /// [`Cmd::perform`].
+    pub fn spawn(work: impl FnOnce(Sender<M>) + Send + 'static) -> Self {
+        Cmd {
+            kind: CmdKind::Spawn(Box::new(work)),
+        }
+    }
+
+    /// Sends `message` to `update` after `delay`.
+    pub fn after(delay: Duration, message: M) -> Self {
+        Cmd {
+            kind: CmdKind::After(delay, message),
         }
     }
 }
@@ -105,17 +163,48 @@ impl<M> Default for Cmd<M> {
 
 impl<M> fmt::Debug for Cmd<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self.kind {
-            CmdKind::None => "Cmd::none()",
-            CmdKind::Quit => "Cmd::quit()",
-        })
+        match &self.kind {
+            CmdKind::None => f.write_str("Cmd::none()"),
+            CmdKind::Quit => f.write_str("Cmd::quit()"),
+            CmdKind::Repaint => f.write_str("Cmd::repaint()"),
+            CmdKind::Batch(cmds) => write!(f, "Cmd::batch({} commands)", cmds.len()),
+            CmdKind::Perform(_) => f.write_str("Cmd::perform(..)"),
+            CmdKind::Spawn(_) => f.write_str("Cmd::spawn(..)"),
+            CmdKind::After(delay, _) => write!(f, "Cmd::after({delay:?}, ..)"),
+        }
     }
+}
+
+/// What running a command asks of the loop itself.
+#[derive(Default)]
+struct Requests {
+    quit: bool,
+    repaint: bool,
+}
+
+/// Starts the effects in `cmd`, in order, and reports what the loop must do.
+fn run_cmd<M: Send + 'static>(cmd: Cmd<M>, effects: &Effects<M>) -> Requests {
+    let mut requests = Requests::default();
+    // An explicit stack, so a deeply nested batch can't overflow the call
+    // stack.
+    let mut pending = vec![cmd];
+    while let Some(cmd) = pending.pop() {
+        match cmd.kind {
+            CmdKind::None => {}
+            CmdKind::Quit => requests.quit = true,
+            CmdKind::Repaint => requests.repaint = true,
+            CmdKind::Batch(cmds) => pending.extend(cmds.into_iter().rev()),
+            CmdKind::Perform(work) => effects.perform(work),
+            CmdKind::Spawn(work) => effects.spawn(work),
+            CmdKind::After(delay, message) => effects.after(delay, message),
+        }
+    }
+    requests
 }
 
 /// Everything the loop can be woken by.
 pub(crate) enum Input<M> {
     Event(Event),
-    #[allow(dead_code)] // sent by workers once effects exist
     Message(M),
     Signal(Signal),
     Failed(io::Error),
@@ -151,16 +240,21 @@ pub struct Program<A: App> {
     app: A,
     options: TerminalOptions,
     max_fps: u32,
+    tx: mpsc::Sender<Input<A::Message>>,
+    rx: Receiver<Input<A::Message>>,
 }
 
 impl<A: App> Program<A> {
     /// A program that runs `app` with the default terminal modes and a
     /// frame rate cap of 60.
     pub fn new(app: A) -> Self {
+        let (tx, rx) = mpsc::channel();
         Program {
             app,
             options: TerminalOptions::default(),
             max_fps: 60,
+            tx,
+            rx,
         }
     }
 
@@ -175,6 +269,13 @@ impl<A: App> Program<A> {
     pub fn max_fps(mut self, fps: u32) -> Self {
         self.max_fps = fps;
         self
+    }
+
+    /// A handle that sends messages to this program from any thread. It can
+    /// be taken before [`Program::run`]; what it sends is queued until the
+    /// loop starts.
+    pub fn sender(&self) -> Sender<A::Message> {
+        Sender::new(self.tx.clone())
     }
 
     /// Runs until the app quits.
@@ -198,11 +299,12 @@ impl<A: App> Program<A> {
             None
         };
         let mut terminal = Terminal::enter_on(input, output, self.options)?;
-        let (tx, rx) = mpsc::channel();
-        let reader = InputReader::spawn(input, signals, tx)?;
-        let result = event_loop(self.app, &rx, &mut terminal, self.max_fps);
+        let reader = InputReader::spawn(input, signals, self.tx.clone())?;
+        let effects = Effects::new(self.tx);
+        let result = event_loop(self.app, &self.rx, &effects, &mut terminal, self.max_fps);
         // Stop reading, but keep the handlers until `terminal` has dropped.
         held = reader.finish().or(held);
+        drop(effects);
         drop(terminal);
         drop(held);
         result
@@ -221,18 +323,31 @@ impl<A: App> fmt::Debug for Program<A> {
 /// Handles one input. Returns true when the program should stop.
 fn handle<A: App, H: Host>(
     app: &mut A,
+    effects: &Effects<A::Message>,
     host: &mut H,
     renderer: &mut Renderer,
     dirty: &mut bool,
     input: Input<A::Message>,
 ) -> io::Result<bool> {
-    fn apply<A: App>(app: &mut A, dirty: &mut bool, message: A::Message) -> bool {
+    fn apply<A: App>(
+        app: &mut A,
+        effects: &Effects<A::Message>,
+        renderer: &mut Renderer,
+        dirty: &mut bool,
+        message: A::Message,
+    ) -> bool {
         *dirty = true;
-        matches!(app.update(message).kind, CmdKind::Quit)
+        let requests = run_cmd(app.update(message), effects);
+        if requests.repaint {
+            renderer.invalidate();
+        }
+        requests.quit
     }
     match input {
-        Input::Event(event) => Ok(app.event(event).is_some_and(|m| apply(app, dirty, m))),
-        Input::Message(message) => Ok(apply(app, dirty, message)),
+        Input::Event(event) => Ok(app
+            .event(event)
+            .is_some_and(|m| apply(app, effects, renderer, dirty, m))),
+        Input::Message(message) => Ok(apply(app, effects, renderer, dirty, message)),
         Input::Failed(error) => Err(error),
         Input::Signal(Signal::Resize) => {
             let (width, height) = host.size()?;
@@ -240,7 +355,7 @@ fn handle<A: App, H: Host>(
             *dirty = true;
             Ok(app
                 .event(Event::Resize(width, height))
-                .is_some_and(|m| apply(app, dirty, m)))
+                .is_some_and(|m| apply(app, effects, renderer, dirty, m)))
         }
         Input::Signal(Signal::Continue) => {
             host.resume()?;
@@ -260,6 +375,7 @@ fn handle<A: App, H: Host>(
 pub(crate) fn event_loop<A: App, H: Host>(
     mut app: A,
     rx: &Receiver<Input<A::Message>>,
+    effects: &Effects<A::Message>,
     host: &mut H,
     max_fps: u32,
 ) -> io::Result<A> {
@@ -291,12 +407,12 @@ pub(crate) fn event_loop<A: App, H: Host>(
         } else {
             rx.recv().map_err(|_| disconnected())?
         };
-        if handle(&mut app, host, &mut renderer, &mut dirty, input)? {
+        if handle(&mut app, effects, host, &mut renderer, &mut dirty, input)? {
             return Ok(app);
         }
         // Everything already waiting goes into the same frame.
         while let Ok(input) = rx.try_recv() {
-            if handle(&mut app, host, &mut renderer, &mut dirty, input)? {
+            if handle(&mut app, effects, host, &mut renderer, &mut dirty, input)? {
                 return Ok(app);
             }
         }
@@ -310,7 +426,9 @@ mod tests {
     use crate::{KeyCode, KeyEvent, Modifiers, Rect, Style};
     use std::cell::{Cell as StdCell, RefCell};
     use std::collections::VecDeque;
-    use std::sync::mpsc::{Sender, channel};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{Sender as StdSender, channel};
     use std::thread;
     use std::time::Instant;
 
@@ -381,7 +499,7 @@ mod tests {
         draws: StdCell<u32>,
         area: StdCell<Option<Rect>>,
         resized: Option<(u16, u16)>,
-        frames: Option<Sender<()>>,
+        frames: Option<StdSender<()>>,
     }
 
     impl Counter {
@@ -443,6 +561,21 @@ mod tests {
         }
     }
 
+    /// Runs a test's driver thread. If it panics, the loop gets a failure so
+    /// the test fails instead of waiting forever for input that won't come.
+    fn spawn_driver<M: Send + 'static>(
+        tx: StdSender<Input<M>>,
+        body: impl FnOnce(&StdSender<Input<M>>) + Send + 'static,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&tx)));
+            if let Err(panic) = outcome {
+                let _ = tx.send(Input::Failed(io::Error::other("a test driver panicked")));
+                std::panic::resume_unwind(panic);
+            }
+        })
+    }
+
     fn key(c: char) -> Input<Msg> {
         Input::Event(Event::Key(KeyEvent {
             code: KeyCode::Char(c),
@@ -456,9 +589,8 @@ mod tests {
         for input in inputs {
             tx.send(input).unwrap();
         }
-        // With the sender gone, an empty queue means the input thread died.
-        drop(tx);
-        event_loop(Counter::new(), &rx, host, max_fps)
+        let effects = Effects::new(tx);
+        event_loop(Counter::new(), &rx, &effects, host, max_fps)
     }
 
     fn screen(host: &FakeHost, width: u16, height: u16) -> Screen {
@@ -483,8 +615,9 @@ mod tests {
     fn every_change_shows_up_on_screen() {
         let mut host = FakeHost::new(20, 3);
         let (tx, rx) = channel();
+        let effects = Effects::new(tx.clone());
         let (app, frames) = Counter::with_frames();
-        let handle = thread::spawn(move || {
+        let handle = spawn_driver(tx.clone(), move |tx| {
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             for _ in 0..3 {
                 tx.send(key('+')).unwrap();
@@ -493,7 +626,7 @@ mod tests {
             }
             tx.send(key('q')).unwrap();
         });
-        let app = event_loop(app, &rx, &mut host, 0).unwrap();
+        let app = event_loop(app, &rx, &effects, &mut host, 0).unwrap();
         handle.join().unwrap();
         assert_eq!(app.n, 3);
         assert_eq!(screen(&host, 20, 3).row(0).trim_end(), "count: 3");
@@ -505,14 +638,15 @@ mod tests {
         run(&mut quiet, vec![key('q')], 0).unwrap();
         let mut noisy = FakeHost::new(20, 3);
         let (tx, rx) = channel();
+        let effects = Effects::new(tx.clone());
         let (app, frames) = Counter::with_frames();
-        let handle = thread::spawn(move || {
+        let handle = spawn_driver(tx.clone(), move |tx| {
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(key('p')).unwrap();
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(key('q')).unwrap();
         });
-        let app = event_loop(app, &rx, &mut noisy, 0).unwrap();
+        let app = event_loop(app, &rx, &effects, &mut noisy, 0).unwrap();
         handle.join().unwrap();
         assert_eq!(app.draws.get(), 2);
         assert_eq!(noisy.out, quiet.out);
@@ -544,7 +678,8 @@ mod tests {
     fn the_frame_rate_cap_folds_fast_changes_together() {
         let mut host = FakeHost::new(20, 3);
         let (tx, rx) = channel();
-        let handle = thread::spawn(move || {
+        let effects = Effects::new(tx.clone());
+        let handle = spawn_driver(tx.clone(), move |tx| {
             for _ in 0..150 {
                 tx.send(Input::Message(Msg::Up)).unwrap();
                 thread::sleep(Duration::from_millis(1));
@@ -552,7 +687,7 @@ mod tests {
             tx.send(key('q')).unwrap();
         });
         let started = Instant::now();
-        let app = event_loop(Counter::new(), &rx, &mut host, 20).unwrap();
+        let app = event_loop(Counter::new(), &rx, &effects, &mut host, 20).unwrap();
         handle.join().unwrap();
         assert_eq!(app.n, 150);
         let allowed = (started.elapsed().as_millis() / 50) as u32 + 2;
@@ -568,14 +703,15 @@ mod tests {
         let mut host = FakeHost::new(20, 3);
         host.sizes = RefCell::new(VecDeque::from([(20, 3), (30, 6)]));
         let (tx, rx) = channel();
+        let effects = Effects::new(tx.clone());
         let (app, frames) = Counter::with_frames();
-        let handle = thread::spawn(move || {
+        let handle = spawn_driver(tx.clone(), move |tx| {
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(Input::Signal(Signal::Resize)).unwrap();
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(key('q')).unwrap();
         });
-        let app = event_loop(app, &rx, &mut host, 0).unwrap();
+        let app = event_loop(app, &rx, &effects, &mut host, 0).unwrap();
         handle.join().unwrap();
         assert_eq!(app.resized, Some((30, 6)));
         assert_eq!(app.area.get(), Some(Rect::new(0, 0, 30, 6)));
@@ -594,7 +730,17 @@ mod tests {
         let mut renderer = Renderer::new(20, 3);
         let mut dirty = false;
         let signal = Input::Signal(Signal::Resize);
-        let quit = handle(&mut app, &mut host, &mut renderer, &mut dirty, signal).unwrap();
+        let (tx, _rx) = channel();
+        let effects = Effects::new(tx);
+        let quit = handle(
+            &mut app,
+            &effects,
+            &mut host,
+            &mut renderer,
+            &mut dirty,
+            signal,
+        )
+        .unwrap();
         assert!(!quit && dirty);
         assert_eq!(app.resized, Some((50, 9)));
         assert_eq!(renderer.area(), Rect::new(0, 0, 50, 9));
@@ -615,14 +761,15 @@ mod tests {
     fn continuing_after_a_stop_resumes_the_terminal_and_repaints_everything() {
         let mut host = FakeHost::new(20, 3);
         let (tx, rx) = channel();
+        let effects = Effects::new(tx.clone());
         let (app, frames) = Counter::with_frames();
-        let handle = thread::spawn(move || {
+        let handle = spawn_driver(tx.clone(), move |tx| {
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(Input::Signal(Signal::Continue)).unwrap();
             frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(key('q')).unwrap();
         });
-        event_loop(app, &rx, &mut host, 0).unwrap();
+        event_loop(app, &rx, &effects, &mut host, 0).unwrap();
         handle.join().unwrap();
         assert_eq!(host.resumed, 1);
         let clears = host.out.windows(4).filter(|w| *w == b"\x1b[2J").count();
@@ -630,19 +777,11 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_read_or_a_lost_input_thread_ends_the_run() {
+    fn a_failed_read_ends_the_run() {
         let mut host = FakeHost::new(20, 3);
-        let err = run(
-            &mut host,
-            vec![Input::Failed(io::ErrorKind::UnexpectedEof.into())],
-            0,
-        )
-        .unwrap_err();
+        let failure = Input::Failed(io::ErrorKind::UnexpectedEof.into());
+        let err = run(&mut host, vec![failure], 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-
-        let mut host = FakeHost::new(20, 3);
-        let err = run(&mut host, vec![], 0).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]
@@ -660,9 +799,348 @@ mod tests {
         assert!(matches!(Cmd::<Msg>::default().kind, CmdKind::None));
     }
 
-    fn _assert_sender_is_send(_: Sender<Input<Msg>>) {
-        fn is_send<T: Send>() {}
-        is_send::<Sender<Input<Msg>>>();
+    #[derive(Debug, Clone, PartialEq)]
+    enum Fx {
+        Start,
+        Got(u32),
+        Done,
+    }
+
+    type Script = Box<dyn FnMut(&Fx) -> Cmd<Fx>>;
+
+    /// An app whose `update` is a closure, so each test scripts the effects
+    /// it wants.
+    struct Scripted {
+        log: Vec<Fx>,
+        script: Script,
+        frames: Option<StdSender<()>>,
+    }
+
+    impl Scripted {
+        fn new(script: impl FnMut(&Fx) -> Cmd<Fx> + 'static) -> Self {
+            Scripted {
+                log: Vec::new(),
+                script: Box::new(script),
+                frames: None,
+            }
+        }
+    }
+
+    impl App for Scripted {
+        type Message = Fx;
+
+        fn event(&self, _: Event) -> Option<Fx> {
+            None
+        }
+
+        fn update(&mut self, message: Fx) -> Cmd<Fx> {
+            let cmd = (self.script)(&message);
+            self.log.push(message);
+            cmd
+        }
+
+        fn view(&self, _: &mut Frame<'_>) {
+            if let Some(frames) = &self.frames {
+                let _ = frames.send(());
+            }
+        }
+    }
+
+    /// Runs `app` after sending `Start`, until its script quits.
+    fn drive(app: Scripted, host: &mut FakeHost) -> Scripted {
+        let (tx, rx) = channel();
+        tx.send(Input::Message(Fx::Start)).unwrap();
+        let effects = Effects::new(tx);
+        event_loop(app, &rx, &effects, host, 0).unwrap()
+    }
+
+    #[test]
+    fn perform_runs_blocking_work_off_the_loop_and_returns_its_result_as_a_message() {
+        let app = Scripted::new(|m| match m {
+            Fx::Start => Cmd::perform(|| {
+                thread::sleep(Duration::from_millis(20));
+                Fx::Got(7)
+            }),
+            Fx::Got(_) => Cmd::quit(),
+            Fx::Done => Cmd::none(),
+        });
+        let app = drive(app, &mut FakeHost::new(20, 3));
+        assert_eq!(app.log, vec![Fx::Start, Fx::Got(7)]);
+    }
+
+    #[test]
+    fn batch_starts_every_command_and_all_results_arrive() {
+        let mut seen = 0;
+        let app = Scripted::new(move |m| match m {
+            Fx::Start => Cmd::batch([
+                Cmd::perform(|| Fx::Got(1)),
+                Cmd::perform(|| Fx::Got(2)),
+                Cmd::batch([Cmd::perform(|| Fx::Got(3))]),
+            ]),
+            Fx::Got(_) => {
+                seen += 1;
+                if seen == 3 { Cmd::quit() } else { Cmd::none() }
+            }
+            Fx::Done => Cmd::none(),
+        });
+        let mut app = drive(app, &mut FakeHost::new(20, 3));
+        assert_eq!(app.log.remove(0), Fx::Start);
+        app.log.sort_by_key(|f| format!("{f:?}"));
+        assert_eq!(app.log, vec![Fx::Got(1), Fx::Got(2), Fx::Got(3)]);
+    }
+
+    #[test]
+    fn a_batch_containing_quit_stops_the_program() {
+        let app = Scripted::new(|m| match m {
+            Fx::Start => Cmd::batch([Cmd::quit(), Cmd::perform(|| Fx::Done)]),
+            _ => Cmd::none(),
+        });
+        let app = drive(app, &mut FakeHost::new(20, 3));
+        assert_eq!(app.log, vec![Fx::Start]);
+    }
+
+    #[test]
+    fn jobs_that_have_not_started_when_the_program_ends_never_run() {
+        // Eight gated jobs fill the pool, so the ninth waits in the queue.
+        let gate = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(AtomicBool::new(false));
+        let (g, r) = (gate.clone(), ran.clone());
+        let app = Scripted::new(move |m| match m {
+            Fx::Start => {
+                let mut cmds: Vec<Cmd<Fx>> = (0..crate::effects::MAX_WORKERS)
+                    .map(|_| {
+                        let g = g.clone();
+                        Cmd::spawn(move |_| {
+                            while !g.load(Ordering::SeqCst) {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                        })
+                    })
+                    .collect();
+                let r = r.clone();
+                cmds.push(Cmd::perform(move || {
+                    r.store(true, Ordering::SeqCst);
+                    Fx::Done
+                }));
+                cmds.push(Cmd::quit());
+                Cmd::batch(cmds)
+            }
+            _ => Cmd::none(),
+        });
+        drive(app, &mut FakeHost::new(20, 3));
+        gate.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a queued job ran after the program ended"
+        );
+    }
+
+    #[test]
+    fn after_delivers_in_deadline_order_and_not_early() {
+        let app = Scripted::new(|m| match m {
+            Fx::Start => Cmd::batch([
+                Cmd::after(Duration::from_millis(80), Fx::Got(2)),
+                Cmd::after(Duration::from_millis(20), Fx::Got(1)),
+                Cmd::after(Duration::from_millis(140), Fx::Done),
+            ]),
+            Fx::Done => Cmd::quit(),
+            Fx::Got(_) => Cmd::none(),
+        });
+        let started = Instant::now();
+        let app = drive(app, &mut FakeHost::new(20, 3));
+        assert_eq!(app.log, vec![Fx::Start, Fx::Got(1), Fx::Got(2), Fx::Done]);
+        assert!(started.elapsed() >= Duration::from_millis(140));
+    }
+
+    #[test]
+    fn a_tick_that_returns_after_again_repeats_until_the_app_stops() {
+        let mut ticks = 0;
+        let app = Scripted::new(move |m| match m {
+            Fx::Start | Fx::Got(_) => {
+                ticks += 1;
+                if ticks < 5 {
+                    Cmd::after(Duration::from_millis(5), Fx::Got(ticks))
+                } else {
+                    Cmd::quit()
+                }
+            }
+            Fx::Done => Cmd::none(),
+        });
+        let app = drive(app, &mut FakeHost::new(20, 3));
+        assert_eq!(app.log.len(), 5);
+    }
+
+    #[test]
+    fn repaint_clears_the_screen_and_draws_everything_again() {
+        let mut host = FakeHost::new(20, 3);
+        let (tx, rx) = channel();
+        let effects = Effects::new(tx.clone());
+        let (frames_tx, frames) = channel();
+        let mut app = Scripted::new(|m| match m {
+            Fx::Start => Cmd::repaint(),
+            Fx::Done => Cmd::quit(),
+            Fx::Got(_) => Cmd::none(),
+        });
+        app.frames = Some(frames_tx);
+        tx.send(Input::Message(Fx::Start)).unwrap();
+        let handle = spawn_driver(tx.clone(), move |tx| {
+            // The initial frame, then the one the repaint asked for.
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
+            tx.send(Input::Message(Fx::Done)).unwrap();
+        });
+        event_loop(app, &rx, &effects, &mut host, 0).unwrap();
+        handle.join().unwrap();
+        let clears = host.out.windows(4).filter(|w| *w == b"\x1b[2J").count();
+        assert_eq!(clears, 2, "{:?}", String::from_utf8_lossy(&host.out));
+    }
+
+    #[test]
+    fn a_worker_can_stream_many_messages_and_they_arrive_in_order() {
+        const N: u32 = 10_000;
+        let app = Scripted::new(|m| match m {
+            Fx::Start => Cmd::spawn(|tx| {
+                for i in 0..N {
+                    tx.send(Fx::Got(i)).unwrap();
+                }
+                tx.send(Fx::Done).unwrap();
+            }),
+            Fx::Done => Cmd::quit(),
+            Fx::Got(_) => Cmd::none(),
+        });
+        let app = drive(app, &mut FakeHost::new(20, 3));
+        assert_eq!(app.log.len(), N as usize + 2);
+        assert_eq!(app.log[0], Fx::Start);
+        assert!(
+            app.log[1..=N as usize]
+                .iter()
+                .enumerate()
+                .all(|(i, m)| *m == Fx::Got(i as u32))
+        );
+        assert_eq!(app.log.last(), Some(&Fx::Done));
+    }
+
+    #[test]
+    fn a_streaming_worker_learns_the_program_ended_when_send_fails() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        let app = Scripted::new(move |m| match m {
+            Fx::Start => {
+                let flag = flag.clone();
+                Cmd::spawn(move |tx| {
+                    let mut i = 0;
+                    while tx.send(Fx::Got(i)).is_ok() {
+                        i = i.wrapping_add(1);
+                        thread::yield_now();
+                    }
+                    flag.store(true, Ordering::SeqCst);
+                })
+            }
+            Fx::Got(3) => Cmd::quit(),
+            _ => Cmd::none(),
+        });
+        let (tx, rx) = channel();
+        tx.send(Input::Message(Fx::Start)).unwrap();
+        let effects = Effects::new(tx);
+        event_loop(app, &rx, &effects, &mut FakeHost::new(20, 3), 0).unwrap();
+        drop(effects);
+        drop(rx);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !stopped.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the worker never saw Closed");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn timers_still_pending_when_the_program_ends_never_fire() {
+        let app = Scripted::new(|m| match m {
+            Fx::Start => Cmd::batch([Cmd::after(Duration::from_millis(60), Fx::Done), Cmd::quit()]),
+            _ => Cmd::none(),
+        });
+        let (tx, rx) = channel();
+        tx.send(Input::Message(Fx::Start)).unwrap();
+        let effects = Effects::new(tx);
+        event_loop(app, &rx, &effects, &mut FakeHost::new(20, 3), 0).unwrap();
+        drop(effects);
+        thread::sleep(Duration::from_millis(150));
+        // Had the timer fired, its message would be waiting here.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_delay_too_large_to_represent_is_a_timer_that_never_fires() {
+        let app = Scripted::new(|m| match m {
+            Fx::Start => Cmd::batch([
+                Cmd::after(Duration::MAX, Fx::Done),
+                Cmd::after(Duration::from_millis(20), Fx::Got(1)),
+            ]),
+            Fx::Got(_) => Cmd::quit(),
+            Fx::Done => Cmd::none(),
+        });
+        let app = drive(app, &mut FakeHost::new(20, 3));
+        assert_eq!(app.log, vec![Fx::Start, Fx::Got(1)]);
+    }
+
+    #[test]
+    fn cmd_debug_names_every_variant() {
+        assert_eq!(format!("{:?}", Cmd::<Msg>::repaint()), "Cmd::repaint()");
+        assert_eq!(
+            format!("{:?}", Cmd::<Msg>::batch([Cmd::none(), Cmd::quit()])),
+            "Cmd::batch(2 commands)"
+        );
+        assert_eq!(
+            format!("{:?}", Cmd::perform(|| Msg::Up)),
+            "Cmd::perform(..)"
+        );
+        assert_eq!(
+            format!("{:?}", Cmd::spawn(|_: Sender<Msg>| {})),
+            "Cmd::spawn(..)"
+        );
+        assert_eq!(
+            format!("{:?}", Cmd::after(Duration::from_millis(5), Msg::Up)),
+            "Cmd::after(5ms, ..)"
+        );
+    }
+
+    #[test]
+    fn a_program_sender_reaches_update_from_other_threads_before_and_during_the_run() {
+        let pty = Pty::open();
+        pty.set_size(40, 4);
+        let master = pty.master;
+        let drain = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut seen = Vec::new();
+            while !seen.ends_with(b"\x1b[?1049l") {
+                seen.extend(drain_fd(master, 50));
+                assert!(Instant::now() < deadline, "the program never quit");
+            }
+        });
+        let program = Program::new(Counter::new()).max_fps(0);
+        let sender = program.sender();
+        // Queued before the loop starts.
+        sender.send(Msg::Up).unwrap();
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    for _ in 0..500 {
+                        sender.send(Msg::Up).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let quitter = thread::spawn(move || {
+            for w in workers {
+                w.join().unwrap();
+            }
+            sender.send(Msg::Quit).unwrap();
+        });
+        let app = program.run_on(pty.slave, pty.slave, false).unwrap();
+        quitter.join().unwrap();
+        drain.join().unwrap();
+        assert_eq!(app.n, 1001);
     }
 
     #[test]
