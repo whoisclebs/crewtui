@@ -338,6 +338,12 @@ pub(crate) fn line_rows(line: &Line<'_>, width: usize, wrap: Wrap) -> usize {
     if wrap == Wrap::None {
         return 1;
     }
+    // A column takes at least a byte, so a line with no more bytes than
+    // columns fits on one row. Most lines do, and this skips splitting them.
+    let bytes: usize = line.spans.iter().map(|s| s.content.len()).sum();
+    if width > 0 && bytes <= width {
+        return 1;
+    }
     rows(&pieces(line), width, wrap).len()
 }
 
@@ -460,6 +466,44 @@ mod tests {
     use super::*;
     use crate::text::Span;
     use crate::{Color, Frame};
+
+    /// The shortcut for a line with no more bytes than columns must agree with
+    /// splitting the line, for every kind of text.
+    #[test]
+    fn the_one_row_shortcut_agrees_with_splitting() {
+        let pieces_of = [
+            "",
+            " ",
+            "a",
+            "ab cd",
+            "aaaa bbbb",
+            "日本語",
+            "😀😀",
+            "e\u{301}",
+            "\t",
+            "x\ty",
+            "👨\u{200d}👩\u{200d}👧",
+            "\u{200b}",
+            "  lead",
+            "trail  ",
+            "a-b-c",
+        ];
+        for a in pieces_of {
+            for b in pieces_of {
+                let line = Line::from(vec![Span::raw(a.to_owned()), Span::raw(b.to_owned())]);
+                for width in 0..24 {
+                    for wrap in [Wrap::Word, Wrap::Char] {
+                        let slow = rows(&pieces(&line), width, wrap).len();
+                        assert_eq!(
+                            line_rows(&line, width, wrap),
+                            slow,
+                            "{a:?} + {b:?} at {width} ({wrap:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// The rows of `buf` as text, one symbol per cell.
     fn rows_of(buf: &Buffer) -> Vec<String> {
