@@ -125,7 +125,7 @@ fn alternate(a: Buffer, b: Buffer) -> impl FnMut() -> usize {
     move || {
         flip = !flip;
         let scene = if flip { &a } else { &b };
-        renderer.draw(|buf| buf.clone_from(scene)).len()
+        renderer.draw(|f| f.buffer_mut().clone_from(scene)).len()
     }
 }
 
@@ -163,7 +163,7 @@ fn diffs() -> Vec<Result> {
         let mut renderer = Renderer::new(WIDTH, HEIGHT);
         move || {
             renderer.invalidate();
-            renderer.draw(|buf| buf.clone_from(&a)).len()
+            renderer.draw(|f| f.buffer_mut().clone_from(&a)).len()
         }
     }));
     cases.into_iter().map(measure).collect()
@@ -182,7 +182,7 @@ fn layout_frame(
     list_state.select(Some(selected));
     let input = InputState::with_text("explain the renderer to me");
     renderer
-        .draw_frame(|frame| {
+        .draw(|frame| {
             let [header, body, input_area, status] = Layout::column()
                 .constraints([
                     Constraint::Fixed(1),
@@ -264,7 +264,7 @@ fn transcript(entries: usize) -> HistoryState {
 
 fn history_frame(renderer: &mut Renderer, state: &HistoryState, area: Rect) -> usize {
     renderer
-        .draw_frame(|frame| {
+        .draw(|frame| {
             frame.render_stateful_widget(History::new(), area, state);
         })
         .len()
@@ -336,7 +336,7 @@ fn histories() -> Vec<Result> {
             let mut renderer = Renderer::new(WIDTH, HEIGHT);
             move || {
                 renderer
-                    .draw_frame(|frame| {
+                    .draw(|frame| {
                         frame.render_stateful_widget(History::new(), area, &state);
                         frame.render_widget(
                             Scrollbar::vertical()
@@ -360,7 +360,7 @@ fn histories() -> Vec<Result> {
                 let area = Rect::new(0, 0, w - 1, HEIGHT);
                 let bar = Rect::new(w - 1, 0, 1, HEIGHT);
                 renderer
-                    .draw_frame(|frame| {
+                    .draw(|frame| {
                         frame.render_stateful_widget(History::new(), area, &state);
                         frame.render_widget(
                             Scrollbar::vertical()

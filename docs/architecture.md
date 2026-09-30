@@ -31,7 +31,7 @@ A diff against a wrong `previous` doesn't fail, it just leaves garbage on screen
 Who calls it:
 
 - `Renderer::resize` does, by itself.
-- `Renderer::present` and `present_frame` do when their write returns an error, whether or not some bytes went through. That matters to code that drives a `Renderer` itself and carries on after the error. `Program` doesn't: a failed write ends the run.
+- `Renderer::present` does when their write returns an error, whether or not some bytes went through. That matters to code that drives a `Renderer` itself and carries on after the error. `Program` doesn't: a failed write ends the run.
 - The runtime does after SIGCONT.
 - Applications ask for it with `Cmd::repaint` (Ctrl+L in the example app), for instance after a child process used the terminal.
 

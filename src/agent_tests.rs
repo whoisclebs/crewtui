@@ -44,7 +44,7 @@ fn agent() -> Agent {
 fn screen(agent: &Agent, w: u16, h: u16) -> Screen {
     let mut renderer = Renderer::new(w, h);
     let mut screen = Screen::new(w, h);
-    screen.feed(renderer.draw_frame(|f| agent.view(f)));
+    screen.feed(renderer.draw(|f| agent.view(f)));
     screen
 }
 
@@ -249,7 +249,7 @@ fn the_cursor_is_in_the_input_box() {
     let mut renderer = Renderer::new(100, 30);
     let mut screen = Screen::new(100, 30);
     screen.feed(b"\x1b[?25l");
-    screen.feed(renderer.draw_frame(|f| a.view(f)));
+    screen.feed(renderer.draw(|f| a.view(f)));
     let ((x, y), shown) = screen.cursor();
     assert!(shown);
     // Inside the bordered input at the bottom, after the three letters.
@@ -330,7 +330,7 @@ fn a_long_transcript_with_streaming_never_repaints_the_screen_per_token() {
     let mut all_bytes = 0usize;
     let mut frame = |a: &Agent, r: &mut Renderer| {
         let started = std::time::Instant::now();
-        let bytes = r.draw_frame(|f| a.view(f)).len();
+        let bytes = r.draw(|f| a.view(f)).len();
         (bytes, started.elapsed())
     };
 
