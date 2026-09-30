@@ -4,6 +4,7 @@
 #[cfg(all(test, unix))]
 mod agent_tests;
 mod buffer;
+mod clipboard;
 mod effects;
 mod frame;
 mod geometry;
@@ -56,6 +57,7 @@ struct ReadmeDoctests;
 struct GettingStartedDoctests;
 
 pub use buffer::{Buffer, Cell};
+pub use clipboard::CLIPBOARD_LIMIT;
 pub use effects::{Closed, Sender};
 pub use frame::Frame;
 pub use geometry::Rect;

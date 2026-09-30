@@ -96,6 +96,7 @@ enum CmdKind<M> {
     None,
     Quit,
     Repaint,
+    Copy(String),
     Batch(Vec<Cmd<M>>),
     Perform(Box<dyn FnOnce() -> M + Send>),
     Spawn(Box<dyn FnOnce(Sender<M>) + Send>),
@@ -122,6 +123,21 @@ impl<M> Cmd<M> {
     pub const fn repaint() -> Self {
         Cmd {
             kind: CmdKind::Repaint,
+        }
+    }
+
+    /// Puts `text` on the system clipboard, with an OSC 52 sequence written
+    /// to the terminal. It works over SSH too, in terminals that allow it;
+    /// those that don't ignore it, and nothing tells the app either way.
+    ///
+    /// The text goes out as base64, so nothing in it can end the sequence and
+    /// run as terminal commands. Text longer than
+    /// [`CLIPBOARD_LIMIT`](crate::CLIPBOARD_LIMIT) bytes is not sent at all,
+    /// since terminals drop or cut large payloads. The sequence is written
+    /// when the command runs, before the next frame.
+    pub fn copy_to_clipboard(text: impl Into<String>) -> Self {
+        Cmd {
+            kind: CmdKind::Copy(text.into()),
         }
     }
 
@@ -209,6 +225,7 @@ impl<M> fmt::Debug for Cmd<M> {
             CmdKind::None => f.write_str("Cmd::none()"),
             CmdKind::Quit => f.write_str("Cmd::quit()"),
             CmdKind::Repaint => f.write_str("Cmd::repaint()"),
+            CmdKind::Copy(text) => write!(f, "Cmd::copy_to_clipboard({} bytes)", text.len()),
             CmdKind::Batch(cmds) => write!(f, "Cmd::batch({} commands)", cmds.len()),
             CmdKind::Perform(_) => f.write_str("Cmd::perform(..)"),
             CmdKind::Spawn(_) => f.write_str("Cmd::spawn(..)"),
@@ -222,6 +239,26 @@ impl<M> fmt::Debug for Cmd<M> {
 struct Requests {
     quit: bool,
     repaint: bool,
+    /// The texts to copy, in the order asked.
+    copies: Vec<String>,
+}
+
+impl Requests {
+    /// Writes the clipboard sequences, so they reach the terminal in the
+    /// order the commands were given and before the next frame.
+    fn write_copies(&mut self, host: &mut impl Write) -> io::Result<()> {
+        let mut wrote = false;
+        for text in self.copies.drain(..) {
+            if let Some(sequence) = crate::clipboard::osc52(&text) {
+                host.write_all(&sequence)?;
+                wrote = true;
+            }
+        }
+        if wrote {
+            host.flush()?;
+        }
+        Ok(())
+    }
 }
 
 /// Starts the effects in `cmd`, in order, and reports what the loop must do.
@@ -235,6 +272,7 @@ fn run_cmd<M: Send + 'static>(cmd: Cmd<M>, effects: &Effects<M>) -> Requests {
             CmdKind::None => {}
             CmdKind::Quit => requests.quit = true,
             CmdKind::Repaint => requests.repaint = true,
+            CmdKind::Copy(text) => requests.copies.push(text),
             CmdKind::Batch(cmds) => pending.extend(cmds.into_iter().rev()),
             CmdKind::Perform(work) => effects.perform(work),
             CmdKind::Spawn(work) => effects.spawn(work),
@@ -477,33 +515,37 @@ fn handle<A: App, H: Host>(
     dirty: &mut bool,
     input: Input<A::Message>,
 ) -> io::Result<bool> {
-    fn apply<A: App>(
+    fn apply<A: App, H: Host>(
         app: &mut A,
         effects: &Effects<A::Message>,
+        host: &mut H,
         renderer: &mut Renderer,
         dirty: &mut bool,
         message: A::Message,
-    ) -> bool {
+    ) -> io::Result<bool> {
         *dirty = true;
-        let requests = run_cmd(app.update(message), effects);
+        let mut requests = run_cmd(app.update(message), effects);
         if requests.repaint {
             renderer.invalidate();
         }
-        requests.quit
+        requests.write_copies(host)?;
+        Ok(requests.quit)
     }
     match input {
-        Input::Event(event) => Ok(app
-            .event(event)
-            .is_some_and(|m| apply(app, effects, renderer, dirty, m))),
-        Input::Message(message) => Ok(apply(app, effects, renderer, dirty, message)),
+        Input::Event(event) => match app.event(event) {
+            Some(m) => apply(app, effects, host, renderer, dirty, m),
+            None => Ok(false),
+        },
+        Input::Message(message) => apply(app, effects, host, renderer, dirty, message),
         Input::Failed(error) => Err(error),
         Input::Signal(Signal::Resize) => {
             let (width, height) = host.size()?;
             renderer.resize(width, height);
             *dirty = true;
-            Ok(app
-                .event(Event::Resize(width, height))
-                .is_some_and(|m| apply(app, effects, renderer, dirty, m)))
+            match app.event(Event::Resize(width, height)) {
+                Some(m) => apply(app, effects, host, renderer, dirty, m),
+                None => Ok(false),
+            }
         }
         Input::Signal(Signal::Continue) => {
             if host.resume()? {
@@ -548,7 +590,8 @@ pub(crate) fn event_loop<A: App, H: Host>(
     } else {
         Duration::from_secs_f64(1.0 / f64::from(max_fps))
     };
-    let started = run_cmd(app.init(), effects);
+    let mut started = run_cmd(app.init(), effects);
+    started.write_copies(host)?;
     if started.quit {
         return Ok(app);
     }
@@ -1310,6 +1353,29 @@ mod tests {
         handle.join().unwrap();
         let clears = host.out.windows(4).filter(|w| *w == b"\x1b[2J").count();
         assert_eq!(clears, 2, "{:?}", String::from_utf8_lossy(&host.out));
+    }
+
+    #[test]
+    fn copy_to_clipboard_writes_the_osc_52_sequences_in_order() {
+        let mut host = FakeHost::new(20, 3);
+        let (tx, rx) = channel();
+        let effects = Effects::new(tx.clone());
+        let app = Scripted::new(|m| match m {
+            Fx::Start => Cmd::batch([
+                Cmd::copy_to_clipboard("first"),
+                Cmd::copy_to_clipboard(String::new()),
+                Cmd::copy_to_clipboard("x\x07\x1b[2J"),
+                Cmd::quit(),
+            ]),
+            _ => Cmd::none(),
+        });
+        tx.send(Input::Message(Fx::Start)).unwrap();
+        event_loop(app, &rx, &effects, &mut host, 0).unwrap();
+        let out = String::from_utf8_lossy(&host.out).into_owned();
+        let first = out.find("\x1b]52;c;Zmlyc3Q=\x1b\\").expect(&out);
+        let second = out.find("\x1b]52;c;eAcbWzJK\x1b\\").expect(&out);
+        assert!(first < second);
+        assert_eq!(out.matches("]52;").count(), 2, "{out:?}");
     }
 
     #[test]
