@@ -13,8 +13,10 @@ pub enum Wrap {
     /// Continue on the next row at whatever character comes next.
     Char,
     /// Continue on the next row at a word boundary. The whitespace where the
-    /// line breaks is dropped, indentation is kept, and a word longer than a
-    /// whole row is split by characters.
+    /// line breaks is dropped, and a word longer than a whole row is split
+    /// by characters. Indentation is kept, unless the first word no longer
+    /// fits after it, in which case the word starts the row. No-break spaces
+    /// are not places to break.
     Word,
 }
 
@@ -114,11 +116,17 @@ fn pieces<'a>(line: &'a Line<'_>) -> Vec<Piece<'a>> {
                 text: g,
                 width,
                 style: span.style,
-                whitespace: g.chars().all(char::is_whitespace),
+                whitespace: g.chars().all(is_breaking_space),
             });
         }
     }
     out
+}
+
+/// Whitespace a line may be broken at. No-break spaces are whitespace, but
+/// the text asked for them not to be a break.
+fn is_breaking_space(c: char) -> bool {
+    c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{2007}' | '\u{202f}')
 }
 
 fn width_of(pieces: &[Piece<'_>]) -> usize {
@@ -226,8 +234,12 @@ fn word_rows(pieces: &[Piece<'_>], width: usize) -> Vec<Row> {
             used += run;
             i = j;
         } else if i > start {
-            // The row has something on it: the word starts the next one.
-            rows.push(trimmed(start, i));
+            // The row has something on it: the word starts the next one. If
+            // all it has is indentation, that is dropped rather than left
+            // as an empty row.
+            if trimmed(start, i).end > start {
+                rows.push(trimmed(start, i));
+            }
             start = i;
             used = 0;
         } else {
@@ -512,6 +524,25 @@ mod tests {
     }
 
     #[test]
+    fn indentation_that_leaves_no_room_for_the_first_word_is_dropped_not_left_as_a_row() {
+        assert_eq!(wrapped("  hello", Wrap::Word, 5, 2), ["hello", "     "]);
+        assert_eq!(
+            wrapped("   abcdefgh", Wrap::Word, 4, 3),
+            ["abcd", "efgh", "    "]
+        );
+        assert_eq!(wrapped("  hi", Wrap::Word, 5, 2), ["  hi ", "     "]);
+    }
+
+    #[test]
+    fn a_no_break_space_is_not_a_place_to_break() {
+        assert_eq!(
+            wrapped("a\u{a0}bcde", Wrap::Word, 4, 3),
+            ["a\u{a0}bc", "de  ", "    "]
+        );
+        assert_eq!(wrapped("a bcde", Wrap::Word, 4, 2), ["a   ", "bcde"]);
+    }
+
+    #[test]
     fn word_wrap_handles_cjk_and_mixed_width_words() {
         assert_eq!(
             wrapped("中文 字 abc", Wrap::Word, 6, 3),
@@ -605,6 +636,12 @@ mod tests {
         assert_eq!(t.height(), 3);
         assert_eq!(t.lines[1], Line::raw("b"));
         assert_eq!(t.lines[2], Line::raw(""));
+        // A `\r` only goes with the `\n` after it.
+        assert_eq!(Text::from("a\r").lines, vec![Line::raw("a\r")]);
+        assert_eq!(
+            Text::from(String::from("a\r\nb\r")).lines,
+            vec![Line::raw("a"), Line::raw("b\r")]
+        );
         assert_eq!(Text::from("中a").width(), 3);
         assert_eq!(
             Line::from(vec![Span::raw("ab"), Span::raw("中")]).width(),

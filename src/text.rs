@@ -218,15 +218,36 @@ pub struct Text<'a> {
 impl<'a> Text<'a> {
     /// Text split into lines at each newline.
     pub fn raw(content: impl Into<Cow<'a, str>>) -> Self {
+        // A `\r` only counts when a `\n` follows it, so the last segment
+        // keeps whatever it ends with.
         let lines = match content.into() {
-            Cow::Borrowed(s) => s
-                .split('\n')
-                .map(|l| Line::raw(l.strip_suffix('\r').unwrap_or(l)))
-                .collect(),
-            Cow::Owned(s) => s
-                .split('\n')
-                .map(|l| Line::raw(l.strip_suffix('\r').unwrap_or(l).to_owned()))
-                .collect(),
+            Cow::Borrowed(s) => {
+                let last = s.matches('\n').count();
+                s.split('\n')
+                    .enumerate()
+                    .map(|(i, l)| {
+                        Line::raw(if i < last {
+                            l.strip_suffix('\r').unwrap_or(l)
+                        } else {
+                            l
+                        })
+                    })
+                    .collect()
+            }
+            Cow::Owned(s) => {
+                let last = s.matches('\n').count();
+                s.split('\n')
+                    .enumerate()
+                    .map(|(i, l)| {
+                        let l = if i < last {
+                            l.strip_suffix('\r').unwrap_or(l)
+                        } else {
+                            l
+                        };
+                        Line::raw(l.to_owned())
+                    })
+                    .collect()
+            }
         };
         Text {
             lines,
