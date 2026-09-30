@@ -155,9 +155,16 @@ impl State {
     }
 
     fn activate(self: &Arc<Self>) -> io::Result<()> {
-        self.set_modes()?;
-        write_all(self.output, &enable_sequence(&self.options))?;
+        // From the first change on, `restore` has something to undo, so a
+        // failure half way leaves the console as it was found.
         self.restored.store(false, Ordering::SeqCst);
+        let done = self
+            .set_modes()
+            .and_then(|()| write_all(self.output, &enable_sequence(&self.options)));
+        if let Err(e) = done {
+            let _ = self.restore();
+            return Err(e);
+        }
         let mut active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
         if !active.iter().any(|s| Arc::ptr_eq(s, self)) {
             active.push(self.clone());
