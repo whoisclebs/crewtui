@@ -179,6 +179,9 @@ fn diff(previous: &Buffer, current: &Buffer, out: &mut Vec<u8>) {
 
     for y in 0..area.height as usize {
         let row = y * width;
+        if current.cells()[row..row + width] == previous.cells()[row..row + width] {
+            continue;
+        }
         for x in 0..width {
             let cell = &current.cells()[row + x];
             if cell.is_continuation() {
