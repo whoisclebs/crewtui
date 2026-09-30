@@ -19,6 +19,7 @@ pub(crate) struct Screen {
     y: usize,
     pending_wrap: bool,
     pen: Style,
+    pending: Vec<u8>,
 }
 
 impl Screen {
@@ -31,6 +32,7 @@ impl Screen {
             y: 0,
             pending_wrap: false,
             pen: Style::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -44,23 +46,80 @@ impl Screen {
         b
     }
 
+    /// Applies bytes the way a terminal would: sequences may be split
+    /// across calls, an ESC inside a CSI sequence aborts it, and invalid
+    /// UTF-8 prints U+FFFD.
     pub(crate) fn feed(&mut self, bytes: &[u8]) {
-        let text = std::str::from_utf8(bytes).expect("renderer output is UTF-8");
-        let mut rest = text;
-        while !rest.is_empty() {
-            if let Some(seq) = rest.strip_prefix("\x1b[") {
-                let end = seq
-                    .find(|c: char| c.is_ascii_alphabetic())
-                    .expect("unterminated CSI sequence");
-                self.csi(&seq[..end], seq.as_bytes()[end] as char);
-                rest = &seq[end + 1..];
-            } else {
-                let end = rest.find('\x1b').unwrap_or(rest.len());
-                for g in rest[..end].graphemes(true) {
-                    self.print(g);
+        self.pending.extend_from_slice(bytes);
+        let data = std::mem::take(&mut self.pending);
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] == 0x1b {
+                if i + 1 == data.len() {
+                    break;
                 }
-                rest = &rest[end..];
+                if data[i + 1] != b'[' {
+                    i += 2;
+                    continue;
+                }
+                let mut j = i + 2;
+                let mut done = false;
+                while j < data.len() {
+                    match data[j] {
+                        0x1b => break,
+                        0x40..=0x7e => {
+                            let params = std::str::from_utf8(&data[i + 2..j]).unwrap_or("");
+                            self.csi(params, data[j] as char);
+                            done = true;
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                if done {
+                    i = j + 1;
+                } else if j == data.len() {
+                    break;
+                } else {
+                    i = j;
+                }
+            } else {
+                let end = data[i..]
+                    .iter()
+                    .position(|&b| b == 0x1b)
+                    .map_or(data.len(), |p| i + p);
+                match std::str::from_utf8(&data[i..end]) {
+                    Ok(text) => {
+                        self.print_text(text);
+                        i = end;
+                    }
+                    Err(e) => {
+                        let valid = i + e.valid_up_to();
+                        self.print_text(std::str::from_utf8(&data[i..valid]).unwrap_or(""));
+                        match e.error_len() {
+                            Some(n) => {
+                                self.print("\u{fffd}");
+                                i = valid + n;
+                            }
+                            None if end == data.len() => {
+                                i = valid;
+                                break;
+                            }
+                            None => {
+                                self.print("\u{fffd}");
+                                i = end;
+                            }
+                        }
+                    }
+                }
             }
+        }
+        self.pending = data[i..].to_vec();
+    }
+
+    fn print_text(&mut self, text: &str) {
+        for g in text.graphemes(true) {
+            self.print(g);
         }
     }
 
