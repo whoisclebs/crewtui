@@ -8,8 +8,12 @@
 #![allow(unsafe_code)]
 
 use std::ffi::CStr;
-use std::os::fd::RawFd;
+use std::io;
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -295,6 +299,10 @@ impl Pty {
             assert!(slave >= 0, "open slave: {}", last_error());
             let flags = libc::fcntl(master, libc::F_GETFL);
             libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            // Children must not inherit these: a master kept open in the
+            // child would stop a hangup from ever happening.
+            libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
             Pty { master, slave }
         }
     }
@@ -328,11 +336,81 @@ impl Pty {
     }
 }
 
+impl Pty {
+    /// Closes the master side, which hangs up the terminal: processes that
+    /// have it as their controlling terminal get SIGHUP.
+    pub(crate) fn close_master(&mut self) {
+        // SAFETY: closes the descriptor once; `Drop` skips it afterwards.
+        unsafe { libc::close(self.master) };
+        self.master = -1;
+    }
+
+    /// Starts `cmd` with this terminal as its stdin, stdout, stderr and
+    /// controlling terminal, in a session of its own. That last part is what
+    /// makes hangups and terminal-generated signals reach it.
+    pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
+        let dup = || -> io::Result<Stdio> {
+            // SAFETY: `dup` returns a new descriptor that `Stdio` then owns.
+            let fd = unsafe { libc::dup(self.slave) };
+            if fd < 0 {
+                return Err(last_error());
+            }
+            Ok(unsafe { Stdio::from_raw_fd(fd) })
+        };
+        cmd.stdin(dup()?).stdout(dup()?).stderr(dup()?);
+        // SAFETY: runs between fork and exec in the child and only calls
+        // async-signal-safe functions (`setsid`, `ioctl`).
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(last_error());
+                }
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(last_error());
+                }
+                Ok(())
+            });
+        }
+        cmd.spawn()
+    }
+
+    /// Reruns this test executable as a child on this terminal, running
+    /// only `test` (a full path such as `pty_children::child_entry`) with
+    /// `mode` in the environment. The test decides what to do from the
+    /// mode; see `crate::pty_children`.
+    pub(crate) fn spawn_self(&self, test: &str, mode: &str) -> io::Result<Child> {
+        let exe = std::env::current_exe()?;
+        self.spawn(
+            Command::new(exe)
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD_MODE, mode),
+        )
+    }
+}
+
+/// The environment variable that tells a re-run test executable which
+/// scenario to play out.
+pub(crate) const CHILD_MODE: &str = "CREWTUI_PTY_CHILD";
+
+/// Waits for `child` to exit, up to `limit`. `None` means it is still running.
+pub(crate) fn wait_timeout(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => return None,
+        }
+    }
+}
+
 impl Drop for Pty {
     fn drop(&mut self) {
         // SAFETY: both descriptors were opened by `open` and are closed once.
         unsafe {
-            libc::close(self.master);
+            if self.master >= 0 {
+                libc::close(self.master);
+            }
             libc::close(self.slave);
         }
     }
@@ -375,4 +453,95 @@ pub(crate) fn write_fd(fd: RawFd, bytes: &[u8]) {
     // SAFETY: the pointer and length come from a live slice.
     let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
     assert_eq!(n, bytes.len() as isize, "short write to the pty");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn sh(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    #[test]
+    fn a_child_that_leaves_the_terminal_alone_leaves_termios_unchanged() {
+        let pty = Pty::open();
+        let original = pty.termios();
+        let mut child = pty.spawn(&mut sh("true")).unwrap();
+        let status = wait_timeout(&mut child, Duration::from_secs(10)).expect("still running");
+        assert!(status.success());
+        assert!(same(&pty.termios(), &original));
+    }
+
+    #[test]
+    fn a_child_that_leaves_the_terminal_raw_is_caught() {
+        // The failure the safety tests exist to catch, produced on purpose.
+        let pty = Pty::open();
+        let original = pty.termios();
+        let mut child = pty.spawn(&mut sh("stty raw -echo")).unwrap();
+        wait_timeout(&mut child, Duration::from_secs(10)).expect("still running");
+        assert!(!same(&pty.termios(), &original));
+        assert!(pty.is_raw());
+    }
+
+    #[test]
+    fn bytes_typed_at_the_master_reach_the_child_and_its_output_comes_back() {
+        let pty = Pty::open();
+        let mut child = pty.spawn(&mut sh("read x; echo got:$x")).unwrap();
+        write_fd(pty.master, b"hi\n");
+        wait_timeout(&mut child, Duration::from_secs(10)).expect("still running");
+        let out = String::from_utf8_lossy(&pty.output()).into_owned();
+        assert!(out.contains("got:hi"), "{out:?}");
+    }
+
+    #[test]
+    fn output_from_a_child_can_be_replayed_into_the_screen_model() {
+        let pty = Pty::open();
+        pty.set_size(20, 3);
+        let mut child = pty
+            .spawn(&mut sh(r"printf '\033[2J\033[1;1Hhello \033[2;3Hworld'"))
+            .unwrap();
+        wait_timeout(&mut child, Duration::from_secs(10)).expect("still running");
+        let mut screen = Screen::new(20, 3);
+        screen.feed(&pty.output());
+        assert_eq!(screen.row(0).trim_end(), "hello");
+        assert_eq!(screen.row(1).trim_end(), "  world");
+    }
+
+    #[test]
+    fn closing_the_master_hangs_the_child_up() {
+        let mut pty = Pty::open();
+        let mut child = pty.spawn(&mut sh("sleep 30")).unwrap();
+        // Let it start, so the signal isn't sent to a process still forking.
+        assert!(wait_timeout(&mut child, Duration::from_millis(100)).is_none());
+        pty.close_master();
+        let status = wait_timeout(&mut child, Duration::from_secs(10))
+            .expect("the child ignored the hangup");
+        assert_eq!(status.signal(), Some(libc::SIGHUP));
+    }
+
+    #[test]
+    fn waiting_for_a_child_that_keeps_running_times_out() {
+        let pty = Pty::open();
+        let mut child = pty.spawn(&mut sh("sleep 30")).unwrap();
+        assert!(wait_timeout(&mut child, Duration::from_millis(100)).is_none());
+        child.kill().unwrap();
+        assert!(wait_timeout(&mut child, Duration::from_secs(10)).is_some());
+    }
+
+    #[test]
+    fn this_executable_can_be_rerun_as_a_child_on_a_terminal() {
+        let pty = Pty::open();
+        let mut child = pty
+            .spawn_self("pty_children::child_entry", "hello")
+            .unwrap();
+        let status =
+            wait_timeout(&mut child, Duration::from_secs(30)).expect("the child never finished");
+        assert!(status.success(), "{status:?}");
+        let out = String::from_utf8_lossy(&pty.output()).into_owned();
+        assert!(out.contains("hello from the child"), "{out:?}");
+    }
 }
