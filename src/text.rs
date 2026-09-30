@@ -7,8 +7,12 @@
 //!
 //! Control characters, including tabs, have zero width and are not drawn.
 
+use std::borrow::Cow;
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+use crate::Style;
 
 /// Columns a single grapheme cluster occupies: 0, 1 or 2.
 pub(crate) fn grapheme_width(g: &str) -> usize {
@@ -65,6 +69,222 @@ pub fn wrap(s: &str, cols: usize) -> Vec<&str> {
         lines.push(&raw[start..]);
     }
     lines
+}
+
+/// Where text sits between the left and right edge of the space it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HorizontalAlign {
+    /// Against the left edge.
+    #[default]
+    Left,
+    /// In the middle. An odd extra cell goes on the right.
+    Center,
+    /// Against the right edge.
+    Right,
+}
+
+/// A piece of text with one style.
+///
+/// The content is a [`Cow`], so text that already lives in the app's state
+/// can be drawn without copying it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Span<'a> {
+    /// The text.
+    pub content: Cow<'a, str>,
+    /// The style applied to it.
+    pub style: Style,
+}
+
+impl<'a> Span<'a> {
+    /// Text with no style of its own.
+    pub fn raw(content: impl Into<Cow<'a, str>>) -> Self {
+        Span {
+            content: content.into(),
+            style: Style::new(),
+        }
+    }
+
+    /// Text with `style`.
+    pub fn styled(content: impl Into<Cow<'a, str>>, style: Style) -> Self {
+        Span {
+            content: content.into(),
+            style,
+        }
+    }
+
+    /// The same text with `style` layered over its current one.
+    pub fn style(mut self, style: Style) -> Self {
+        self.style = self.style.patch(style);
+        self
+    }
+
+    /// Columns the text takes.
+    pub fn width(&self) -> usize {
+        width(&self.content)
+    }
+}
+
+impl<'a> From<&'a str> for Span<'a> {
+    fn from(s: &'a str) -> Self {
+        Span::raw(s)
+    }
+}
+
+impl From<String> for Span<'_> {
+    fn from(s: String) -> Self {
+        Span::raw(s)
+    }
+}
+
+/// A row of spans. It never wraps by itself; a [`Paragraph`] decides that.
+///
+/// [`Paragraph`]: crate::widgets::Paragraph
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Line<'a> {
+    /// The pieces, left to right.
+    pub spans: Vec<Span<'a>>,
+    /// A style applied under every span.
+    pub style: Style,
+    /// Overrides the paragraph's alignment for this line.
+    pub alignment: Option<HorizontalAlign>,
+}
+
+impl<'a> Line<'a> {
+    /// A line of unstyled text.
+    pub fn raw(content: impl Into<Cow<'a, str>>) -> Self {
+        Line::from(Span::raw(content))
+    }
+
+    /// The same line with `style` layered under its spans.
+    pub fn style(mut self, style: Style) -> Self {
+        self.style = self.style.patch(style);
+        self
+    }
+
+    /// Sets the alignment of this line.
+    pub fn align(mut self, alignment: HorizontalAlign) -> Self {
+        self.alignment = Some(alignment);
+        self
+    }
+
+    /// Columns the whole line takes.
+    pub fn width(&self) -> usize {
+        self.spans.iter().map(Span::width).sum()
+    }
+}
+
+impl<'a> From<Span<'a>> for Line<'a> {
+    fn from(span: Span<'a>) -> Self {
+        Line {
+            spans: vec![span],
+            ..Line::default()
+        }
+    }
+}
+
+impl<'a> From<Vec<Span<'a>>> for Line<'a> {
+    fn from(spans: Vec<Span<'a>>) -> Self {
+        Line {
+            spans,
+            ..Line::default()
+        }
+    }
+}
+
+impl<'a> From<&'a str> for Line<'a> {
+    fn from(s: &'a str) -> Self {
+        Line::raw(s)
+    }
+}
+
+impl From<String> for Line<'_> {
+    fn from(s: String) -> Self {
+        Line::raw(s)
+    }
+}
+
+/// Several lines.
+///
+/// Built from a string, it splits on `\n` (and `\r\n`), and a trailing
+/// newline leaves an empty last line, as in an editor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Text<'a> {
+    /// The lines, top to bottom.
+    pub lines: Vec<Line<'a>>,
+    /// A style applied under every line.
+    pub style: Style,
+}
+
+impl<'a> Text<'a> {
+    /// Text split into lines at each newline.
+    pub fn raw(content: impl Into<Cow<'a, str>>) -> Self {
+        let lines = match content.into() {
+            Cow::Borrowed(s) => s
+                .split('\n')
+                .map(|l| Line::raw(l.strip_suffix('\r').unwrap_or(l)))
+                .collect(),
+            Cow::Owned(s) => s
+                .split('\n')
+                .map(|l| Line::raw(l.strip_suffix('\r').unwrap_or(l).to_owned()))
+                .collect(),
+        };
+        Text {
+            lines,
+            style: Style::new(),
+        }
+    }
+
+    /// The same text with `style` layered under its lines.
+    pub fn style(mut self, style: Style) -> Self {
+        self.style = self.style.patch(style);
+        self
+    }
+
+    /// Number of lines, before any wrapping.
+    pub fn height(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Columns of the widest line.
+    pub fn width(&self) -> usize {
+        self.lines.iter().map(Line::width).max().unwrap_or(0)
+    }
+}
+
+impl<'a> From<&'a str> for Text<'a> {
+    fn from(s: &'a str) -> Self {
+        Text::raw(s)
+    }
+}
+
+impl From<String> for Text<'_> {
+    fn from(s: String) -> Self {
+        Text::raw(s)
+    }
+}
+
+impl<'a> From<Line<'a>> for Text<'a> {
+    fn from(line: Line<'a>) -> Self {
+        Text {
+            lines: vec![line],
+            style: Style::new(),
+        }
+    }
+}
+
+impl<'a> From<Span<'a>> for Text<'a> {
+    fn from(span: Span<'a>) -> Self {
+        Text::from(Line::from(span))
+    }
+}
+
+impl<'a> From<Vec<Line<'a>>> for Text<'a> {
+    fn from(lines: Vec<Line<'a>>) -> Self {
+        Text {
+            lines,
+            style: Style::new(),
+        }
+    }
 }
 
 #[cfg(test)]
