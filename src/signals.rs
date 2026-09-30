@@ -114,7 +114,7 @@ extern "C" fn handler(sig: libc::c_int) {
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-fn new_pipe() -> io::Result<(RawFd, RawFd)> {
+pub(crate) fn new_pipe() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `fds` has room for the two descriptors `pipe2` writes. Both
     // flags are set atomically, so no other thread can fork in between and
@@ -133,7 +133,7 @@ fn new_pipe() -> io::Result<(RawFd, RawFd)> {
     target_os = "openbsd",
     target_os = "dragonfly"
 )))]
-fn new_pipe() -> io::Result<(RawFd, RawFd)> {
+pub(crate) fn new_pipe() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `fds` has room for the two descriptors `pipe` writes; `fcntl`
     // works on descriptors we just created. There is no `pipe2` here, so a
@@ -291,17 +291,18 @@ impl Drop for Signals {
     }
 }
 
+/// Handlers are per process, so tests anywhere in the crate that install
+/// them take this lock and run one at a time.
+#[cfg(test)]
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, PoisonError};
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, PoisonError};
-
-    /// Handlers are per process, so tests that install them run one at a time.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
-    }
 
     fn raise(sig: libc::c_int) {
         // SAFETY: `raise` takes a signal number and has no other preconditions.

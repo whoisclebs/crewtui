@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, PoisonError};
 use std::thread::{self, ThreadId};
 
-fn last_error() -> io::Error {
+pub(crate) fn last_error() -> io::Error {
     io::Error::last_os_error()
 }
 
@@ -22,7 +22,7 @@ fn is_tty(fd: RawFd) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
-fn get_termios(fd: RawFd) -> io::Result<libc::termios> {
+pub(crate) fn get_termios(fd: RawFd) -> io::Result<libc::termios> {
     let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
     // SAFETY: `t` is valid for writes of a `termios`; it is only read after
     // `tcgetattr` reports success, which means it filled the struct in.
@@ -180,6 +180,15 @@ impl State {
         Ok(())
     }
 
+    /// Sets raw mode and the requested modes again on a terminal that is
+    /// still registered, in case something else changed them.
+    fn reapply(&self) -> io::Result<()> {
+        let mut raw = self.original;
+        make_raw(&mut raw);
+        set_termios(self.input, libc::TCSAFLUSH, &raw)?;
+        write_all_fd(self.output, &enable_sequence(&self.options))
+    }
+
     /// Undoes everything `activate` did. Only the first call does any work.
     fn restore(self: &Arc<Self>) -> io::Result<()> {
         if self.restored.swap(true, Ordering::SeqCst) {
@@ -307,16 +316,18 @@ impl Terminal {
         self.state.restore()
     }
 
-    /// Goes back to raw mode and the requested screen modes after the
-    /// terminal was restored, for instance by the panic hook when the app
-    /// caught the panic and carries on. Does nothing while the terminal is
-    /// active. The next frame has to repaint everything, so call
-    /// `Renderer::invalidate` too.
+    /// Goes back to raw mode and the requested screen modes. Use it after
+    /// the terminal was restored, for instance by the panic hook when the
+    /// app caught the panic and carries on, and after the process was
+    /// stopped and continued, since a shell may have reset the tty while it
+    /// was stopped. It is safe to call when nothing needs redoing. The next
+    /// frame has to repaint everything, so call `Renderer::invalidate` too.
     pub fn resume(&mut self) -> io::Result<()> {
         if self.state.restored.load(Ordering::SeqCst) {
-            self.state.activate()?;
+            self.state.activate()
+        } else {
+            self.state.reapply()
         }
-        Ok(())
     }
 }
 
@@ -358,88 +369,7 @@ impl std::fmt::Debug for Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CStr;
-    use std::os::fd::RawFd;
-
-    /// A pseudo-terminal pair: the app side is `slave`, the test reads what
-    /// the app wrote from `master`.
-    struct Pty {
-        master: RawFd,
-        slave: RawFd,
-    }
-
-    static OPEN: Mutex<()> = Mutex::new(());
-
-    impl Pty {
-        fn open() -> Pty {
-            let _guard = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
-            // SAFETY: plain libc calls; `ptsname` returns a pointer into a
-            // static buffer, which the lock above keeps other threads from
-            // overwriting until it is copied and used.
-            unsafe {
-                let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-                assert!(master >= 0, "posix_openpt: {}", last_error());
-                assert_eq!(libc::grantpt(master), 0);
-                assert_eq!(libc::unlockpt(master), 0);
-                let name = CStr::from_ptr(libc::ptsname(master)).to_owned();
-                let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
-                assert!(slave >= 0, "open slave: {}", last_error());
-                let flags = libc::fcntl(master, libc::F_GETFL);
-                libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                Pty { master, slave }
-            }
-        }
-
-        /// Everything the app has written so far.
-        fn output(&self) -> Vec<u8> {
-            let mut out = Vec::new();
-            loop {
-                let mut pfd = libc::pollfd {
-                    fd: self.master,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: `pfd` is valid for one entry; `buf` for its length.
-                unsafe {
-                    if libc::poll(&mut pfd, 1, 100) <= 0 {
-                        return out;
-                    }
-                    let mut buf = [0u8; 512];
-                    let n = libc::read(self.master, buf.as_mut_ptr().cast(), buf.len());
-                    if n <= 0 {
-                        return out;
-                    }
-                    out.extend_from_slice(&buf[..n as usize]);
-                }
-            }
-        }
-
-        fn termios(&self) -> libc::termios {
-            get_termios(self.slave).unwrap()
-        }
-
-        fn is_raw(&self) -> bool {
-            self.termios().c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG) == 0
-        }
-    }
-
-    impl Drop for Pty {
-        fn drop(&mut self) {
-            // SAFETY: both descriptors were opened by `open` and are closed once.
-            unsafe {
-                libc::close(self.master);
-                libc::close(self.slave);
-            }
-        }
-    }
-
-    fn same(a: &libc::termios, b: &libc::termios) -> bool {
-        a.c_iflag == b.c_iflag
-            && a.c_oflag == b.c_oflag
-            && a.c_cflag == b.c_cflag
-            && a.c_lflag == b.c_lflag
-            && a.c_cc == b.c_cc
-    }
+    use crate::testing::{Pty, same};
 
     fn enter(pty: &Pty, options: TerminalOptions) -> Terminal {
         Terminal::enter_on(pty.slave, pty.slave, options).unwrap()
@@ -575,8 +505,23 @@ mod tests {
         term.resume().unwrap();
         assert!(pty.is_raw());
         assert_eq!(pty.output(), ALL_ON);
+        drop(term);
+        assert!(same(&pty.termios(), &original));
+        assert_eq!(pty.output(), ALL_OFF);
+    }
+
+    #[test]
+    fn resume_reasserts_raw_mode_when_something_else_undid_it() {
+        // A shell resetting the tty while the process is stopped.
+        let pty = Pty::open();
+        let original = pty.termios();
+        let mut term = enter(&pty, ALL);
+        pty.output();
+        set_termios(pty.slave, libc::TCSANOW, &original).unwrap();
+        assert!(!pty.is_raw());
         term.resume().unwrap();
-        assert!(pty.output().is_empty());
+        assert!(pty.is_raw());
+        assert_eq!(pty.output(), ALL_ON);
         drop(term);
         assert!(same(&pty.termios(), &original));
         assert_eq!(pty.output(), ALL_OFF);
