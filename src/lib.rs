@@ -4,6 +4,7 @@
 mod buffer;
 mod geometry;
 mod style;
+pub mod text;
 
 pub use buffer::{Buffer, Cell};
 pub use geometry::Rect;

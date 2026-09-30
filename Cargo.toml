@@ -8,6 +8,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/whoisclebs/crewtui"
 
 [dependencies]
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
 
 [lints.rust]
 unsafe_code = "deny"
