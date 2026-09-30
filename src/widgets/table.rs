@@ -286,8 +286,13 @@ impl StatefulWidget for Table<'_> {
             height: area.bottom() - y,
             ..area
         };
-        if body.is_empty() || self.rows.is_empty() {
+        if self.rows.is_empty() {
             state.offset.set(0);
+            return;
+        }
+        if body.is_empty() {
+            // The header takes the whole area. Keep the scroll position for
+            // when there is room again.
             return;
         }
 
@@ -537,6 +542,22 @@ mod tests {
         state.select(Some(50));
         let out = draw(Table::new(files(3), WIDTHS), &state, 10, 5);
         assert!(out[2].starts_with("> f2"), "{out:?}");
+    }
+
+    #[test]
+    fn squeezing_the_table_to_nothing_keeps_the_scroll_position() {
+        let mut state = TableState::new();
+        state.select(Some(15));
+        let table = || Table::new(files(20), WIDTHS).header(Row::new(["n", "s"]));
+        draw(table(), &state, 12, 6);
+        assert_eq!(state.offset(), 11);
+        state.select(Some(12));
+        draw(table(), &state, 12, 6);
+        assert_eq!(state.offset(), 11);
+        // Only the header fits, then the table comes back.
+        draw(table(), &state, 12, 1);
+        draw(table(), &state, 12, 6);
+        assert_eq!(state.offset(), 11);
     }
 
     #[test]
