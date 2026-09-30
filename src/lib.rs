@@ -36,6 +36,15 @@ extern crate self as crewtui;
 #[path = "../examples/agent.rs"]
 mod agent_example;
 
+// The README and the getting-started guide are compiled as doctests, so their
+// code can't drift from the API.
+#[cfg(all(doctest, unix))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+#[cfg(all(doctest, unix))]
+#[doc = include_str!("../docs/getting-started.md")]
+struct GettingStartedDoctests;
+
 pub use buffer::{Buffer, Cell};
 #[cfg(unix)]
 pub use effects::{Closed, Sender};
