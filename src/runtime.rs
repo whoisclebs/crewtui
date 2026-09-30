@@ -3,6 +3,7 @@
 use std::fmt;
 use std::io::{self, Write};
 use std::os::fd::RawFd;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -136,7 +137,8 @@ impl<M: Send + 'static> Cmd<M> {
     ///
     /// At most eight jobs run at once; the rest wait their turn, so a job
     /// that blocks for a long time occupies one of those slots. A job that
-    /// panics produces no message.
+    /// panics produces no message; see [`Cmd::perform_catching`] for one that
+    /// does.
     pub fn perform(work: impl FnOnce() -> M + Send + 'static) -> Self {
         Cmd {
             kind: CmdKind::Perform(Box::new(work)),
@@ -152,6 +154,38 @@ impl<M: Send + 'static> Cmd<M> {
         Cmd {
             kind: CmdKind::Spawn(Box::new(work)),
         }
+    }
+
+    /// Like [`Cmd::perform`], but a panic in `work` becomes a message too:
+    /// `on_panic` gets the text of the panic and returns what `update` sees.
+    /// Without it a job that panics leaves the app waiting for a reply that
+    /// never comes.
+    ///
+    /// The default panic hook still prints the panic message where the app
+    /// is drawn. Use `on_panic` to show it properly.
+    pub fn perform_catching(
+        work: impl FnOnce() -> M + Send + 'static,
+        on_panic: impl FnOnce(String) -> M + Send + 'static,
+    ) -> Self {
+        Cmd::perform(move || match catch_unwind(AssertUnwindSafe(work)) {
+            Ok(message) => message,
+            Err(payload) => on_panic(panic_text(payload.as_ref())),
+        })
+    }
+
+    /// Like [`Cmd::spawn`], but a panic in `work` is sent to `update` as the
+    /// message `on_panic` makes from its text. Messages sent before the
+    /// panic have arrived as usual.
+    pub fn spawn_catching(
+        work: impl FnOnce(Sender<M>) + Send + 'static,
+        on_panic: impl FnOnce(String) -> M + Send + 'static,
+    ) -> Self {
+        Cmd::spawn(move |tx| {
+            let report = tx.clone();
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(move || work(tx))) {
+                let _ = report.send(on_panic(panic_text(payload.as_ref())));
+            }
+        })
     }
 
     /// Sends `message` to `update` after `delay`.
@@ -207,6 +241,17 @@ fn run_cmd<M: Send + 'static>(cmd: Cmd<M>, effects: &Effects<M>) -> Requests {
         }
     }
     requests
+}
+
+/// The text of a panic payload: what `panic!` was given, when it was a string.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a job panicked".to_owned()
+    }
 }
 
 /// Everything the loop can be woken by.
@@ -963,6 +1008,7 @@ mod tests {
         Start,
         Got(u32),
         Done,
+        Failed(String),
     }
 
     type Script = Box<dyn FnMut(&Fx) -> Cmd<Fx>>;
@@ -1014,6 +1060,70 @@ mod tests {
     }
 
     #[test]
+    fn perform_catching_turns_a_panic_into_a_message_and_passes_a_result_through() {
+        let app = Scripted::new(|m| match m {
+            Fx::Start => Cmd::batch([
+                Cmd::perform_catching(|| panic!("disk on fire"), Fx::Failed),
+                Cmd::perform_catching(|| Fx::Got(5), Fx::Failed),
+                Cmd::perform_catching(
+                    || std::panic::panic_any(42_u8),
+                    |text| Fx::Failed(format!("other: {text}")),
+                ),
+            ]),
+            Fx::Failed(_) | Fx::Got(_) => Cmd::none(),
+            Fx::Done => Cmd::quit(),
+        });
+        let (tx, rx) = channel();
+        tx.send(Input::Message(Fx::Start)).unwrap();
+        let effects = Effects::new(tx.clone());
+        // Quits once all three answered.
+        let handle = spawn_driver(tx.clone(), move |tx| {
+            thread::sleep(Duration::from_millis(300));
+            tx.send(Input::Message(Fx::Done)).unwrap();
+        });
+        let app = event_loop(app, &rx, &effects, &mut FakeHost::new(20, 3), 0).unwrap();
+        handle.join().unwrap();
+        let mut log: Vec<String> = app.log.iter().map(|m| format!("{m:?}")).collect();
+        log.sort();
+        assert_eq!(
+            log,
+            [
+                r#"Done"#,
+                r#"Failed("disk on fire")"#,
+                r#"Failed("other: a job panicked")"#,
+                r#"Got(5)"#,
+                r#"Start"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn spawn_catching_delivers_what_was_sent_before_the_panic_and_then_the_failure() {
+        let app = Scripted::new(|m| match m {
+            Fx::Start => Cmd::spawn_catching(
+                |tx| {
+                    tx.send(Fx::Got(1)).unwrap();
+                    tx.send(Fx::Got(2)).unwrap();
+                    panic!("stream broke");
+                },
+                Fx::Failed,
+            ),
+            Fx::Failed(_) => Cmd::quit(),
+            Fx::Got(_) | Fx::Done => Cmd::none(),
+        });
+        let app = drive(app, &mut FakeHost::new(20, 3));
+        assert_eq!(
+            app.log,
+            vec![
+                Fx::Start,
+                Fx::Got(1),
+                Fx::Got(2),
+                Fx::Failed("stream broke".to_owned())
+            ]
+        );
+    }
+
+    #[test]
     fn perform_runs_blocking_work_off_the_loop_and_returns_its_result_as_a_message() {
         let app = Scripted::new(|m| match m {
             Fx::Start => Cmd::perform(|| {
@@ -1021,7 +1131,7 @@ mod tests {
                 Fx::Got(7)
             }),
             Fx::Got(_) => Cmd::quit(),
-            Fx::Done => Cmd::none(),
+            Fx::Done | Fx::Failed(_) => Cmd::none(),
         });
         let app = drive(app, &mut FakeHost::new(20, 3));
         assert_eq!(app.log, vec![Fx::Start, Fx::Got(7)]);
@@ -1040,7 +1150,7 @@ mod tests {
                 seen += 1;
                 if seen == 3 { Cmd::quit() } else { Cmd::none() }
             }
-            Fx::Done => Cmd::none(),
+            Fx::Done | Fx::Failed(_) => Cmd::none(),
         });
         let mut app = drive(app, &mut FakeHost::new(20, 3));
         assert_eq!(app.log.remove(0), Fx::Start);
@@ -1103,7 +1213,7 @@ mod tests {
                 Cmd::after(Duration::from_millis(20), Fx::Got(1)),
                 Cmd::after(Duration::from_millis(140), Fx::Done),
             ]),
-            Fx::Done => Cmd::quit(),
+            Fx::Done | Fx::Failed(_) => Cmd::quit(),
             Fx::Got(_) => Cmd::none(),
         });
         let started = Instant::now();
@@ -1124,7 +1234,7 @@ mod tests {
                     Cmd::quit()
                 }
             }
-            Fx::Done => Cmd::none(),
+            Fx::Done | Fx::Failed(_) => Cmd::none(),
         });
         let app = drive(app, &mut FakeHost::new(20, 3));
         assert_eq!(app.log.len(), 5);
@@ -1138,7 +1248,7 @@ mod tests {
         let (frames_tx, frames) = channel();
         let mut app = Scripted::new(|m| match m {
             Fx::Start => Cmd::repaint(),
-            Fx::Done => Cmd::quit(),
+            Fx::Done | Fx::Failed(_) => Cmd::quit(),
             Fx::Got(_) => Cmd::none(),
         });
         app.frames = Some(frames_tx);
@@ -1165,7 +1275,7 @@ mod tests {
                 }
                 tx.send(Fx::Done).unwrap();
             }),
-            Fx::Done => Cmd::quit(),
+            Fx::Done | Fx::Failed(_) => Cmd::quit(),
             Fx::Got(_) => Cmd::none(),
         });
         let app = drive(app, &mut FakeHost::new(20, 3));
@@ -1236,7 +1346,7 @@ mod tests {
                 Cmd::after(Duration::from_millis(20), Fx::Got(1)),
             ]),
             Fx::Got(_) => Cmd::quit(),
-            Fx::Done => Cmd::none(),
+            Fx::Done | Fx::Failed(_) => Cmd::none(),
         });
         let app = drive(app, &mut FakeHost::new(20, 3));
         assert_eq!(app.log, vec![Fx::Start, Fx::Got(1)]);
