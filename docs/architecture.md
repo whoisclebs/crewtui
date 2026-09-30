@@ -47,7 +47,7 @@ The main thread blocks in one place, a channel receiver. The reader thread waits
 
 When something changes, the loop draws, but no more than `max_fps` times a second. It applies everything that is already waiting before it draws, so a burst of messages costs one frame. Quitting doesn't draw a last frame.
 
-Signals are turned into loop behavior in one place. SIGWINCH resizes the renderer, which repaints, and gives the app an `Event::Resize`. SIGTSTP, sent from outside, restores the terminal and stops the process, so the shell that gets control back is usable; the loop takes the terminal again and repaints once it is continued. SIGCONT re-enters raw mode and invalidates the renderer. SIGINT, SIGTERM and SIGHUP end the run with an `Interrupted` error that wraps the signal, and the terminal is restored on the way out like on any other exit. Ctrl+C typed in raw mode is not a signal: it reaches the app as a key event, and the app decides whether it quits.
+Signals are turned into loop behavior in one place. This is the Unix description; the Windows console is below. SIGWINCH resizes the renderer, which repaints, and gives the app an `Event::Resize`. SIGTSTP, sent from outside, restores the terminal and stops the process, so the shell that gets control back is usable; the loop takes the terminal again and repaints once it is continued. SIGCONT re-enters raw mode and invalidates the renderer. SIGINT, SIGTERM and SIGHUP end the run with an `Interrupted` error that wraps the signal, and the terminal is restored on the way out like on any other exit. Ctrl+C typed in raw mode is not a signal: it reaches the app as a key event, and the app decides whether it quits.
 
 The loop itself is a function over a small `Host` trait (write bytes, report the size, resume raw mode). That is what lets the tests drive it without a terminal, with one test that runs a real `Program` on a pty.
 
@@ -74,3 +74,17 @@ The unit of the buffer is a grapheme cluster, not a `char` or a byte, and its wi
 `Terminal` enters raw mode and the modes selected in `TerminalOptions` (alternate screen, hidden cursor, mouse, focus reports, bracketed paste) and undoes them when it is dropped, so early returns and `?` restore the terminal too. Restoring is idempotent and reports the first error it hits without skipping the rest of the steps. A panic hook restores the terminal of the panicking thread before the message is printed, so the message lands on the normal screen and not the alternate one. SIGINT, SIGTERM and SIGHUP end the run with an error and the same restore (see the loop above).
 
 The tests for all of this run a real child process on a pty and check the terminal modes and the termios settings afterwards; see [testing](testing.md).
+
+## Windows
+
+The Windows backend puts the console in virtual terminal mode: escape sequences on output, and escape sequences on input, both in UTF-8. The renderer, the parser and the loop are the same code as on Unix. What differs is `terminal_windows.rs` (console modes and their restore), `reader_windows.rs`, `signals_windows.rs`, `utf16.rs` for the input, and the `cfg` split in `Program::run`.
+
+The reader waits on a wake-up event, the console input and the signal event with `WaitForMultipleObjects`. The wake-up event comes first, because the wait returns the lowest handle that is set and a stream of input would otherwise keep it from being seen. The console reports each character of an escape sequence as its own key record; the reader turns them back into UTF-8 bytes (`utf16.rs` joins surrogate pairs that arrive split) and feeds the same `Parser`.
+
+The console only reports a change of the screen buffer, not of the window on it. With the alternate screen the two are the same. Without it, in the classic console, the buffer is thousands of rows tall and a taller or shorter window makes no record, so the reader also looks at the window size every 250 ms and sends `Signal::Resize` when it changed.
+
+Console control events are the signals. Ctrl+Break and closing the window end the run with the same `Interrupted` error as on Unix. Logging off and shutting down do too, but Windows only delivers them to services, and not at all to a process that has loaded user32 or gdi32. Windows ends the process when the handler for a close returns, so the handler sleeps for four seconds and the loop restores the console meanwhile. If the program exits earlier the process ends earlier, and work after `run` returns is cut off at four seconds. Ctrl+C typed in raw mode is a key, as on Unix. There is no job control, so Ctrl+Z is just a key and nothing suspends the process.
+
+The event the handler sets is created once and never closed. The handler can be running on a thread of the system while it is removed, and removing it does not wait for it. `Program::run` installs the handler first and holds it until the console is restored, on a panic too.
+
+The pty tests only run on Unix. The Windows job in CI runs the tests that don't need a terminal: the UTF-16 decoder, the control handler and the conversion of console records to bytes.

@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::fd::RawFd;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -292,6 +293,7 @@ impl Host for Terminal {
         Ok(true)
     }
 
+    #[cfg(unix)]
     fn suspend(&mut self) -> io::Result<()> {
         self.restore()?;
         let continued = Signals::stop_process()?;
@@ -299,6 +301,12 @@ impl Host for Terminal {
         // The continue signal that woke the process reaches the loop next.
         // It has nothing left to do.
         self.skip_continue = continued;
+        Ok(())
+    }
+
+    /// The console has no job control, so nothing asks for this.
+    #[cfg(windows)]
+    fn suspend(&mut self) -> io::Result<()> {
         Ok(())
     }
 
@@ -387,10 +395,42 @@ impl<A: App> Program<A> {
     /// [`io::ErrorKind::Interrupted`] error that wraps the [`Signal`]. Ctrl+C
     /// typed in raw mode is a key event instead, and the app decides what
     /// it does.
+    ///
+    #[cfg(unix)]
     pub fn run(self) -> io::Result<A> {
         self.run_on(libc::STDIN_FILENO, libc::STDOUT_FILENO, true)
     }
 
+    /// Runs until the app quits.
+    ///
+    /// Ctrl+Break and the console window being closed from outside end the
+    /// run with an [`io::ErrorKind::Interrupted`] error that wraps the
+    /// [`Signal`]. Logging off and shutting down do too, when Windows
+    /// delivers them, which it does only to services. Ctrl+C typed in raw mode is a key
+    /// event instead, and the app decides what it does.
+    #[cfg(windows)]
+    pub fn run(self) -> io::Result<A> {
+        // The handler goes in first and comes out last, like on Unix. Locals
+        // drop in the opposite order to how they are declared, on a panic as
+        // well, so the console is restored before the handler is removed.
+        let _signals = Signals::install()?;
+        let mut terminal = Terminal::enter(self.options)?;
+        let reader = InputReader::spawn(
+            terminal.input_handle(),
+            terminal.output_handle(),
+            Some(crate::signals::event()?),
+            self.tx.clone(),
+            self.options.keyboard_enhancement,
+        )?;
+        let effects = Effects::new(self.tx);
+        let result = event_loop(self.app, &self.rx, &effects, &mut terminal, self.max_fps);
+        drop(reader);
+        drop(effects);
+        drop(terminal);
+        result
+    }
+
+    #[cfg(unix)]
     pub(crate) fn run_on(self, input: RawFd, output: RawFd, signals: bool) -> io::Result<A> {
         // The handlers go in first and come out last, so a signal that
         // arrives while the terminal is being restored is still delivered
@@ -551,7 +591,9 @@ pub(crate) fn event_loop<A: App, H: Host>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{Pty, Screen, drain_fd, same, write_fd};
+    use crate::testing::Screen;
+    #[cfg(unix)]
+    use crate::testing::{Pty, drain_fd, same, write_fd};
     use crate::{KeyCode, KeyEvent, KeyModifiers, Rect, Style};
     use std::cell::{Cell as StdCell, RefCell};
     use std::collections::VecDeque;
@@ -1378,6 +1420,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_program_sender_reaches_update_from_other_threads_before_and_during_the_run() {
         let pty = Pty::open();
@@ -1417,6 +1460,7 @@ mod tests {
         assert_eq!(app.n, 1001);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_program_runs_on_a_real_pty_and_restores_the_terminal() {
         let pty = Pty::open();

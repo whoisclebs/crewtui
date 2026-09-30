@@ -4,27 +4,37 @@
 #[cfg(all(test, unix))]
 mod agent_tests;
 mod buffer;
-#[cfg(unix)]
 mod effects;
 mod frame;
 mod geometry;
 mod input;
 mod layout;
+mod options;
 #[cfg(all(test, unix))]
 mod pty_children;
 #[cfg(unix)]
 mod reader;
+#[cfg(windows)]
+#[path = "reader_windows.rs"]
+mod reader;
 mod render;
-#[cfg(unix)]
 mod runtime;
+mod signal;
 #[cfg(unix)]
+mod signals;
+#[cfg(windows)]
+#[path = "signals_windows.rs"]
 mod signals;
 mod style;
 #[cfg(unix)]
 mod terminal;
+#[cfg(windows)]
+#[path = "terminal_windows.rs"]
+mod terminal;
 #[cfg(test)]
 mod testing;
 pub mod text;
+mod utf16;
 pub mod widgets;
 
 // The reference app is built as an example, and also compiled here so the
@@ -46,7 +56,6 @@ struct ReadmeDoctests;
 struct GettingStartedDoctests;
 
 pub use buffer::{Buffer, Cell};
-#[cfg(unix)]
 pub use effects::{Closed, Sender};
 pub use frame::Frame;
 pub use geometry::Rect;
@@ -55,21 +64,17 @@ pub use input::{
     Parser,
 };
 pub use layout::{Constraint, Edges, Justify, Layout};
+pub use options::TerminalOptions;
 pub use render::Renderer;
-#[cfg(unix)]
 pub use runtime::{App, Cmd, Program, run};
-#[cfg(unix)]
-pub use signals::Signal;
-#[cfg(unix)]
+pub use signal::Signal;
 pub(crate) use signals::Signals;
 pub use style::{Color, Modifier, Style};
-#[cfg(unix)]
-pub use terminal::{Terminal, TerminalOptions};
+pub use terminal::Terminal;
 
 /// The names most apps import, in one `use crewtui::prelude::*;`.
 pub mod prelude {
     pub use crate::widgets::{Block, Paragraph, StatefulWidget, Widget};
-    #[cfg(unix)]
     pub use crate::{App, Cmd, Program};
     pub use crate::{Color, Constraint, Event, Frame, KeyCode, KeyEvent, KeyModifiers, Layout};
     pub use crate::{Rect, Style};
