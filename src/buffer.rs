@@ -92,19 +92,19 @@ impl Cell {
     }
 
     /// Layers `style` on top of the current one.
-    pub fn patch_style(&mut self, style: Style) -> &mut Self {
+    pub(crate) fn patch_style(&mut self, style: Style) -> &mut Self {
         self.style = self.style.patch(style);
         self
     }
 
     /// Replaces the style outright.
-    pub fn set_style(&mut self, style: Style) -> &mut Self {
+    pub(crate) fn set_style(&mut self, style: Style) -> &mut Self {
         self.style = style;
         self
     }
 
     /// Back to a blank, unstyled cell.
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         *self = Cell::blank();
     }
 }
@@ -168,8 +168,9 @@ impl Buffer {
         self.index_of(x, y).map(|i| &self.cells[i])
     }
 
-    /// Mutable access to the cell at `(x, y)`.
-    pub fn get_mut(&mut self, x: u16, y: u16) -> Option<&mut Cell> {
+    /// Mutable access to the cell at `(x, y)`. Internal: writes must keep
+    /// wide glyphs intact, so they go through the `Buffer` methods.
+    pub(crate) fn get_mut(&mut self, x: u16, y: u16) -> Option<&mut Cell> {
         self.index_of(x, y).map(|i| &mut self.cells[i])
     }
 
@@ -279,13 +280,22 @@ impl Buffer {
         }
     }
 
-    /// Layers `style` on every cell of `area`, clipped to the buffer.
+    /// Layers `style` on every cell of `area`, clipped to the buffer. A
+    /// terminal can't style the two halves of a wide glyph differently, so
+    /// touching either half styles the whole glyph.
     pub fn set_style(&mut self, area: Rect, style: Style) {
         let area = self.area.intersection(area);
         for y in area.y..area.bottom() {
             for x in area.x..area.right() {
-                if let Some(cell) = self.get_mut(x, y) {
-                    cell.patch_style(style);
+                let other = match self.get(x, y) {
+                    Some(c) if c.is_continuation() => x.checked_sub(1),
+                    Some(_) if self.get(x + 1, y).is_some_and(Cell::is_continuation) => Some(x + 1),
+                    _ => None,
+                };
+                for x in std::iter::once(x).chain(other) {
+                    if let Some(cell) = self.get_mut(x, y) {
+                        cell.patch_style(style);
+                    }
                 }
             }
         }
@@ -506,6 +516,18 @@ mod tests {
         assert_eq!(row_text(&b, 0), "ab  ");
         b.set_string(0, 0, "a\t\u{202e}b", Style::new());
         assert_eq!(row_text(&b, 0), "ab  ");
+    }
+
+    #[test]
+    fn set_style_on_half_a_wide_glyph_styles_both_halves() {
+        for x in [0, 1] {
+            let mut b = Buffer::new(Rect::new(0, 0, 4, 1));
+            b.set_string(0, 0, "中a", Style::new());
+            b.set_style(Rect::new(x, 0, 1, 1), Style::new().bold());
+            assert_eq!(b.get(0, 0).unwrap().style(), Style::new().bold());
+            assert_eq!(b.get(1, 0).unwrap().style(), Style::new().bold());
+            assert_eq!(b.get(2, 0).unwrap().style(), Style::new());
+        }
     }
 
     #[test]
