@@ -1,6 +1,6 @@
 //! What a view draws into.
 
-use crate::widgets::{Input, InputState, StatefulWidget, Widget};
+use crate::widgets::{StatefulWidget, Widget};
 use crate::{Buffer, Rect};
 
 /// The surface [`App::view`](crate::App::view) draws on for one frame.
@@ -33,14 +33,6 @@ impl<'a> Frame<'a> {
         self.cursor
     }
 
-    /// Draws `input` and puts the terminal cursor where its text cursor is.
-    pub fn render_input(&mut self, input: Input<'_>, area: Rect, state: &InputState) {
-        self.render_stateful_widget(input, area, state);
-        if let Some((x, y)) = state.cursor_position() {
-            self.set_cursor(x, y);
-        }
-    }
-
     /// The area of the whole terminal.
     pub fn area(&self) -> Rect {
         self.buffer.area()
@@ -52,7 +44,9 @@ impl<'a> Frame<'a> {
         widget.render(area.intersection(self.buffer.area()), self.buffer);
     }
 
-    /// Draws a widget that keeps `state` between frames, inside `area`.
+    /// Draws a widget that keeps `state` between frames, inside `area`. If
+    /// the widget has a cursor, like an [`Input`](crate::widgets::Input), the
+    /// terminal cursor is placed there.
     pub fn render_stateful_widget<W: StatefulWidget>(
         &mut self,
         widget: W,
@@ -60,6 +54,9 @@ impl<'a> Frame<'a> {
         state: &W::State,
     ) {
         widget.render(area.intersection(self.buffer.area()), self.buffer, state);
+        if let Some((x, y)) = W::cursor(state) {
+            self.set_cursor(x, y);
+        }
     }
 
     /// The buffer to draw into.

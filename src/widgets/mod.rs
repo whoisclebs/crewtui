@@ -65,6 +65,16 @@ pub trait StatefulWidget {
 
     /// Draws the widget.
     fn render(self, area: Rect, buf: &mut Buffer, state: &Self::State);
+
+    /// Where the terminal's own cursor goes after this widget is drawn, if it
+    /// has one, such as the text cursor of an input. It is asked after
+    /// [`StatefulWidget::render`], so the state can hold where drawing put
+    /// it. [`Frame::render_stateful_widget`](crate::Frame::render_stateful_widget)
+    /// passes it on to [`Frame::set_cursor`](crate::Frame::set_cursor). Most
+    /// widgets have none.
+    fn cursor(_state: &Self::State) -> Option<(u16, u16)> {
+        None
+    }
 }
 
 impl Widget for Text<'_> {
