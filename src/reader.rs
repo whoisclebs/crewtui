@@ -140,6 +140,12 @@ fn read_loop<M>(input: RawFd, wake: RawFd, mut signals: Option<Signals>, tx: &Se
         if readable(&fds[1]) {
             return;
         }
+        if fds.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
+            // A closed or invalid descriptor would make `poll` return at
+            // once forever, so report it instead of spinning.
+            let _ = tx.send(Input::Failed(io::Error::from_raw_os_error(libc::EBADF)));
+            return;
+        }
         if ready == 0 {
             let event = if parser.is_pasting() {
                 parser.abort_paste()
@@ -318,6 +324,19 @@ mod tests {
         feed.hang_up();
         match next(&rx) {
             Input::Failed(e) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+            _ => panic!("expected a failure"),
+        }
+    }
+
+    #[test]
+    fn a_closed_input_descriptor_is_a_failure_not_a_busy_loop() {
+        // Not open in this process, and too high for the reader's own pipe
+        // to land on by reusing a freed number.
+        let closed = 9_999;
+        let (tx, rx) = channel();
+        let _reader = InputReader::spawn(closed, None, tx).unwrap();
+        match next(&rx) {
+            Input::Failed(e) => assert_eq!(e.raw_os_error(), Some(libc::EBADF)),
             _ => panic!("expected a failure"),
         }
     }
