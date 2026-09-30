@@ -426,6 +426,28 @@ pub(crate) fn kill(child: &Child, sig: libc::c_int) {
     assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, sig) }, 0);
 }
 
+/// Waits until `child` has been stopped by a signal, and returns which one,
+/// or `None` if that didn't happen within `limit`.
+pub(crate) fn wait_until_stopped(child: &Child, limit: Duration) -> Option<libc::c_int> {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        let mut status = 0;
+        // SAFETY: `status` is valid for a write, and WNOHANG returns at once.
+        let got = unsafe {
+            libc::waitpid(
+                child.id() as libc::pid_t,
+                &mut status,
+                libc::WUNTRACED | libc::WNOHANG,
+            )
+        };
+        if got > 0 && libc::WIFSTOPPED(status) {
+            return Some(libc::WSTOPSIG(status));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
 /// The environment variable that tells a re-run test executable which
 /// scenario to play out.
 pub(crate) const CHILD_MODE: &str = "CREWTUI_PTY_CHILD";

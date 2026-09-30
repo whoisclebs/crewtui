@@ -45,7 +45,7 @@ The main thread blocks in one place, a channel receiver. The reader thread waits
 
 When something changes, the loop draws, but no more than `max_fps` times a second. It applies everything that is already waiting before it draws, so a burst of messages costs one frame. Quitting doesn't draw a last frame.
 
-Signals are turned into loop behavior in one place. SIGWINCH resizes the renderer, which repaints, and gives the app an `Event::Resize`. SIGCONT re-enters raw mode and invalidates the renderer. SIGINT, SIGTERM and SIGHUP end the run with an `Interrupted` error that wraps the signal, and the terminal is restored on the way out like on any other exit. Ctrl+C typed in raw mode is not a signal: it reaches the app as a key event, and the app decides whether it quits.
+Signals are turned into loop behavior in one place. SIGWINCH resizes the renderer, which repaints, and gives the app an `Event::Resize`. SIGTSTP, sent from outside, restores the terminal and stops the process, so the shell that gets control back is usable; the loop takes the terminal again and repaints once it is continued. SIGCONT re-enters raw mode and invalidates the renderer. SIGINT, SIGTERM and SIGHUP end the run with an `Interrupted` error that wraps the signal, and the terminal is restored on the way out like on any other exit. Ctrl+C typed in raw mode is not a signal: it reaches the app as a key event, and the app decides whether it quits.
 
 The loop itself is a function over a small `Host` trait (write bytes, report the size, resume raw mode). That is what lets the tests drive it without a terminal, with one test that runs a real `Program` on a pty.
 
