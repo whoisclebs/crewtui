@@ -469,7 +469,7 @@ mod tests {
     use crate::{Color, Frame};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent { code, modifiers }
+        KeyEvent::new(code, modifiers)
     }
 
     fn plain(c: char) -> KeyEvent {

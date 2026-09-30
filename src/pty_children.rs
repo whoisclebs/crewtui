@@ -56,6 +56,7 @@ const ALL_MODES: TerminalOptions = TerminalOptions {
     mouse: true,
     focus_events: true,
     bracketed_paste: true,
+    keyboard_enhancement: true,
 };
 
 fn run_probe(mode: &str, options: TerminalOptions) -> io::Result<()> {
@@ -132,7 +133,7 @@ mod tests {
     /// cursor shown, alternate screen left.
     const LEAVE: &[u8] = b"\x1b[?2004l\x1b[0m\x1b[?25h\x1b[?1049l";
     const LEAVE_ALL: &[u8] =
-        b"\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
+        b"\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
 
     /// A child that is running its scenario on a pty.
     struct Scenario {
@@ -425,6 +426,35 @@ mod tests {
         wait_for_row(&mut s, &mut screen, "ready \u{b7} Enter sends");
         // Ctrl+C is a key in raw mode, and the app quits on it.
         s.type_bytes(&[0x03]);
+        let status = s.finish();
+        assert_eq!(status.code(), Some(0), "{status:?}");
+        assert!(
+            s.seen
+                .windows(b"\x1b[?1049l".len())
+                .any(|w| w == b"\x1b[?1049l"),
+            "the alternate screen was never left"
+        );
+        assert!(
+            same(&s.pty.termios(), &s.original),
+            "termios was not restored"
+        );
+    }
+
+    #[test]
+    fn a_kitty_release_of_ctrl_c_does_not_quit_the_agent_and_the_press_does() {
+        let mut s = Scenario::start_sized("agent", true, 100, 30);
+        let mut screen = crate::testing::Screen::new(100, 30);
+        screen.feed(&s.seen);
+        wait_for_row(&mut s, &mut screen, "crewtui agent");
+        // Ctrl+C released, as a terminal with the kitty protocol reports it.
+        s.type_bytes(b"\x1b[99;5:3u");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            s.child.try_wait().unwrap().is_none(),
+            "a key release quit the program: {}",
+            s.text()
+        );
+        s.type_bytes(b"\x1b[99;5u");
         let status = s.finish();
         assert_eq!(status.code(), Some(0), "{status:?}");
         assert!(

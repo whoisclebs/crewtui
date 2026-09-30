@@ -100,6 +100,18 @@ pub struct TerminalOptions {
     pub focus_events: bool,
     /// Deliver pasted text as one event instead of as typed keys.
     pub bracketed_paste: bool,
+    /// Ask for the kitty keyboard protocol: keys that plain terminals can't
+    /// tell apart (Ctrl+I from Tab, Esc from the start of a sequence) arrive
+    /// as different events, modifiers beyond Shift, Alt and Ctrl are
+    /// reported, and key releases and repeats arrive as [`KeyEvent`]s with
+    /// their [`KeyEventKind`]. Off by default, since a terminal that doesn't
+    /// know the protocol ignores the request and keeps sending plain keys,
+    /// and an app should only expect releases when it knows it has a
+    /// terminal that supports them.
+    ///
+    /// [`KeyEvent`]: crate::KeyEvent
+    /// [`KeyEventKind`]: crate::KeyEventKind
+    pub keyboard_enhancement: bool,
 }
 
 impl TerminalOptions {
@@ -132,6 +144,13 @@ impl TerminalOptions {
         self.bracketed_paste = on;
         self
     }
+
+    /// Asks for the kitty keyboard protocol, or doesn't. See
+    /// [`TerminalOptions::keyboard_enhancement`].
+    pub fn keyboard_enhancement(mut self, on: bool) -> Self {
+        self.keyboard_enhancement = on;
+        self
+    }
 }
 
 impl Default for TerminalOptions {
@@ -142,6 +161,7 @@ impl Default for TerminalOptions {
             mouse: false,
             focus_events: false,
             bracketed_paste: true,
+            keyboard_enhancement: false,
         }
     }
 }
@@ -163,6 +183,10 @@ fn enable_sequence(o: &TerminalOptions) -> Vec<u8> {
     if o.bracketed_paste {
         s.push_str("\x1b[?2004h");
     }
+    if o.keyboard_enhancement {
+        // Push flags 1 and 2: disambiguate escape codes, report event types.
+        s.push_str("\x1b[>3u");
+    }
     s.into_bytes()
 }
 
@@ -170,6 +194,10 @@ fn enable_sequence(o: &TerminalOptions) -> Vec<u8> {
 /// and the colors reset, since the app may have changed them by itself.
 fn disable_sequence(o: &TerminalOptions) -> Vec<u8> {
     let mut s = String::new();
+    if o.keyboard_enhancement {
+        // Pop what the enable pushed.
+        s.push_str("\x1b[<u");
+    }
     if o.bracketed_paste {
         s.push_str("\x1b[?2004l");
     }
@@ -439,6 +467,7 @@ mod tests {
         mouse: true,
         focus_events: true,
         bracketed_paste: true,
+        keyboard_enhancement: true,
     };
     const NONE: TerminalOptions = TerminalOptions {
         alternate_screen: false,
@@ -446,11 +475,12 @@ mod tests {
         mouse: false,
         focus_events: false,
         bracketed_paste: false,
+        keyboard_enhancement: false,
     };
     const ALL_ON: &[u8] =
-        b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h";
+        b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[>3u";
     const ALL_OFF: &[u8] =
-        b"\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
+        b"\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
 
     #[test]
     fn enter_goes_raw_and_drop_puts_everything_back() {

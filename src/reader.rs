@@ -314,10 +314,7 @@ mod tests {
     }
 
     fn key(code: KeyCode) -> Event {
-        Event::Key(KeyEvent {
-            code,
-            modifiers: KeyModifiers::NONE,
-        })
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
     #[test]

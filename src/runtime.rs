@@ -720,10 +720,10 @@ mod tests {
     }
 
     fn key(c: char) -> Input<Msg> {
-        Input::Event(Event::Key(KeyEvent {
-            code: KeyCode::Char(c),
-            modifiers: KeyModifiers::NONE,
-        }))
+        Input::Event(Event::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        )))
     }
 
     /// Runs the loop over `inputs`, which must end the program.
