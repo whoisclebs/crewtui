@@ -208,7 +208,7 @@ fn layout_frame(
                     .wrap(Wrap::Word),
                 main,
             );
-            frame.render_input(Input::new().block(Block::bordered()), input_area, &input);
+            frame.render_stateful_widget(Input::new().block(Block::bordered()), input_area, &input);
             let [bar, right] = Layout::row()
                 .constraints([Constraint::Fill(1), Constraint::Fixed(10)])
                 .split_array(status);

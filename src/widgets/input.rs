@@ -332,8 +332,8 @@ impl InputState {
 ///
 /// Text wider than the area scrolls sideways just far enough to keep the
 /// cursor in view, and the scroll is remembered between frames. Use
-/// `Frame::render_input` to draw it and place the terminal cursor in one
-/// call. Only the first row of the area is used.
+/// `Frame::render_stateful_widget`, which also places the terminal cursor at
+/// the text cursor. Only the first row of the area is used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Input<'a> {
     style: Style,
@@ -387,6 +387,10 @@ impl Default for Input<'_> {
 
 impl StatefulWidget for Input<'_> {
     type State = InputState;
+
+    fn cursor(state: &InputState) -> Option<(u16, u16)> {
+        state.cursor_position()
+    }
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &InputState) {
         state.cursor_position.set(None);
@@ -870,12 +874,12 @@ mod tests {
     }
 
     #[test]
-    fn frame_render_input_sets_the_terminal_cursor() {
+    fn rendering_an_input_through_a_frame_sets_the_terminal_cursor() {
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::new(area);
         let s = InputState::with_text("hi");
         let mut frame = Frame::new(&mut buf);
-        frame.render_input(Input::new(), Rect::new(2, 1, 6, 1), &s);
+        frame.render_stateful_widget(Input::new(), Rect::new(2, 1, 6, 1), &s);
         assert_eq!(frame.cursor(), Some((4, 1)));
     }
 

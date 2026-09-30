@@ -390,7 +390,7 @@ impl App for Agent {
 
         self.draw_status(frame, status);
 
-        frame.render_input(
+        frame.render_stateful_widget(
             Input::new()
                 .placeholder("ask the agent")
                 .block(Block::bordered().title("you")),
