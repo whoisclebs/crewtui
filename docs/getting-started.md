@@ -15,8 +15,7 @@ An app is a type that implements `App`. It has three methods, and each one has a
 ## A counter
 
 ```rust,no_run
-use crewtui::widgets::{Block, Paragraph};
-use crewtui::{App, Cmd, Event, Frame, KeyCode, Program};
+use crewtui::prelude::*;
 
 struct Counter {
     count: i32,
@@ -32,10 +31,10 @@ impl App for Counter {
 
     fn event(&self, event: Event) -> Option<Msg> {
         let Event::Key(key) = event else { return None };
-        match key.code {
-            KeyCode::Up => Some(Msg::Add(1)),
-            KeyCode::Down => Some(Msg::Add(-1)),
-            KeyCode::Char('q') => Some(Msg::Quit),
+        match key {
+            k if k.is(KeyCode::Up) => Some(Msg::Add(1)),
+            k if k.is(KeyCode::Down) => Some(Msg::Add(-1)),
+            k if k.is(KeyCode::Char('q')) => Some(Msg::Quit),
             _ => None,
         }
     }
@@ -63,12 +62,11 @@ impl App for Counter {
 }
 
 fn main() -> std::io::Result<()> {
-    Program::new(Counter { count: 0 }).run()?;
-    Ok(())
+    crewtui::run(Counter { count: 0 })
 }
 ```
 
-`Program::run` puts the terminal in raw mode on the alternate screen, runs the loop and puts everything back when it returns, including when `update` panics or the process gets SIGINT. It hands the app back, so `run()?` gives you the final state.
+`crewtui::run` puts the terminal in raw mode on the alternate screen, runs the loop and puts everything back when it returns, including when `update` panics or the process gets SIGINT. `Program::new(app).run()` does the same and hands the app back, for when you want the final state; `Program` also takes options such as `terminal_options` and `max_fps`. The `prelude` has the names an app usually needs.
 
 Messages are yours: a plain enum is enough. `event` gets a shared reference and `view` gets a shared reference too, so the only place state changes is `update`. That is also what makes `view` testable: draw the same state into a `Renderer` and compare.
 
@@ -79,8 +77,7 @@ Messages are yours: a plain enum is enough. `event` gets a shared reference and 
 ```rust,no_run
 use std::time::Duration;
 
-use crewtui::widgets::Paragraph;
-use crewtui::{App, Cmd, Event, Frame, KeyCode, Program};
+use crewtui::prelude::*;
 
 struct Loader {
     status: String,
@@ -97,9 +94,9 @@ impl App for Loader {
 
     fn event(&self, event: Event) -> Option<Msg> {
         let Event::Key(key) = event else { return None };
-        match key.code {
-            KeyCode::Enter => Some(Msg::Load),
-            KeyCode::Char('q') => Some(Msg::Quit),
+        match key {
+            k if k.is(KeyCode::Enter) => Some(Msg::Load),
+            k if k.is(KeyCode::Char('q')) => Some(Msg::Quit),
             _ => None,
         }
     }
@@ -132,12 +129,11 @@ impl App for Loader {
 }
 
 fn main() -> std::io::Result<()> {
-    Program::new(Loader { status: "idle".to_owned() }).run()?;
-    Ok(())
+    crewtui::run(Loader { status: "idle".to_owned() })
 }
 ```
 
-The other commands are `Cmd::spawn` for work that sends many messages (a token stream), `Cmd::after` for timers, `Cmd::repaint`, `Cmd::batch` to return several at once, and `Cmd::quit`. Apps with their own threads or an async runtime call `Program::sender()` before `run()` and post messages from wherever they like. There is no need for tokio, and using it doesn't get in the way.
+The other commands are `Cmd::spawn` for work that sends many messages (a token stream), `Cmd::after` for timers, `Cmd::repaint`, `Cmd::batch` to return several at once, and `Cmd::quit`. Work that should start with the program goes in `App::init`, which returns a `Cmd` and runs before the first frame. Apps with their own threads or an async runtime call `Program::sender()` before `run()` and post messages from wherever they like. There is no need for tokio, and using it doesn't get in the way.
 
 ## Where to go next
 

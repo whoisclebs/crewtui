@@ -37,6 +37,20 @@ pub struct KeyEvent {
     pub modifiers: KeyModifiers,
 }
 
+impl KeyEvent {
+    /// True for this key pressed on its own, with no modifier held. Shift
+    /// is already in the character: `is(KeyCode::Char('Q'))` matches a
+    /// capital Q.
+    pub fn is(&self, code: KeyCode) -> bool {
+        self.code == code && self.modifiers == KeyModifiers::NONE
+    }
+
+    /// True for Ctrl and the character `c` held together, like Ctrl+C.
+    pub fn is_ctrl(&self, c: char) -> bool {
+        self.code == KeyCode::Char(c) && self.modifiers.contains(KeyModifiers::CTRL)
+    }
+}
+
 /// A key on the keyboard.
 ///
 /// Letters arrive as [`KeyCode::Char`] carrying the case that was typed, so
@@ -650,6 +664,30 @@ mod tests {
 
     fn k(code: KeyCode) -> Event {
         key(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn key_helpers_match_a_key_on_its_own_or_with_ctrl() {
+        let plain = KeyEvent {
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+        };
+        let ctrl = KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CTRL,
+        };
+        let ctrl_alt = KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CTRL | KeyModifiers::ALT,
+        };
+        assert!(plain.is(KeyCode::Char('q')));
+        assert!(!plain.is(KeyCode::Char('w')));
+        assert!(!plain.is_ctrl('q'));
+        assert!(ctrl.is_ctrl('c'));
+        assert!(!ctrl.is(KeyCode::Char('c')), "Ctrl is a modifier");
+        assert!(!ctrl.is_ctrl('d'));
+        assert!(ctrl_alt.is_ctrl('c'));
+        assert!(!ctrl_alt.is(KeyCode::Char('c')));
     }
 
     fn km(code: KeyCode, m: KeyModifiers) -> Event {

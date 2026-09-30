@@ -22,8 +22,8 @@ use crewtui::widgets::{
     Block, History, HistoryState, Input, InputState, List, ListState, Paragraph, Scrollbar, Spinner,
 };
 use crewtui::{
-    App, Cmd, Color, Constraint, Event, Frame, KeyCode, KeyEvent, KeyModifiers, Layout, MouseKind,
-    Program, Rect, Sender, Style, TerminalOptions,
+    App, Cmd, Color, Constraint, Event, Frame, KeyCode, KeyEvent, Layout, MouseKind, Program, Rect,
+    Sender, Style, TerminalOptions,
 };
 
 /// How fast the fake agent works.
@@ -252,11 +252,8 @@ impl App for Agent {
 
     fn event(&self, event: Event) -> Option<Msg> {
         match event {
-            Event::Key(key) if key.modifiers.contains(KeyModifiers::CTRL) => match key.code {
-                KeyCode::Char('c') => Some(Msg::Quit),
-                KeyCode::Char('l') => Some(Msg::Repaint),
-                _ => Some(Msg::Key(key)),
-            },
+            Event::Key(key) if key.is_ctrl('c') => Some(Msg::Quit),
+            Event::Key(key) if key.is_ctrl('l') => Some(Msg::Repaint),
             Event::Key(key) => Some(Msg::Key(key)),
             Event::Paste(text) => Some(Msg::Paste(text)),
             Event::Resize(w, h) => Some(Msg::Resize(w, h)),
