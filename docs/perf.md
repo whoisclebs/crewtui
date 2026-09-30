@@ -49,13 +49,13 @@ Most of the time is the widgets drawing into the buffer, not the diff. At 400 µ
 | a streamed token, all on one growing line | 608 µs | 241 |
 | scroll by one row, 5,000 rows up | 678 µs | 7,714 |
 | the width changes on every frame | 792 µs | 11,592 |
-| the width changes, and the scrollbar wants the total | 75 ms | 12,049 |
+| the width changes, and the scrollbar wants the total | 1.5 ms | 12,020 |
 
 The steady frame costs the same with 200 entries as with 20,000, which is the point of keeping the row count of every line of every entry: a frame wraps what is on screen and nothing else. The frame tests in `src/widgets/history.rs` check the same thing without a clock, by counting how many entries and lines a frame looks at, so a regression fails a test instead of showing up as a number nobody reads.
 
 A streamed token writes a few hundred bytes on average instead of redrawing the transcript. The two streaming rows are not the same case. With a newline every few tokens the last line stays short. With everything on one line, the line being streamed is measured again on each token, so the frame gets slower as the line grows: on a scratch copy of this bench, 4,000 tokens into one line a frame took about 1.1 ms instead of 0.6. Streamed messages usually have newlines, but a paragraph of 30 lines that arrives as one line does not.
 
-A width change is the expensive case. The frame itself is under a millisecond, because only what is on screen has to be counted again. The last row is different. A scrollbar needs the total number of rows, and after a width change that means counting every entry again: 75 ms for 20,000 entries here. It is paid once per width, and cached after that, but an app that drags its window edge with a scrollbar on a very long transcript will feel it. Making that cheaper is tracked in #54.
+A width change is the expensive case. The frame itself is under a millisecond, because only what is on screen has to be counted again. A scrollbar also needs the total number of rows, and after a width change that used to mean counting all 20,000 entries in one frame, which took 75 ms. Now `content_rows` counts 160 entries per call and estimates the rest from the average of the ones counted, so the frame in the last row costs 1 to 1.7 ms. A line that has no more bytes than the view has columns is counted as one row without splitting it, which is most lines, and that halved the cost per entry. The estimate settles as `content_rows` is called again, which is once per frame with a scrollbar: about 125 frames for 20,000 entries. Frames only happen when something changes, so an app that goes idle right after a resize keeps an estimated thumb until its next frame. While following the end the thumb stays at the bottom throughout, and at the start of the transcript it is at the top.
 
 ## The reference app under stress
 
@@ -80,7 +80,7 @@ The times are from one run and move by tens of percent between runs, so the test
 
 To see where a frame's time goes, the run was split into stages with a timer around each, in a scratch test that is not kept. Updating the state costs about 0.1 µs per token, drawing the view 190 µs, and diffing plus building the bytes 20 µs. Nearly all of the view is `History`, which wraps and draws the rows on screen.
 
-The slow frame is the resize. A width change with a scrollbar has to measure every entry again to know the total number of rows, and each of the twelve resize frames in the run took 28 to 33 ms. It is the case tracked in #54. It doesn't happen while streaming, only when the window size changes.
+The resize frames, at 90x30 and back, took 0.27 to 0.77 ms each. Before `content_rows` counted in batches they took 28 to 33 ms, as every entry was measured again in that one frame.
 
 ## Running it
 
