@@ -1,6 +1,6 @@
 //! Turns consecutive buffers into terminal output.
 
-use std::io::Write;
+use std::io::{self, Write};
 
 use crate::{Buffer, Color, Modifier, Rect, Style};
 
@@ -50,6 +50,9 @@ impl Renderer {
     /// Draws one frame. `f` receives a blank buffer covering the whole
     /// screen and must not resize it. The returned bytes are what to write
     /// to the terminal.
+    ///
+    /// If the caller can't write them, or only some of them get through, it
+    /// must call [`Renderer::invalidate`]. [`Renderer::present`] does this.
     pub fn draw(&mut self, f: impl FnOnce(&mut Buffer)) -> &[u8] {
         let area = self.current.area();
         self.current.reset();
@@ -68,6 +71,38 @@ impl Renderer {
         diff(&self.previous, &self.current, &mut self.out);
         std::mem::swap(&mut self.previous, &mut self.current);
         &self.out
+    }
+
+    /// Draws one frame and writes it to `out` in a single `write_all`,
+    /// flushing afterwards. Nothing is written for an unchanged frame.
+    ///
+    /// When the write fails, possibly after part of the frame reached the
+    /// terminal, the renderer no longer knows what is on screen, so it
+    /// invalidates itself and the next frame repaints everything.
+    pub fn present<W: Write>(
+        &mut self,
+        out: &mut W,
+        f: impl FnOnce(&mut Buffer),
+    ) -> io::Result<()> {
+        if self.draw(f).is_empty() {
+            return Ok(());
+        }
+        let result = out.write_all(&self.out).and_then(|()| out.flush());
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
+
+    /// Forgets what the terminal shows. The next frame clears the screen
+    /// and paints every cell.
+    ///
+    /// Call this whenever something other than this renderer may have
+    /// changed the screen: another process writing to the tty, a terminal
+    /// multiplexer redraw, resuming after suspend, or running a child
+    /// process that took over the terminal. Resizing does it implicitly.
+    pub fn invalidate(&mut self) {
+        self.known = false;
     }
 }
 
@@ -338,6 +373,99 @@ mod tests {
             out,
             b"\x1b[0m\x1b[2J\x1b[1;1H\x1b[0;3;4;38;5;200;104mx\x1b[0m"
         );
+    }
+
+    #[test]
+    fn invalidate_repaints_exactly_like_a_first_frame() {
+        let mut r = Renderer::new(8, 2);
+        let first = text(&mut r, &["ab中", "c"]);
+        assert!(text(&mut r, &["ab中", "c"]).is_empty());
+        r.invalidate();
+        assert_eq!(text(&mut r, &["ab中", "c"]), first);
+        assert!(text(&mut r, &["ab中", "c"]).is_empty());
+    }
+
+    #[test]
+    fn present_skips_the_write_for_an_unchanged_frame() {
+        let mut r = Renderer::new(4, 1);
+        let mut sink = Vec::new();
+        r.present(&mut sink, |b| {
+            b.set_string(0, 0, "hi", Style::new());
+        })
+        .unwrap();
+        let len = sink.len();
+        r.present(&mut sink, |b| {
+            b.set_string(0, 0, "hi", Style::new());
+        })
+        .unwrap();
+        assert_eq!(sink.len(), len);
+    }
+
+    /// Accepts `limit` bytes, then fails, like a tty that goes away or a
+    /// write that is interrupted halfway through a frame.
+    struct Cut {
+        sent: Vec<u8>,
+        limit: usize,
+    }
+
+    impl Write for Cut {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let room = self.limit - self.sent.len();
+            if room == 0 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "cut"));
+            }
+            let n = room.min(buf.len());
+            self.sent.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_frame_cut_at_any_byte_is_repaired_by_the_next_one() {
+        let s1 = Style::new().fg(Color::Red).bold();
+        let s2 = Style::new().bg(Color::Rgb(10, 20, 30));
+        let draw1 = |b: &mut Buffer| {
+            b.set_string(0, 0, "hello 中文 x", s1);
+            b.set_string(1, 1, "😀ab", s2);
+        };
+        let draw2 = |b: &mut Buffer| {
+            b.set_string(0, 0, "hEllo 字文 y", s2);
+            b.set_string(0, 1, "👨‍👩‍👧‍👦 ab", s1);
+        };
+        let draw3 = |b: &mut Buffer| {
+            b.set_string(2, 0, "final 中", s1);
+        };
+        let mut probe = Renderer::new(12, 2);
+        probe.draw(draw1);
+        let frame2_len = probe.draw(draw2).len();
+        assert!(frame2_len > 20);
+
+        for limit in 0..frame2_len {
+            let mut r = Renderer::new(12, 2);
+            let mut screen = Screen::new(12, 2);
+            let mut first = Vec::new();
+            r.present(&mut first, draw1).unwrap();
+            screen.feed(&first);
+
+            let mut cut = Cut {
+                sent: Vec::new(),
+                limit,
+            };
+            assert!(r.present(&mut cut, draw2).is_err(), "limit {limit}");
+            screen.feed(&cut.sent);
+
+            let mut rest = Vec::new();
+            r.present(&mut rest, draw3).unwrap();
+            screen.feed(&rest);
+
+            let mut want = Buffer::new(r.area());
+            draw3(&mut want);
+            assert_eq!(screen.to_buffer(), want, "cut after {limit} bytes");
+        }
     }
 
     /// Feeds random frames through the renderer and a small terminal model,
