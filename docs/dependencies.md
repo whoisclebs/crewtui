@@ -9,5 +9,7 @@ A dependency is added in the same change that first uses it.
 | `unicode-width` | #3 | Display width tables. Wrong widths corrupt the screen, and the tables change with each Unicode release. |
 | `unicode-segmentation` | #3 | Grapheme cluster boundaries for cell writes, wrapping and cursor movement. |
 
+`crewtui-rich`, the crate in `crates/rich`, depends on `crewtui` and on nothing else.
+
 No async runtime. No `crossterm`, no `termion`: input parsing and terminal
 control are part of what this crate is for.
