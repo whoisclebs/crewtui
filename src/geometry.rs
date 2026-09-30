@@ -60,6 +60,21 @@ impl Rect {
         x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
     }
 
+    /// A rectangle of `width` by `height` in the middle of this one, for a
+    /// dialog or a popup. A size larger than this rectangle is clamped to it.
+    /// When the space left over is odd, the extra cell goes to the right and
+    /// the bottom.
+    pub fn centered(&self, width: u16, height: u16) -> Rect {
+        let width = width.min(self.width);
+        let height = height.min(self.height);
+        Rect {
+            x: self.x + (self.width - width) / 2,
+            y: self.y + (self.height - height) / 2,
+            width,
+            height,
+        }
+    }
+
     /// The overlapping region of two rectangles, empty if they don't touch.
     pub fn intersection(&self, other: Rect) -> Rect {
         let x = self.x.max(other.x);
@@ -108,6 +123,22 @@ mod tests {
         let a = Rect::new(0, 0, 5, 5);
         let b = Rect::new(3, 2, 5, 5);
         assert_eq!(a.intersection(b), Rect::new(3, 2, 2, 3));
+    }
+
+    #[test]
+    fn centered_puts_the_extra_cell_right_and_below() {
+        let r = Rect::new(2, 1, 11, 6);
+        assert_eq!(r.centered(4, 3), Rect::new(5, 2, 4, 3));
+        assert_eq!(r.centered(11, 6), r);
+    }
+
+    #[test]
+    fn centered_is_clamped_to_the_parent() {
+        let r = Rect::new(3, 4, 10, 5);
+        assert_eq!(r.centered(50, 50), r);
+        assert_eq!(r.centered(50, 1), Rect::new(3, 6, 10, 1));
+        assert!(r.centered(0, 3).is_empty());
+        assert!(Rect::new(0, 0, 0, 0).centered(4, 4).is_empty());
     }
 
     #[test]

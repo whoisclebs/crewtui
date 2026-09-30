@@ -452,6 +452,42 @@ impl Buffer {
         }
     }
 
+    /// Resets every cell of `area`, clipped to the buffer, to a blank cell
+    /// with no style and no hyperlink, whatever was drawn there. It is what
+    /// to do before drawing a popup over other content.
+    ///
+    /// A wide glyph that the area cuts through, at its left or right edge, is
+    /// blanked whole, so no half of it is left behind.
+    pub fn clear(&mut self, area: Rect) {
+        let area = self.area.intersection(area);
+        if area.is_empty() {
+            return;
+        }
+        for y in area.y..area.bottom() {
+            // The glyph on the left edge that started outside the area.
+            if area.x > self.area.x && self.get(area.x, y).is_some_and(Cell::is_continuation) {
+                self.blank_cell(area.x - 1, y);
+            }
+            // The glyph on the right edge whose second half is outside.
+            let last = area.right() - 1;
+            if self.get(last + 1, y).is_some_and(Cell::is_continuation) {
+                self.blank_cell(last + 1, y);
+            }
+            if !self.links.is_empty() {
+                self.unlink(y, area.x, area.right());
+            }
+            for x in area.x..area.right() {
+                self.blank_cell(x, y);
+            }
+        }
+    }
+
+    fn blank_cell(&mut self, x: u16, y: u16) {
+        if let Some(cell) = self.get_mut(x, y) {
+            cell.reset();
+        }
+    }
+
     /// Resets every cell to blank.
     pub(crate) fn reset(&mut self) {
         self.cells.iter_mut().for_each(Cell::reset);

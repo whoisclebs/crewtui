@@ -22,6 +22,7 @@
 //! something they can share.
 
 mod block;
+mod clear;
 mod history;
 mod input;
 mod list;
@@ -32,6 +33,7 @@ mod spinner;
 mod table;
 
 pub use block::{Block, BorderType, Borders};
+pub use clear::Clear;
 pub use history::{History, HistoryState};
 pub use input::{Input, InputState};
 pub use list::{List, ListItem, ListState};
