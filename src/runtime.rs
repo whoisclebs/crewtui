@@ -18,7 +18,7 @@ use crate::{Event, Frame, Renderer, Signal, Signals, Terminal, TerminalOptions};
 /// always draws the same frame.
 ///
 /// ```no_run
-/// use crewtui::{App, Cmd, Event, Frame, KeyCode, Program, Style};
+/// use crewtui::prelude::*;
 ///
 /// struct Counter(i32);
 /// enum Msg { Up, Quit }
@@ -28,8 +28,8 @@ use crate::{Event, Frame, Renderer, Signal, Signals, Terminal, TerminalOptions};
 ///
 ///     fn event(&self, event: Event) -> Option<Msg> {
 ///         match event {
-///             Event::Key(k) if k.code == KeyCode::Char('+') => Some(Msg::Up),
-///             Event::Key(k) if k.code == KeyCode::Char('q') => Some(Msg::Quit),
+///             Event::Key(k) if k.is(KeyCode::Char('+')) => Some(Msg::Up),
+///             Event::Key(k) if k.is(KeyCode::Char('q')) => Some(Msg::Quit),
 ///             _ => None,
 ///         }
 ///     }
@@ -43,12 +43,12 @@ use crate::{Event, Frame, Renderer, Signal, Signals, Terminal, TerminalOptions};
 ///
 ///     fn view(&self, frame: &mut Frame) {
 ///         let text = format!("count: {}  (+ to add, q to quit)", self.0);
-///         frame.buffer_mut().set_string(0, 0, &text, Style::new());
+///         frame.render_widget(Paragraph::new(text), frame.area());
 ///     }
 /// }
 ///
 /// fn main() -> std::io::Result<()> {
-///     Program::new(Counter(0)).run().map(|_| ())
+///     crewtui::run(Counter(0))
 /// }
 /// ```
 pub trait App {
@@ -66,6 +66,13 @@ pub trait App {
 
     /// Draws the current state.
     fn view(&self, frame: &mut Frame<'_>);
+
+    /// What to start when the program starts, before the first frame is
+    /// drawn: a clock, a first request, a load from disk. It does nothing by
+    /// default.
+    fn init(&self) -> Cmd<Self::Message> {
+        Cmd::none()
+    }
 }
 
 /// What `update` asks the runtime to do next.
@@ -255,6 +262,28 @@ impl Host for Terminal {
     }
 }
 
+/// Runs `app` on the terminal until it quits, with the default options.
+///
+/// This is `Program::new(app).run()` for an app that has no use for its
+/// final state, which is most of them:
+///
+/// ```no_run
+/// # use crewtui::{App, Cmd, Event, Frame};
+/// # struct MyApp;
+/// # impl App for MyApp {
+/// #     type Message = ();
+/// #     fn event(&self, _: Event) -> Option<()> { None }
+/// #     fn update(&mut self, _: ()) -> Cmd<()> { Cmd::none() }
+/// #     fn view(&self, _: &mut Frame) {}
+/// # }
+/// fn main() -> std::io::Result<()> {
+///     crewtui::run(MyApp)
+/// }
+/// ```
+pub fn run<A: App>(app: A) -> io::Result<()> {
+    Program::new(app).run().map(|_| ())
+}
+
 /// Runs an [`App`] on the terminal.
 ///
 /// `run` puts the terminal in raw mode, reads input on its own thread,
@@ -429,6 +458,13 @@ pub(crate) fn event_loop<A: App, H: Host>(
     } else {
         Duration::from_secs_f64(1.0 / f64::from(max_fps))
     };
+    let started = run_cmd(app.init(), effects);
+    if started.quit {
+        return Ok(app);
+    }
+    if started.repaint {
+        renderer.invalidate();
+    }
     let mut last_draw: Option<Instant> = None;
     let mut dirty = true;
     let disconnected = || io::Error::new(io::ErrorKind::BrokenPipe, "the input thread stopped");
@@ -556,6 +592,7 @@ mod tests {
         area: StdCell<Option<Rect>>,
         resized: Option<(u16, u16)>,
         frames: Option<StdSender<()>>,
+        on_init: Option<fn() -> Cmd<Msg>>,
     }
 
     impl Counter {
@@ -567,6 +604,7 @@ mod tests {
                 area: StdCell::new(None),
                 resized: None,
                 frames: None,
+                on_init: None,
             }
         }
 
@@ -604,6 +642,10 @@ mod tests {
                 Msg::Quit => return Cmd::quit(),
             }
             Cmd::none()
+        }
+
+        fn init(&self) -> Cmd<Msg> {
+            self.on_init.map_or_else(Cmd::none, |f| f())
         }
 
         fn view(&self, frame: &mut Frame<'_>) {
@@ -718,6 +760,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.updates, 1);
+    }
+
+    #[test]
+    fn init_starts_work_before_the_first_frame_and_its_result_reaches_update() {
+        let mut host = FakeHost::new(20, 3);
+        let (tx, rx) = channel();
+        let effects = Effects::new(tx.clone());
+        let (mut app, frames) = Counter::with_frames();
+        app.on_init = Some(|| Cmd::perform(|| Msg::Up));
+        let handle = spawn_driver(tx.clone(), move |tx| {
+            // The first frame, then the one after the message from init.
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
+            tx.send(key('q')).unwrap();
+        });
+        let app = event_loop(app, &rx, &effects, &mut host, 0).unwrap();
+        handle.join().unwrap();
+        assert_eq!(app.n, 1);
+    }
+
+    #[test]
+    fn a_quit_from_init_ends_the_run_without_drawing() {
+        let mut host = FakeHost::new(20, 3);
+        let (tx, rx) = channel();
+        let effects = Effects::new(tx);
+        let mut app = Counter::new();
+        app.on_init = Some(Cmd::quit);
+        let app = event_loop(app, &rx, &effects, &mut host, 0).unwrap();
+        assert_eq!(app.draws.get(), 0);
     }
 
     #[test]
