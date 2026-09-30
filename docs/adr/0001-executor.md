@@ -22,7 +22,7 @@ The details that matter:
 - The pool starts threads on demand up to eight, queues beyond that, and lets idle threads exit after five seconds. A job that blocks for a long time holds one of the eight slots. `Cmd::spawn` takes a slot too, which is what keeps thread count bounded.
 - Timers live on one thread that sleeps until the earliest deadline. A repeating tick is `Cmd::after` returned again by the `update` that handled the last one, so there is nothing to cancel and no timer state in the app.
 - Cancellation has two parts. When the program ends, timers that haven't fired and jobs that haven't started are dropped. A worker that is already running finds out through `Sender::send`, which returns `Closed` once the receiver is gone; a streaming worker stops when its send fails.
-- A job that panics loses its result but not its worker thread.
+- A job that panics loses its result but not its worker thread. `Cmd::perform_catching` and `Cmd::spawn_catching` turn the panic into a message the app chooses, for jobs where waiting forever for a reply would be a bug.
 
 ## Consequences
 
