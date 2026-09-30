@@ -39,7 +39,7 @@ impl PartialEq for InputState {
 impl Eq for InputState {}
 
 /// Start of the cluster that ends at `at`.
-fn prev_boundary(text: &str, at: usize) -> usize {
+pub(super) fn prev_boundary(text: &str, at: usize) -> usize {
     text[..at]
         .grapheme_indices(true)
         .next_back()
@@ -47,7 +47,7 @@ fn prev_boundary(text: &str, at: usize) -> usize {
 }
 
 /// End of the cluster that starts at `at`.
-fn next_boundary(text: &str, at: usize) -> usize {
+pub(super) fn next_boundary(text: &str, at: usize) -> usize {
     text[at..]
         .graphemes(true)
         .next()
@@ -55,7 +55,7 @@ fn next_boundary(text: &str, at: usize) -> usize {
 }
 
 /// The first cluster boundary at or after `at`.
-fn snap(text: &str, at: usize) -> usize {
+pub(super) fn snap(text: &str, at: usize) -> usize {
     for (i, g) in text.grapheme_indices(true) {
         if at == i {
             return i;
@@ -67,7 +67,7 @@ fn snap(text: &str, at: usize) -> usize {
     text.len()
 }
 
-fn is_space(g: &str) -> bool {
+pub(super) fn is_space(g: &str) -> bool {
     g.chars().all(char::is_whitespace)
 }
 

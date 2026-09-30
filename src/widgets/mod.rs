@@ -31,6 +31,7 @@ mod progress;
 mod scrollbar;
 mod spinner;
 mod table;
+mod textarea;
 
 pub use block::{Block, BorderType, Borders};
 pub use clear::Clear;
@@ -42,6 +43,7 @@ pub use progress::Progress;
 pub use scrollbar::{Orientation, Scrollbar};
 pub use spinner::Spinner;
 pub use table::{Row, Table, TableState};
+pub use textarea::{TextArea, TextAreaState};
 
 use crate::text::{Line, Span, Text};
 use crate::{Buffer, Rect};
