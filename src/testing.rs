@@ -30,6 +30,7 @@ pub(crate) struct Screen {
     pending_wrap: bool,
     pen: Style,
     pending: Vec<u8>,
+    cursor_visible: bool,
 }
 
 impl Screen {
@@ -43,7 +44,13 @@ impl Screen {
             pending_wrap: false,
             pen: Style::new(),
             pending: Vec::new(),
+            cursor_visible: true,
         }
+    }
+
+    /// The cursor's `(column, row)` and whether it is showing.
+    pub(crate) fn cursor(&self) -> ((usize, usize), bool) {
+        ((self.x, self.y), self.cursor_visible)
     }
 
     /// The text of row `y`, one symbol per cell, continuation cells omitted.
@@ -166,7 +173,11 @@ impl Screen {
             }
             'm' => self.sgr(&nums),
             // Private modes such as alternate screen; not modeled.
-            'h' | 'l' => {}
+            'h' | 'l' => {
+                if params == "?25" {
+                    self.cursor_visible = fin == 'h';
+                }
+            }
             other => panic!("unmodeled CSI final {other:?}"),
         }
     }

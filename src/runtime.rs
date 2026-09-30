@@ -360,6 +360,8 @@ fn handle<A: App, H: Host>(
         Input::Signal(Signal::Continue) => {
             host.resume()?;
             renderer.invalidate();
+            // Entering the modes again hides the cursor.
+            renderer.cursor_was_reset();
             *dirty = true;
             Ok(false)
         }
@@ -394,7 +396,7 @@ pub(crate) fn event_loop<A: App, H: Host>(
         let input = if dirty {
             let wait = last_draw.map_or(Duration::ZERO, |t| interval.saturating_sub(t.elapsed()));
             if wait.is_zero() {
-                renderer.present(&mut *host, |buffer| app.view(&mut Frame::new(buffer)))?;
+                renderer.present_frame(&mut *host, |frame| app.view(frame))?;
                 last_draw = Some(Instant::now());
                 dirty = false;
                 continue;
