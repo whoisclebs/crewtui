@@ -101,6 +101,8 @@ fn child_entry() {
         "early_return" => early_return(),
         "leak_and_panic" => leak_and_panic(),
         "all_modes" => run_probe("normal", ALL_MODES),
+        "agent" => crate::agent_example::run(crate::agent_example::Pace::INSTANT, false),
+        "agent_stress" => crate::agent_example::run(crate::agent_example::Pace::INSTANT, true),
         other => run_probe(other, TerminalOptions::default()),
     };
     match result {
@@ -148,8 +150,13 @@ mod tests {
         /// parent could look. `expect_raw` false checks that it entered
         /// through the enable sequence instead.
         fn start_with(mode: &str, expect_raw: bool) -> Scenario {
+            Scenario::start_sized(mode, expect_raw, 40, 5)
+        }
+
+        /// Like `start_with`, on a terminal of `columns` by `rows`.
+        fn start_sized(mode: &str, expect_raw: bool, columns: u16, rows: u16) -> Scenario {
             let pty = Pty::open();
-            pty.set_size(40, 5);
+            pty.set_size(columns, rows);
             let original = pty.termios();
             let child = pty.spawn_self("pty_children::child_entry", mode).unwrap();
             let mut scenario = Scenario {
@@ -334,6 +341,80 @@ mod tests {
     #[test]
     fn sighup_from_outside_ends_the_run_and_restores_the_terminal() {
         stopped_by_signal("normal", libc::SIGHUP, "hung up (SIGHUP)");
+    }
+
+    /// Feeds what the child writes to `screen` until some row holds `text`.
+    fn wait_for_row(s: &mut Scenario, screen: &mut crate::testing::Screen, text: &str) {
+        let deadline = std::time::Instant::now() + LIMIT;
+        loop {
+            let out = s.pty.output_within(std::time::Duration::from_millis(500));
+            s.seen.extend_from_slice(&out);
+            screen.feed(&out);
+            if (0..30).any(|y| screen.row(y).contains(text)) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never saw {text:?} on the screen: {:?}",
+                (0..30).map(|y| screen.row(y)).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn the_agent_example_answers_a_request_and_quits_cleanly_on_ctrl_c() {
+        let mut s = Scenario::start_sized("agent", true, 100, 30);
+        let mut screen = crate::testing::Screen::new(100, 30);
+        // What was drawn before `start_sized` returned.
+        screen.feed(&s.seen);
+        wait_for_row(&mut s, &mut screen, "crewtui agent");
+        s.type_bytes(b"hello there\r");
+        wait_for_row(&mut s, &mut screen, "you \u{25b8} hello there");
+        // The worker thread streams the whole answer, tools included.
+        wait_for_row(
+            &mut s,
+            &mut screen,
+            "behavior you're after is already there",
+        );
+        wait_for_row(&mut s, &mut screen, "\u{2713} run_tests");
+        // The status line, not a word that happens to be in the answer.
+        wait_for_row(&mut s, &mut screen, "ready \u{b7} Enter sends");
+        // Ctrl+C is a key in raw mode, and the app quits on it.
+        s.type_bytes(&[0x03]);
+        let status = s.finish();
+        assert_eq!(status.code(), Some(0), "{status:?}");
+        assert!(
+            s.seen
+                .windows(b"\x1b[?1049l".len())
+                .any(|w| w == b"\x1b[?1049l"),
+            "the alternate screen was never left"
+        );
+        assert!(
+            same(&s.pty.termios(), &s.original),
+            "termios was not restored"
+        );
+    }
+
+    #[test]
+    fn the_agent_example_survives_its_stress_mode_and_quits_cleanly() {
+        let mut s = Scenario::start_sized("agent_stress", true, 100, 30);
+        let mut screen = crate::testing::Screen::new(100, 30);
+        screen.feed(&s.seen);
+        wait_for_row(&mut s, &mut screen, "crewtui agent");
+        // A request arrives by itself every second, on top of 20,000 lines.
+        wait_for_row(&mut s, &mut screen, "you \u{25b8} stress request 1");
+        wait_for_row(
+            &mut s,
+            &mut screen,
+            "behavior you're after is already there",
+        );
+        s.type_bytes(&[0x03]);
+        let status = s.finish();
+        assert_eq!(status.code(), Some(0), "{status:?}");
+        assert!(
+            same(&s.pty.termios(), &s.original),
+            "termios was not restored"
+        );
     }
 
     #[test]
