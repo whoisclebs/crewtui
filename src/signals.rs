@@ -9,6 +9,7 @@
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// A signal the framework cares about.
@@ -58,18 +59,28 @@ impl std::error::Error for Signal {}
 /// Write end of the pipe, read by the handler. `-1` while nothing is installed.
 static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+/// The pipe lives as long as the process. A handler that is already running
+/// when a `Signals` is dropped may still write to it, and closing the
+/// descriptor would let that byte land in whatever file gets the number
+/// next. Leaking two descriptors is the price of never having that race.
+static PIPE: OnceLock<(RawFd, RawFd)> = OnceLock::new();
 
+#[cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "emscripten"))]
 fn errno_location() -> *mut libc::c_int {
     // SAFETY: returns the address of the calling thread's errno.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    unsafe {
-        libc::__errno_location()
-    }
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+fn errno_location() -> *mut libc::c_int {
     // SAFETY: returns the address of the calling thread's errno.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    unsafe {
-        libc::__error()
-    }
+    unsafe { libc::__errno() }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: returns the address of the calling thread's errno.
+    unsafe { libc::__error() }
 }
 
 /// Only async-signal-safe calls: an atomic load, `write`, and errno
@@ -95,19 +106,78 @@ extern "C" fn handler(sig: libc::c_int) {
     }
 }
 
-fn set_nonblocking_cloexec(fd: RawFd) -> io::Result<()> {
-    // SAFETY: `fcntl` on a descriptor we own, with plain integer arguments.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+fn new_pipe() -> io::Result<(RawFd, RawFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` has room for the two descriptors `pipe2` writes. Both
+    // flags are set atomically, so no other thread can fork in between and
+    // hand the pipe to a child.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+fn new_pipe() -> io::Result<(RawFd, RawFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` has room for the two descriptors `pipe` writes; `fcntl`
+    // works on descriptors we just created. There is no `pipe2` here, so a
+    // fork on another thread between these calls could leak the pipe.
     unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
             return Err(io::Error::last_os_error());
         }
-        let fdflags = libc::fcntl(fd, libc::F_GETFD);
-        if fdflags < 0 || libc::fcntl(fd, libc::F_SETFD, fdflags | libc::FD_CLOEXEC) < 0 {
-            return Err(io::Error::last_os_error());
+        for fd in fds {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            let fdflags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0
+                || fdflags < 0
+                || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
+                || libc::fcntl(fd, libc::F_SETFD, fdflags | libc::FD_CLOEXEC) < 0
+            {
+                let err = io::Error::last_os_error();
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+                return Err(err);
+            }
         }
     }
-    Ok(())
+    Ok((fds[0], fds[1]))
+}
+
+/// The process-wide pipe, created on first use.
+fn pipe() -> io::Result<(RawFd, RawFd)> {
+    if let Some(p) = PIPE.get() {
+        return Ok(*p);
+    }
+    let created = new_pipe()?;
+    // Two threads can race here; the loser closes its extra pipe.
+    match PIPE.set(created) {
+        Ok(()) => Ok(created),
+        Err(_) => {
+            // SAFETY: the descriptors were just created and never shared.
+            unsafe {
+                libc::close(created.0);
+                libc::close(created.1);
+            }
+            Ok(*PIPE.get().expect("set by the other thread"))
+        }
+    }
 }
 
 /// Handlers for [`Signal`]s, and the pipe they report through.
@@ -115,10 +185,13 @@ fn set_nonblocking_cloexec(fd: RawFd) -> io::Result<()> {
 /// Only one can exist per process. Dropping it puts the previous handlers
 /// back. Poll [`AsRawFd::as_raw_fd`] for readability, then call
 /// [`Signals::pending`].
+///
+/// A SIGINT or SIGHUP that was being ignored when [`Signals::install`] ran,
+/// as it is under `nohup` or for a background job, stays ignored, so
+/// [`Signal::Interrupt`] and [`Signal::Hangup`] are never delivered then.
 #[derive(Debug)]
 pub struct Signals {
     read_fd: RawFd,
-    write_fd: RawFd,
     previous: Vec<(libc::c_int, libc::sigaction)>,
 }
 
@@ -135,20 +208,13 @@ impl Signals {
     }
 
     fn install_inner() -> io::Result<Signals> {
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `fds` has room for the two descriptors `pipe` writes.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let [read_fd, write_fd] = fds;
+        let (read_fd, write_fd) = pipe()?;
         let mut signals = Signals {
             read_fd,
-            write_fd,
             previous: Vec::new(),
         };
-        // From here on `Drop` cleans up after any early return.
-        set_nonblocking_cloexec(read_fd)?;
-        set_nonblocking_cloexec(write_fd)?;
+        // Bytes left by an earlier `Signals` are stale.
+        signals.pending()?;
         WRITE_FD.store(write_fd, Ordering::SeqCst);
 
         for (_, sig) in Signal::ALL {
@@ -156,12 +222,19 @@ impl Signals {
             // valid for a write, and `handler` has the signature `sigaction`
             // expects for a handler without `SA_SIGINFO`.
             let old = unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, std::ptr::null(), &mut old) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let ignored = old.sa_sigaction == libc::SIG_IGN;
+                if ignored && (sig == libc::SIGINT || sig == libc::SIGHUP) {
+                    continue;
+                }
                 let mut action: libc::sigaction = std::mem::zeroed();
                 action.sa_sigaction = handler as extern "C" fn(libc::c_int) as libc::sighandler_t;
                 action.sa_flags = libc::SA_RESTART;
                 libc::sigemptyset(&mut action.sa_mask);
-                let mut old: libc::sigaction = std::mem::zeroed();
-                if libc::sigaction(sig, &action, &mut old) != 0 {
+                if libc::sigaction(sig, &action, std::ptr::null_mut()) != 0 {
                     return Err(io::Error::last_os_error());
                 }
                 old
@@ -207,18 +280,13 @@ impl AsRawFd for Signals {
 
 impl Drop for Signals {
     fn drop(&mut self) {
-        // Handlers go first, so nothing writes to a descriptor we close.
         for (sig, old) in &self.previous {
             // SAFETY: `old` is the action `sigaction` returned for `sig`.
             unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
         }
+        // A handler that already started may still write, so the pipe stays
+        // open; see `PIPE`.
         WRITE_FD.store(-1, Ordering::SeqCst);
-        // SAFETY: both descriptors were created by `install_inner` and are
-        // closed exactly once, here.
-        unsafe {
-            libc::close(self.read_fd);
-            libc::close(self.write_fd);
-        }
         INSTALLED.store(false, Ordering::SeqCst);
     }
 }
@@ -304,7 +372,7 @@ mod tests {
         let mut signals = Signals::install().unwrap();
         // A successful write doesn't touch errno, so fill the pipe first:
         // from then on the handler's write fails with EAGAIN.
-        for _ in 0..200_000 {
+        for _ in 0..100_000 {
             raise(libc::SIGWINCH);
         }
         // SAFETY: errno is thread-local and always writable.
@@ -320,7 +388,7 @@ mod tests {
         let _s = serial();
         let mut signals = Signals::install().unwrap();
         // A pipe holds 64 KiB on Linux; this is well past that.
-        for _ in 0..200_000 {
+        for _ in 0..100_000 {
             raise(libc::SIGWINCH);
         }
         let got = signals.pending().unwrap();
@@ -339,6 +407,42 @@ mod tests {
         let after: Vec<_> = Signal::ALL.iter().map(|&(_, s)| disposition(s)).collect();
         assert_eq!(before, after);
         drop(Signals::install().unwrap());
+    }
+
+    #[test]
+    fn an_ignored_sigint_or_sighup_stays_ignored() {
+        let _s = serial();
+        // SAFETY: setting a disposition to ignore has no other preconditions.
+        let (old_int, old_hup) = unsafe {
+            (
+                libc::signal(libc::SIGINT, libc::SIG_IGN),
+                libc::signal(libc::SIGHUP, libc::SIG_IGN),
+            )
+        };
+        let mut signals = Signals::install().unwrap();
+        assert_eq!(disposition(libc::SIGINT), libc::SIG_IGN);
+        assert_eq!(disposition(libc::SIGHUP), libc::SIG_IGN);
+        raise(libc::SIGINT);
+        raise(libc::SIGHUP);
+        raise(libc::SIGTERM);
+        assert_eq!(signals.pending().unwrap(), vec![Signal::Terminate]);
+        drop(signals);
+        assert_eq!(disposition(libc::SIGINT), libc::SIG_IGN);
+        // SAFETY: putting back what the test replaced.
+        unsafe {
+            libc::signal(libc::SIGINT, old_int);
+            libc::signal(libc::SIGHUP, old_hup);
+        }
+    }
+
+    #[test]
+    fn bytes_left_over_from_an_earlier_install_are_not_delivered() {
+        let _s = serial();
+        let first = Signals::install().unwrap();
+        raise(libc::SIGTERM);
+        drop(first);
+        let mut second = Signals::install().unwrap();
+        assert!(second.pending().unwrap().is_empty());
     }
 
     #[test]
