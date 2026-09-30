@@ -22,8 +22,8 @@ use crewtui::widgets::{
     Block, History, HistoryState, Input, InputState, List, ListState, Paragraph, Scrollbar, Spinner,
 };
 use crewtui::{
-    App, Cmd, Color, Constraint, Event, Frame, KeyCode, KeyEvent, Layout, MouseKind, Program, Rect,
-    Sender, Style, TerminalOptions,
+    App, Cmd, Color, Constraint, Event, Frame, KeyCode, KeyEvent, KeyEventKind, Layout, MouseKind,
+    Program, Rect, Sender, Style, TerminalOptions,
 };
 
 /// How fast the fake agent works.
@@ -252,6 +252,8 @@ impl App for Agent {
 
     fn event(&self, event: Event) -> Option<Msg> {
         match event {
+            // A terminal with the kitty protocol also reports releases.
+            Event::Key(key) if key.kind == KeyEventKind::Release => None,
             Event::Key(key) if key.is_ctrl('c') => Some(Msg::Quit),
             Event::Key(key) if key.is_ctrl('l') => Some(Msg::Repaint),
             Event::Key(key) => Some(Msg::Key(key)),

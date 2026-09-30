@@ -29,26 +29,72 @@ pub enum Event {
 }
 
 /// A key and the modifiers held with it.
+///
+/// Most terminals only report that a key went down, and every event has the
+/// kind [`KeyEventKind::Press`]. A terminal that speaks the kitty keyboard
+/// protocol, asked for with `TerminalOptions::keyboard_enhancement`, also
+/// reports repeats and releases. An app that turned that on and matches
+/// `Event::Key` directly should look at `kind`, or use [`KeyEvent::is`] and
+/// [`KeyEvent::is_ctrl`], which ignore releases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyEvent {
     /// Which key.
     pub code: KeyCode,
     /// Modifier keys held.
     pub modifiers: KeyModifiers,
+    /// Whether the key went down, repeated, or came up.
+    pub kind: KeyEventKind,
 }
 
 impl KeyEvent {
-    /// True for this key pressed on its own, with no modifier held. Shift
-    /// is already in the character: `is(KeyCode::Char('Q'))` matches a
-    /// capital Q.
-    pub fn is(&self, code: KeyCode) -> bool {
-        self.code == code && self.modifiers == KeyModifiers::NONE
+    /// A key press with `modifiers`.
+    pub fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+        }
     }
 
-    /// True for Ctrl and the character `c` held together, like Ctrl+C.
-    pub fn is_ctrl(&self, c: char) -> bool {
-        self.code == KeyCode::Char(c) && self.modifiers.contains(KeyModifiers::CTRL)
+    /// The same key with another kind.
+    pub fn with_kind(mut self, kind: KeyEventKind) -> Self {
+        self.kind = kind;
+        self
     }
+
+    /// True for this key pressed on its own, with no modifier held, and not
+    /// a release. Shift is already in the character: `is(KeyCode::Char('Q'))`
+    /// matches a capital Q.
+    pub fn is(&self, code: KeyCode) -> bool {
+        self.code == code
+            && self.modifiers == KeyModifiers::NONE
+            && self.kind != KeyEventKind::Release
+    }
+
+    /// True for Ctrl and the character `c` held together, like Ctrl+C, and
+    /// not a release.
+    pub fn is_ctrl(&self, c: char) -> bool {
+        self.code == KeyCode::Char(c)
+            && self.modifiers.contains(KeyModifiers::CTRL)
+            && self.kind != KeyEventKind::Release
+    }
+}
+
+/// What a key did: went down, kept going down, or came up.
+///
+/// Only a terminal in the kitty keyboard protocol tells repeats and releases
+/// from presses. The others send [`KeyEventKind::Press`] for everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum KeyEventKind {
+    /// The key went down.
+    #[default]
+    Press,
+    /// The key is held and repeating.
+    Repeat,
+    /// The key came up.
+    Release,
 }
 
 /// A key on the keyboard.
@@ -94,7 +140,7 @@ pub enum KeyCode {
     F(u8),
 }
 
-/// Shift, Ctrl and Alt.
+/// Shift, Ctrl, Alt and Super.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct KeyModifiers(u8);
 
@@ -107,6 +153,9 @@ impl KeyModifiers {
     pub const ALT: KeyModifiers = KeyModifiers(1 << 1);
     /// Ctrl.
     pub const CTRL: KeyModifiers = KeyModifiers(1 << 2);
+    /// Super, the Windows or Command key. Only terminals with the kitty
+    /// keyboard protocol report it.
+    pub const SUPER: KeyModifiers = KeyModifiers(1 << 3);
 
     /// True when every modifier in `other` is set.
     pub const fn contains(self, other: KeyModifiers) -> bool {
@@ -197,7 +246,7 @@ enum Step {
 }
 
 fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
-    Event::Key(KeyEvent { code, modifiers })
+    Event::Key(KeyEvent::new(code, modifiers))
 }
 
 fn with_alt(step: Step, consumed_extra: usize) -> Step {
@@ -215,18 +264,18 @@ fn with_alt(step: Step, consumed_extra: usize) -> Step {
 }
 
 /// Parses the first thing in `buf`, which is not empty.
-fn parse_one(buf: &[u8]) -> Step {
+fn parse_one(buf: &[u8], kitty: bool) -> Step {
     if buf[0] == ESC {
-        parse_escape(buf)
+        parse_escape(buf, kitty)
     } else {
         parse_plain(buf)
     }
 }
 
-fn parse_escape(buf: &[u8]) -> Step {
+fn parse_escape(buf: &[u8], kitty: bool) -> Step {
     match buf.get(1) {
         None => Step::NeedMore,
-        Some(b'[') => parse_csi(buf),
+        Some(b'[') => parse_csi(buf, kitty),
         Some(b'O') => parse_ss3(buf),
         // Three ESCs in a row: the first is a key press of its own. Without
         // this, a long run of ESC bytes would recurse once per byte.
@@ -234,7 +283,7 @@ fn parse_escape(buf: &[u8]) -> Step {
             Step::Event(key(KeyCode::Esc, KeyModifiers::NONE), 1)
         }
         // ESC before anything else is Alt with that key.
-        Some(_) => with_alt(parse_one(&buf[1..]), 1),
+        Some(_) => with_alt(parse_one(&buf[1..], kitty), 1),
     }
 }
 
@@ -258,7 +307,7 @@ fn parse_ss3(buf: &[u8]) -> Step {
     Step::Event(key(code, KeyModifiers::NONE), 3)
 }
 
-fn parse_csi(buf: &[u8]) -> Step {
+fn parse_csi(buf: &[u8], kitty: bool) -> Step {
     let mut i = 2;
     while let Some(&b) = buf.get(i) {
         match b {
@@ -270,7 +319,7 @@ fn parse_csi(buf: &[u8]) -> Step {
                     Step::Skip(6)
                 };
             }
-            0x40..=0x7e => return csi_step(&buf[2..i], b, i + 1),
+            0x40..=0x7e => return csi_step(&buf[2..i], b, i + 1, kitty),
             0x20..=0x3f if i - 2 < MAX_CSI => i += 1,
             0x20..=0x3f => return Step::SkipCsi(i),
             // A control byte or a new ESC: give up on this sequence and let
@@ -282,7 +331,7 @@ fn parse_csi(buf: &[u8]) -> Step {
 }
 
 /// `params` are the bytes between `ESC [` and the final byte.
-fn csi_step(params: &[u8], fin: u8, consumed: usize) -> Step {
+fn csi_step(params: &[u8], fin: u8, consumed: usize, kitty_mode: bool) -> Step {
     if let Some(mouse) = params.strip_prefix(b"<") {
         return match mouse_event(mouse, fin) {
             Some(e) => Step::Event(Event::Mouse(e), consumed),
@@ -291,22 +340,51 @@ fn csi_step(params: &[u8], fin: u8, consumed: usize) -> Step {
     }
     // Private parameters and intermediates (`?`, `>`, spaces) belong to
     // replies and features that aren't key input.
-    if params.iter().any(|b| !b.is_ascii_digit() && *b != b';') {
+    if params
+        .iter()
+        .any(|b| !b.is_ascii_digit() && *b != b';' && *b != b':')
+    {
         return Step::Skip(consumed);
     }
-    let nums: Vec<u32> = params
+    // Fields are separated by `;` and may have sub-fields separated by `:`,
+    // which is how the kitty keyboard protocol adds to the xterm forms.
+    let fields: Vec<Vec<u32>> = params
         .split(|&b| b == b';')
-        .map(|p| {
-            std::str::from_utf8(p)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0)
+        .map(|field| {
+            field
+                .split(|&b| b == b':')
+                .map(|p| {
+                    std::str::from_utf8(p)
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0)
+                })
+                .collect()
         })
         .collect();
-    let first = nums.first().copied().unwrap_or(0);
-    let mods = nums
-        .get(1)
-        .map_or(KeyModifiers::NONE, |&m| xterm_modifiers(m));
+    let first = fields[0][0];
+    let mod_field = fields.get(1);
+    // A modifier field with an event type is the kitty form, where bit 8 is
+    // Super. In the xterm form it is Meta, which is Alt.
+    let kitty = kitty_mode || fin == b'u' || mod_field.is_some_and(|f| f.len() > 1);
+    let mods = mod_field.map_or(KeyModifiers::NONE, |f| {
+        if kitty {
+            kitty_modifiers(f[0])
+        } else {
+            xterm_modifiers(f[0])
+        }
+    });
+    let kind = match mod_field.and_then(|f| f.get(1)) {
+        Some(2) => KeyEventKind::Repeat,
+        Some(3) => KeyEventKind::Release,
+        _ => KeyEventKind::Press,
+    };
+    let event = |code: KeyCode, mods: KeyModifiers| {
+        Step::Event(
+            Event::Key(KeyEvent::new(code, mods).with_kind(kind)),
+            consumed,
+        )
+    };
 
     let code = match fin {
         b'A' => KeyCode::Up,
@@ -319,11 +397,12 @@ fn csi_step(params: &[u8], fin: u8, consumed: usize) -> Step {
         b'Q' => KeyCode::F(2),
         b'R' => KeyCode::F(3),
         b'S' => KeyCode::F(4),
-        b'Z' => return Step::Event(key(KeyCode::BackTab, KeyModifiers::SHIFT | mods), consumed),
+        b'Z' => return event(KeyCode::BackTab, KeyModifiers::SHIFT | mods),
         b'I' if params.is_empty() => return Step::Event(Event::FocusGained, consumed),
         b'O' if params.is_empty() => return Step::Event(Event::FocusLost, consumed),
+        b'u' => return kitty_key(&fields, mods, kind, consumed),
         b'~' => match first {
-            200 if nums.len() == 1 => return Step::PasteStart(consumed),
+            200 if fields.len() == 1 && fields[0].len() == 1 => return Step::PasteStart(consumed),
             1 | 7 => KeyCode::Home,
             2 => KeyCode::Insert,
             3 => KeyCode::Delete,
@@ -337,7 +416,101 @@ fn csi_step(params: &[u8], fin: u8, consumed: usize) -> Step {
         },
         _ => return Step::Skip(consumed),
     };
-    Step::Event(key(code, mods), consumed)
+    event(code, mods)
+}
+
+/// A key from the kitty keyboard protocol: `CSI code[:shifted[:base]] ;
+/// modifiers[:event] u`. Keys that are not for the keyboard proper, like
+/// modifier keys and media keys, are dropped.
+fn kitty_key(fields: &[Vec<u32>], mods: KeyModifiers, kind: KeyEventKind, consumed: usize) -> Step {
+    let code = fields[0][0];
+    let shifted = fields[0].get(1).copied().filter(|&c| c != 0);
+    let key = match code {
+        27 => KeyCode::Esc,
+        13 | 57414 => KeyCode::Enter,
+        9 if mods.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
+        9 => KeyCode::Tab,
+        8 | 127 => KeyCode::Backspace,
+        // The keypad, as the characters it types.
+        57399..=57408 => KeyCode::Char(char::from(b'0' + (code - 57399) as u8)),
+        57409 => KeyCode::Char('.'),
+        57410 => KeyCode::Char('/'),
+        57411 => KeyCode::Char('*'),
+        57412 => KeyCode::Char('-'),
+        57413 => KeyCode::Char('+'),
+        57415 => KeyCode::Char('='),
+        57416 => KeyCode::Char(','),
+        // The keypad with Num Lock off.
+        57417 => KeyCode::Left,
+        57418 => KeyCode::Right,
+        57419 => KeyCode::Up,
+        57420 => KeyCode::Down,
+        57421 => KeyCode::PageUp,
+        57422 => KeyCode::PageDown,
+        57423 => KeyCode::Home,
+        57424 => KeyCode::End,
+        57425 => KeyCode::Insert,
+        57426 => KeyCode::Delete,
+        57376..=57398 => KeyCode::F((code - 57376 + 13) as u8),
+        57344..=63743 => return Step::Skip(consumed),
+        _ => match char::from_u32(code) {
+            Some(c) if !c.is_control() => {
+                // Shift alone gives the character that was typed, the way
+                // plain text does: `A`, not `a` with Shift.
+                // Without the alternate keys, which are not asked for, a
+                // letter's shifted form is its uppercase, so a release
+                // matches the press that arrived as text.
+                let typed = shifted.and_then(char::from_u32).or_else(|| {
+                    let mut up = c.to_uppercase();
+                    match (up.next(), up.next()) {
+                        (Some(u), None) if c.is_alphabetic() => Some(u),
+                        _ => None,
+                    }
+                });
+                if mods == KeyModifiers::SHIFT && typed.is_some() {
+                    return Step::Event(
+                        Event::Key(
+                            KeyEvent::new(KeyCode::Char(typed.unwrap_or(c)), KeyModifiers::NONE)
+                                .with_kind(kind),
+                        ),
+                        consumed,
+                    );
+                }
+                KeyCode::Char(c)
+            }
+            _ => return Step::Skip(consumed),
+        },
+    };
+    let mods = if key == KeyCode::BackTab {
+        mods | KeyModifiers::SHIFT
+    } else {
+        mods
+    };
+    Step::Event(
+        Event::Key(KeyEvent::new(key, mods).with_kind(kind)),
+        consumed,
+    )
+}
+
+/// The kitty protocol sends modifiers as `1 + bitmask`: shift 1, alt 2,
+/// ctrl 4, super 8, hyper 16, meta 32, caps lock 64, num lock 128. Hyper is
+/// left out and meta counts as Alt; the locks are not modifiers here.
+fn kitty_modifiers(param: u32) -> KeyModifiers {
+    let bits = param.saturating_sub(1);
+    let mut m = KeyModifiers::NONE;
+    if bits & 1 != 0 {
+        m |= KeyModifiers::SHIFT;
+    }
+    if bits & (2 | 32) != 0 {
+        m |= KeyModifiers::ALT;
+    }
+    if bits & 4 != 0 {
+        m |= KeyModifiers::CTRL;
+    }
+    if bits & 8 != 0 {
+        m |= KeyModifiers::SUPER;
+    }
+    m
 }
 
 /// xterm sends modifiers as `1 + bitmask`: shift 1, alt 2, ctrl 4, meta 8.
@@ -479,6 +652,8 @@ struct Paste {
 /// got its end marker.
 #[derive(Default)]
 pub struct Parser {
+    /// Whether the terminal was asked for the kitty keyboard protocol.
+    kitty: bool,
     buf: Vec<u8>,
     paste: Option<Paste>,
     /// Inside a CSI sequence that was too long to keep, dropping bytes up to
@@ -490,6 +665,16 @@ impl Parser {
     /// An empty parser.
     pub fn new() -> Self {
         Parser::default()
+    }
+
+    /// A parser for a terminal that was asked for the kitty keyboard
+    /// protocol. The modifiers of a key are then read the kitty way even
+    /// when a key press carries no event type: in `CSI 1;9 A`, 9 is Super,
+    /// where in the xterm form it is Meta. Without this the parser still
+    /// reads a kitty form when the sequence itself shows it is one.
+    pub fn with_keyboard_enhancement(mut self, on: bool) -> Self {
+        self.kitty = on;
+        self
     }
 
     /// Adds bytes read from the terminal.
@@ -509,7 +694,7 @@ impl Parser {
             if self.buf.is_empty() {
                 return None;
             }
-            match parse_one(&self.buf) {
+            match parse_one(&self.buf, self.kitty) {
                 Step::Event(event, n) => {
                     self.buf.drain(..n);
                     return Some(event);
@@ -668,18 +853,9 @@ mod tests {
 
     #[test]
     fn key_helpers_match_a_key_on_its_own_or_with_ctrl() {
-        let plain = KeyEvent {
-            code: KeyCode::Char('q'),
-            modifiers: KeyModifiers::NONE,
-        };
-        let ctrl = KeyEvent {
-            code: KeyCode::Char('c'),
-            modifiers: KeyModifiers::CTRL,
-        };
-        let ctrl_alt = KeyEvent {
-            code: KeyCode::Char('c'),
-            modifiers: KeyModifiers::CTRL | KeyModifiers::ALT,
-        };
+        let plain = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let ctrl = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CTRL);
+        let ctrl_alt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CTRL | KeyModifiers::ALT);
         assert!(plain.is(KeyCode::Char('q')));
         assert!(!plain.is(KeyCode::Char('w')));
         assert!(!plain.is_ctrl('q'));
@@ -940,6 +1116,190 @@ mod tests {
         assert_eq!(p.next_event(), Some(Event::Paste("partial".into())));
     }
 
+    fn kitty(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers).with_kind(kind))
+    }
+
+    #[test]
+    fn kitty_keys_carry_their_modifiers_and_kind() {
+        use KeyEventKind::{Press, Release, Repeat};
+        let none = KeyModifiers::NONE;
+        let cases: &[(&[u8], Event)] = &[
+            (b"\x1b[97;5u", kitty(KeyCode::Char('a'), CTRL, Press)),
+            (b"\x1b[97;5:1u", kitty(KeyCode::Char('a'), CTRL, Press)),
+            (b"\x1b[97;5:2u", kitty(KeyCode::Char('a'), CTRL, Repeat)),
+            (b"\x1b[97;5:3u", kitty(KeyCode::Char('a'), CTRL, Release)),
+            (
+                b"\x1b[97;6u",
+                kitty(KeyCode::Char('a'), CTRL | SHIFT, Press),
+            ),
+            (b"\x1b[97;3u", kitty(KeyCode::Char('a'), ALT, Press)),
+            (
+                b"\x1b[97;9u",
+                kitty(KeyCode::Char('a'), KeyModifiers::SUPER, Press),
+            ),
+            (b"\x1b[27u", kitty(KeyCode::Esc, none, Press)),
+            (b"\x1b[27;1:3u", kitty(KeyCode::Esc, none, Release)),
+            (b"\x1b[13u", kitty(KeyCode::Enter, none, Press)),
+            (b"\x1b[13;2u", kitty(KeyCode::Enter, SHIFT, Press)),
+            (b"\x1b[9u", kitty(KeyCode::Tab, none, Press)),
+            (b"\x1b[9;2u", kitty(KeyCode::BackTab, SHIFT, Press)),
+            (b"\x1b[127u", kitty(KeyCode::Backspace, none, Press)),
+            (b"\x1b[1;1:3A", kitty(KeyCode::Up, none, Release)),
+            (b"\x1b[1;5:2C", kitty(KeyCode::Right, CTRL, Repeat)),
+            (b"\x1b[3;2:3~", kitty(KeyCode::Delete, SHIFT, Release)),
+            (b"\x1b[15;5:1~", kitty(KeyCode::F(5), CTRL, Press)),
+            (b"\x1b[1;3:3P", kitty(KeyCode::F(1), ALT, Release)),
+            (b"\x1b[57376u", kitty(KeyCode::F(13), none, Press)),
+            (b"\x1b[57398u", kitty(KeyCode::F(35), none, Press)),
+            (b"\x1b[57399u", kitty(KeyCode::Char('0'), none, Press)),
+            (b"\x1b[57408u", kitty(KeyCode::Char('9'), none, Press)),
+            (b"\x1b[57414u", kitty(KeyCode::Enter, none, Press)),
+            (b"\x1b[57413;5u", kitty(KeyCode::Char('+'), CTRL, Press)),
+            // Caps lock and num lock are not modifiers here.
+            (b"\x1b[97;69u", kitty(KeyCode::Char('a'), CTRL, Press)),
+            (b"\x1b[97;129u", kitty(KeyCode::Char('a'), none, Press)),
+            // Shift alone gives the typed character, like plain text does.
+            (b"\x1b[97:65;2u", kitty(KeyCode::Char('A'), none, Press)),
+            (b"\x1b[228;5u", kitty(KeyCode::Char('ä'), CTRL, Press)),
+            (b"\x1b[128512u", kitty(KeyCode::Char('😀'), none, Press)),
+        ];
+        for (bytes, want) in cases {
+            assert_eq!(
+                &parse(bytes),
+                &vec![want.clone()],
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+            assert_eq!(
+                &parse_split(bytes),
+                &vec![want.clone()],
+                "split {:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn a_parser_told_about_the_protocol_reads_every_modifier_field_the_kitty_way() {
+        let mut p = Parser::new().with_keyboard_enhancement(true);
+        p.feed(b"\x1b[1;9A\x1b[1;9:3A\x1b[15;9~\x1b[1;33A\x1b[97;33u");
+        let got = events(&mut p);
+        let want = vec![
+            kitty(KeyCode::Up, KeyModifiers::SUPER, KeyEventKind::Press),
+            kitty(KeyCode::Up, KeyModifiers::SUPER, KeyEventKind::Release),
+            kitty(KeyCode::F(5), KeyModifiers::SUPER, KeyEventKind::Press),
+            kitty(KeyCode::Up, ALT, KeyEventKind::Press),
+            kitty(KeyCode::Char('a'), ALT, KeyEventKind::Press),
+        ];
+        assert_eq!(got, want);
+        // Without it the press is the xterm form.
+        assert_eq!(parse(b"\x1b[1;9A"), vec![km(KeyCode::Up, ALT)]);
+    }
+
+    #[test]
+    fn the_keypad_with_num_lock_off_sends_navigation_keys() {
+        for (code, want) in [
+            (57417, KeyCode::Left),
+            (57418, KeyCode::Right),
+            (57419, KeyCode::Up),
+            (57420, KeyCode::Down),
+            (57421, KeyCode::PageUp),
+            (57422, KeyCode::PageDown),
+            (57423, KeyCode::Home),
+            (57424, KeyCode::End),
+            (57425, KeyCode::Insert),
+            (57426, KeyCode::Delete),
+        ] {
+            let bytes = format!("\x1b[{code}u");
+            assert_eq!(
+                parse(bytes.as_bytes()),
+                vec![kitty(want, KeyModifiers::NONE, KeyEventKind::Press)]
+            );
+        }
+        assert_eq!(parse(b"\x1b[57416u"), vec![ch(',')]);
+        // KP_BEGIN has no key.
+        assert_eq!(parse(b"\x1b[57427u"), vec![]);
+    }
+
+    #[test]
+    fn the_release_of_a_shifted_letter_matches_the_press_that_came_as_text() {
+        use KeyEventKind::Release;
+        assert_eq!(parse(b"A"), vec![ch('A')]);
+        assert_eq!(
+            parse(b"\x1b[97;2:3u"),
+            vec![kitty(KeyCode::Char('A'), KeyModifiers::NONE, Release)]
+        );
+        // Not for a key with more than shift, or a character without a case.
+        assert_eq!(
+            parse(b"\x1b[97;6:3u"),
+            vec![kitty(KeyCode::Char('a'), CTRL | SHIFT, Release)]
+        );
+        assert_eq!(
+            parse(b"\x1b[49;2:3u"),
+            vec![kitty(KeyCode::Char('1'), SHIFT, Release)]
+        );
+        // `ß` uppercases to two characters, so it stays.
+        assert_eq!(
+            parse("\x1b[223;2:3u".as_bytes()),
+            vec![kitty(KeyCode::Char('ß'), SHIFT, Release)]
+        );
+    }
+
+    #[test]
+    fn a_paste_start_with_a_sub_field_is_not_a_paste() {
+        assert_eq!(parse(b"\x1b[200:1~x"), vec![ch('x')]);
+    }
+
+    #[test]
+    fn the_xterm_forms_keep_their_meaning_next_to_the_kitty_ones() {
+        // Bit 8 is Meta in the xterm form, which counts as Alt.
+        assert_eq!(parse(b"\x1b[1;9A"), vec![km(KeyCode::Up, ALT)]);
+        // With an event type it is the kitty form, where bit 8 is Super.
+        assert_eq!(
+            parse(b"\x1b[1;9:1A"),
+            vec![kitty(KeyCode::Up, KeyModifiers::SUPER, KeyEventKind::Press)]
+        );
+        assert_eq!(parse(b"\x1b[1;5A"), vec![km(KeyCode::Up, CTRL)]);
+    }
+
+    #[test]
+    fn keys_the_protocol_reports_that_are_not_for_the_keyboard_are_dropped() {
+        // Modifier keys, media keys, and codes that are not characters.
+        for bytes in [
+            &b"\x1b[57441u"[..],
+            b"\x1b[57428u",
+            b"\x1b[63743u",
+            b"\x1b[0u",
+            b"\x1b[1114112u",
+            b"\x1b[55296u",
+            b"\x1b[7u",
+        ] {
+            assert_eq!(parse(bytes), vec![], "{:?}", String::from_utf8_lossy(bytes));
+        }
+        assert_eq!(parse(b"\x1b[57441ux"), vec![ch('x')]);
+    }
+
+    #[test]
+    fn a_release_is_not_a_press_for_the_key_helpers() {
+        let press = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let release = press.with_kind(KeyEventKind::Release);
+        let repeat = press.with_kind(KeyEventKind::Repeat);
+        assert!(press.is(KeyCode::Char('q')) && repeat.is(KeyCode::Char('q')));
+        assert!(!release.is(KeyCode::Char('q')));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CTRL);
+        assert!(ctrl_c.is_ctrl('c'));
+        assert!(!ctrl_c.with_kind(KeyEventKind::Release).is_ctrl('c'));
+    }
+
+    #[test]
+    fn alt_before_a_kitty_key_adds_alt() {
+        assert_eq!(
+            parse(b"\x1b\x1b[97;5u"),
+            vec![kitty(KeyCode::Char('a'), CTRL | ALT, KeyEventKind::Press)]
+        );
+    }
+
     #[test]
     fn unknown_sequences_are_dropped_without_eating_what_follows() {
         assert_eq!(
@@ -949,7 +1309,8 @@ mod tests {
         assert_eq!(parse(b"\x1b[?1;2cx"), vec![ch('x')]);
         assert_eq!(parse(b"\x1b[200;5~x"), vec![ch('x')]);
         assert_eq!(parse(b"\x1b[27;5;9~x"), vec![ch('x')]);
-        assert_eq!(parse(b"\x1b[97;5ux"), vec![ch('x')]);
+        // A modifier key on its own is not for the app.
+        assert_eq!(parse(b"\x1b[57441;5ux"), vec![ch('x')]);
         assert_eq!(parse(b"\x1bO~x"), vec![ch('x')]);
     }
 

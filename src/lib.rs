@@ -51,7 +51,8 @@ pub use effects::{Closed, Sender};
 pub use frame::Frame;
 pub use geometry::Rect;
 pub use input::{
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseKind, Parser,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseKind,
+    Parser,
 };
 pub use layout::{Constraint, Edges, Justify, Layout};
 pub use render::Renderer;
