@@ -306,3 +306,106 @@ fn a_background_note_in_the_middle_of_an_answer_does_not_swallow_the_tokens() {
         "the answer picked up the note's dim style"
     );
 }
+
+/// The stress scenario from the design: a transcript of 20,000 lines with
+/// answers streaming into it, tool calls, a spinner, background notes, typing
+/// and resizes. A frame is drawn after every message, which is more often than
+/// the runtime does it.
+#[test]
+fn a_long_transcript_with_streaming_never_repaints_the_screen_per_token() {
+    const TRANSCRIPT: usize = 20_000;
+    const REQUESTS: usize = 6;
+    const TOKENS: usize = 400;
+    let mut a = agent().with_history(TRANSCRIPT);
+    let mut renderer = Renderer::new(120, 40);
+    let mut all_bytes = 0usize;
+    let mut frame = |a: &Agent, r: &mut Renderer| {
+        let started = std::time::Instant::now();
+        let bytes = r.draw_frame(|f| a.view(f)).len();
+        (bytes, started.elapsed())
+    };
+
+    // What repainting everything costs: the first frame, on a fresh renderer.
+    let (full, _) = frame(&a, &mut renderer);
+    assert!(full > 4_000, "the screen is nearly empty: {full} bytes");
+
+    let mut token_frames = Vec::new();
+    let mut times = Vec::new();
+    for request in 0..REQUESTS {
+        a.update(Msg::Submit(format!("request {request}")));
+        frame(&a, &mut renderer);
+        for t in 0..TOKENS {
+            a.update(Msg::Token(format!("word{t} ")));
+            if t % 9 == 8 {
+                a.update(Msg::Token("\n".into()));
+            }
+            if t % 3 == 0 {
+                a.update(Msg::Spin);
+            }
+            if t % 40 == 20 {
+                a.update(Msg::ToolStarted("run_tests".into()));
+                a.update(Msg::ToolFinished("run_tests".into()));
+            }
+            if t % 50 == 0 {
+                a.update(Msg::Clock);
+            }
+            if t % 25 == 0 {
+                type_text(&mut a, "x");
+            }
+            let (bytes, took) = frame(&a, &mut renderer);
+            assert!(
+                bytes < full / 2,
+                "token {t} of request {request} wrote {bytes} bytes; a full repaint is {full}"
+            );
+            token_frames.push(bytes);
+            times.push(took);
+            all_bytes += bytes;
+        }
+        a.update(Msg::Finished);
+        // A resize repaints on purpose. Every frame after it is small again.
+        let (w, h) = if request % 2 == 0 {
+            (90, 30)
+        } else {
+            (120, 40)
+        };
+        renderer.resize(w, h);
+        a.update(Msg::Resize(w, h));
+        let (bytes, _) = frame(&a, &mut renderer);
+        assert!(bytes > 1_000, "a resize should repaint, wrote {bytes}");
+        full_repaint_reference(&mut a, &mut renderer, &mut frame);
+    }
+
+    token_frames.sort_unstable();
+    times.sort_unstable();
+    let count = token_frames.len();
+    let mean = all_bytes / count;
+    eprintln!(
+        "stress: {count} token frames, bytes mean {mean}, median {}, p99 {}, max {}; \
+         frame time median {:?}, p99 {:?}, max {:?}; full repaint {full}",
+        token_frames[count / 2],
+        token_frames[count * 99 / 100],
+        token_frames[count - 1],
+        times[count / 2],
+        times[count * 99 / 100],
+        times[count - 1],
+    );
+    assert!(
+        mean < full / 8,
+        "a token cost {mean} bytes on average; a full repaint is {full}"
+    );
+    assert!(
+        token_frames[count / 2] < 800,
+        "the typical token cost {} bytes",
+        token_frames[count / 2]
+    );
+}
+
+/// Draws twice with nothing changed in between: the second frame is empty.
+fn full_repaint_reference(
+    a: &mut Agent,
+    renderer: &mut Renderer,
+    frame: &mut impl FnMut(&Agent, &mut Renderer) -> (usize, std::time::Duration),
+) {
+    let (bytes, _) = frame(a, renderer);
+    assert_eq!(bytes, 0, "an unchanged view still wrote to the terminal");
+}

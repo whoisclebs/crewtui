@@ -57,6 +57,28 @@ A streamed token writes a few hundred bytes on average instead of redrawing the 
 
 A width change is the expensive case. The frame itself is under a millisecond, because only what is on screen has to be counted again. The last row is different. A scrollbar needs the total number of rows, and after a width change that means counting every entry again: 75 ms for 20,000 entries here. It is paid once per width, and cached after that, but an app that drags its window edge with a scrollbar on a very long transcript will feel it. Making that cheaper is tracked in #54.
 
+## The reference app under stress
+
+`a_long_transcript_with_streaming_never_repaints_the_screen_per_token` in `src/agent_tests.rs` runs the agent from `examples/agent.rs` headless: 20,000 lines of history, six answers of 400 tokens each, a newline every 9 tokens, a spinner tick every third token, two tool calls and a background note per answer, typing in the input, and a resize after each answer. It draws a frame after every message, which is more often than the runtime does, and it fails when
+
+- a token frame writes half of what a full repaint writes,
+- the mean over all token frames is more than an eighth of a full repaint,
+- the median token frame writes 800 bytes or more,
+- a resize does not repaint, or an unchanged view writes anything.
+
+On a 120x40 screen a full repaint is 6,455 bytes. Over 2,400 token frames (`cargo test --release --lib a_long_transcript -- --nocapture` prints this):
+
+| | Bytes | Time |
+|---|---|---|
+| median | 32 | 195 µs |
+| mean | 312 | |
+| 99th percentile | 2,678 | 376 µs |
+| max | 2,880 | 529 µs |
+
+Most tokens change a few cells of the last line, hence the median of 32 bytes. A token that starts a new line scrolls the history pane, and every row of it changes; that is the 2.7 KB tail. A terminal scroll region would make it cheaper, and it was not tried.
+
+For a profile, the same run was split into stages with a timer around each, on a scratch test that is not kept: updating the state costs about 0.1 µs per token, drawing the view 190 µs, and diffing plus building the bytes 20 µs. Nearly all of the view is `History`, which wraps and draws the rows on screen. Nothing in it stands out as something to fix now. The one slow path the run found is the known one: a frame whose width differs from the last one, with a scrollbar, takes tens of milliseconds because the total row count is measured again (#54). The agent does not hit it while streaming, only when the window is resized.
+
 ## Running it
 
 ```
