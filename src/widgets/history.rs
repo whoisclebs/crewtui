@@ -234,13 +234,15 @@ impl HistoryState {
 
     /// Rows the whole transcript takes at the width it was last drawn at.
     ///
-    /// After a change of width, entries are counted again in batches of 160,
-    /// one batch per call, so a scrollbar doesn't stall a frame on a very long transcript.
-    /// Until every entry is counted the result is an estimate, the average of
-    /// the ones counted so far times the number of entries, and it settles
-    /// over the next calls. It is exact when everything is counted, which is
-    /// always the case for a transcript of up to 160 entries.
+    /// After a change of width the entries are counted again, 160 per call,
+    /// so that a scrollbar doesn't stall a frame on a very long transcript.
+    /// Until every entry is counted the result is an estimate: the rows
+    /// counted so far plus their average for each entry left. It settles as
+    /// this is called again, which a scrollbar does on every frame. It is
+    /// exact once everything is counted, and at once for a transcript of up
+    /// to 160 entries.
     pub fn content_rows(&self) -> usize {
+        self.count_more(self.entries.len());
         self.rows_before(self.entries.len())
     }
 
@@ -249,18 +251,24 @@ impl HistoryState {
     /// [`HistoryState::viewport_rows`] this is what a
     /// [`Scrollbar`](crate::widgets::Scrollbar) needs.
     ///
-    /// At the start of the transcript this is 0, and when following the end
-    /// it is as far down as the scrollbar goes, whether or not every entry
-    /// has been counted yet. Anywhere else it is an estimate until they are.
+    /// This is 0 at the start of the transcript, and when following the end it
+    /// is where the scrollbar thumb sits at the bottom of `content_rows`, as
+    /// long as both are asked for in the same frame. Anywhere else it is an
+    /// estimate, like `content_rows`, until everything is counted, and it
+    /// never goes past the last position the scrollbar can show.
     pub fn position(&self) -> usize {
         if self.entries.is_empty() {
             return 0;
         }
+        self.count_first_batch();
+        let end = self
+            .rows_before(self.entries.len())
+            .saturating_sub(self.viewport_rows());
         if self.is_following() {
-            return self.content_rows().saturating_sub(self.viewport_rows());
+            return end;
         }
         let top = self.resolve_top();
-        self.rows_before(top.entry) + top.row
+        (self.rows_before(top.entry) + top.row).min(end)
     }
 
     /// How many rows the view had the last time it was drawn.
@@ -369,10 +377,9 @@ impl HistoryState {
         (line, row - above)
     }
 
-    /// Rows of all entries before entry `i`. Counts at most `COUNT_PER_CALL`
-    /// entries that were not counted yet, and estimates the rest from the
-    /// average of the ones that were.
-    fn rows_before(&self, i: usize) -> usize {
+    /// Counts the entries that were not counted yet at the current width, in
+    /// order, up to entry `upto` and at most `COUNT_PER_CALL` of them.
+    fn count_more(&self, upto: usize) {
         let view = self.view.get();
         let mut prefix = self.prefix.borrow_mut();
         if prefix.key != Some((view.width, view.wrap)) {
@@ -382,18 +389,41 @@ impl HistoryState {
         if prefix.sums.is_empty() {
             prefix.sums.push(0);
         }
-        let stop = i.min(prefix.sums.len() - 1 + COUNT_PER_CALL);
+        let stop = upto.min(prefix.sums.len() - 1 + COUNT_PER_CALL);
         while prefix.sums.len() <= stop {
             let j = prefix.sums.len() - 1;
             let next = prefix.sums[j] + self.rows_of(j);
             prefix.sums.push(next);
         }
-        if stop == i {
-            return prefix.sums[i];
+    }
+
+    /// Rows of all entries before entry `i`, from what is counted so far: exact
+    /// when entry `i` is reached, and otherwise the counted rows plus the
+    /// average of them for each entry not counted yet.
+    fn rows_before(&self, i: usize) -> usize {
+        let prefix = self.prefix.borrow();
+        let counted = prefix.sums.len().saturating_sub(1);
+        if i <= counted {
+            return prefix.sums.get(i).copied().unwrap_or(0);
         }
-        let counted = prefix.sums.len() - 1;
+        if counted == 0 {
+            // Nothing counted, which only happens when nothing was asked for
+            // yet: a row per entry is the least an entry takes.
+            return i;
+        }
         let so_far = prefix.sums[counted];
         so_far + (i - counted) * so_far / counted
+    }
+
+    /// Counts one batch, unless a batch has been counted already. That makes
+    /// a transcript of up to `COUNT_PER_CALL` entries exact for whoever asks,
+    /// and leaves the counting of a longer one to `content_rows`, so that the
+    /// two agree within a frame however they are called.
+    fn count_first_batch(&self) {
+        let counted = self.prefix.borrow().sums.len().saturating_sub(1);
+        if counted < COUNT_PER_CALL.min(self.entries.len()) {
+            self.count_more(self.entries.len());
+        }
     }
 
     /// Where the top of the view is when it shows the end.
@@ -957,11 +987,54 @@ mod tests {
         assert!(n <= 1, "{n}");
     }
 
+    /// A transcript whose first entries are nothing like the rest gives a bad
+    /// first estimate. The scrollbar still has to be consistent in every
+    /// frame: the thumb at the bottom while following, and never a position
+    /// past the end.
+    #[test]
+    fn the_thumb_stays_consistent_while_the_estimate_settles() {
+        let long = "aaaa bbbb cccc dddd ".repeat(5);
+        let mut s = HistoryState::new();
+        for i in 0..20_000 {
+            s.push(if i < COUNT_PER_CALL {
+                long.as_str()
+            } else {
+                "a"
+            });
+        }
+        draw(&s, 120, 10);
+        for width in [30, 25] {
+            draw(&s, width, 10);
+            for frame in 0..200 {
+                let content = s.content_rows();
+                let position = s.position();
+                assert_eq!(
+                    position,
+                    content.saturating_sub(s.viewport_rows()),
+                    "following, width {width}, frame {frame}"
+                );
+            }
+        }
+        // Anchored: never past the end, whatever the estimate says.
+        s.scroll_up(10_000);
+        for width in [30, 20] {
+            draw(&s, width, 10);
+            for frame in 0..200 {
+                let content = s.content_rows();
+                let position = s.position();
+                assert!(
+                    position <= content.saturating_sub(s.viewport_rows()),
+                    "anchored, width {width}, frame {frame}: {position} of {content}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_estimate_settles_on_the_exact_count_and_the_ends_are_exact_before() {
         let mut s = HistoryState::new();
         for i in 0..3_000 {
-            // One row, or three at width 10.
+            // One row, or two at width 10.
             s.push(if i % 4 == 0 {
                 "aaaa bbbb cccc dddd"
             } else {
@@ -973,7 +1046,7 @@ mod tests {
         // Following: the thumb is at the very end, whatever the estimate is.
         let first = s.content_rows();
         assert!(first.abs_diff(exact) < exact / 10, "{first} vs {exact}");
-        assert_eq!(s.position(), s.content_rows() - s.viewport_rows());
+        assert_eq!(s.position(), first - s.viewport_rows());
         // At the start: exact at once.
         s.scroll_to_top();
         assert_eq!(s.position(), 0);
