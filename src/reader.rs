@@ -9,13 +9,14 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::runtime::Input;
 use crate::signals::new_pipe;
 use crate::{Parser, Signals};
 
 /// How long a lone Esc waits to see whether a sequence follows.
-const ESCAPE_TIMEOUT_MS: libc::c_int = 50;
+pub(crate) const ESCAPE_TIMEOUT_MS: libc::c_int = 50;
 /// How long a paste may sit idle before it is given up on.
 const PASTE_IDLE_MS: libc::c_int = 1000;
 const READ_SIZE: usize = 4096;
@@ -24,7 +25,7 @@ const READ_SIZE: usize = 4096;
 pub(crate) struct InputReader {
     wake_write: RawFd,
     wake_read: RawFd,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<Option<Signals>>>,
 }
 
 impl InputReader {
@@ -34,10 +35,20 @@ impl InputReader {
         signals: Option<Signals>,
         tx: Sender<Input<M>>,
     ) -> io::Result<InputReader> {
+        InputReader::spawn_with(input, signals, tx, ESCAPE_TIMEOUT_MS)
+    }
+
+    /// Like `spawn`, with the time a lone Esc waits for a sequence to follow.
+    pub(crate) fn spawn_with<M: Send + 'static>(
+        input: RawFd,
+        signals: Option<Signals>,
+        tx: Sender<Input<M>>,
+        escape_timeout_ms: libc::c_int,
+    ) -> io::Result<InputReader> {
         let (wake_read, wake_write) = new_pipe()?;
         let thread = thread::Builder::new()
             .name("crewtui-input".into())
-            .spawn(move || read_loop(input, wake_read, signals, &tx))
+            .spawn(move || read_loop(input, wake_read, signals, &tx, escape_timeout_ms))
             .inspect_err(|_| close_pair(wake_read, wake_write))?;
         Ok(InputReader {
             wake_write,
@@ -45,16 +56,27 @@ impl InputReader {
             thread: Some(thread),
         })
     }
-}
 
-impl Drop for InputReader {
-    fn drop(&mut self) {
+    /// Stops the thread and hands back the signal handlers it was holding,
+    /// so the caller decides when they are uninstalled.
+    pub(crate) fn finish(mut self) -> Option<Signals> {
+        self.wake();
+        self.thread.take().and_then(|t| t.join().ok()).flatten()
+    }
+
+    fn wake(&self) {
         // SAFETY: writes one byte from a live local to a pipe we own. If the
         // pipe is full a wake-up is already pending, so a failure is fine.
         unsafe {
             let byte = 1u8;
             libc::write(self.wake_write, (&byte as *const u8).cast(), 1);
         }
+    }
+}
+
+impl Drop for InputReader {
+    fn drop(&mut self) {
+        self.wake();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -98,19 +120,37 @@ fn read_some(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-fn read_loop<M>(input: RawFd, wake: RawFd, mut signals: Option<Signals>, tx: &Sender<Input<M>>) {
+/// Runs until told to stop or the input ends, then returns the signal
+/// handlers rather than dropping them.
+fn read_loop<M>(
+    input: RawFd,
+    wake: RawFd,
+    mut signals: Option<Signals>,
+    tx: &Sender<Input<M>>,
+    escape_timeout_ms: libc::c_int,
+) -> Option<Signals> {
     let mut parser = Parser::new();
+    // When input last arrived. The Esc and paste timeouts count from here,
+    // so a signal waking the loop doesn't restart them.
+    let mut last_input = Instant::now();
     let mut buf = [0u8; READ_SIZE];
     let readable =
         |p: &libc::pollfd| p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
     loop {
-        let timeout = if parser.is_pasting() {
-            PASTE_IDLE_MS
+        let limit = if parser.is_pasting() {
+            Some(PASTE_IDLE_MS)
         } else if parser.is_waiting() {
-            ESCAPE_TIMEOUT_MS
+            Some(escape_timeout_ms)
         } else {
-            -1
+            None
         };
+        let timeout = limit.map_or(-1, |limit| {
+            let left = Duration::from_millis(limit as u64).saturating_sub(last_input.elapsed());
+            // Round up, so a wake-up just short of the limit doesn't spin.
+            left.as_micros()
+                .div_ceil(1000)
+                .min(libc::c_int::MAX as u128) as libc::c_int
+        });
         let mut fds = vec![
             libc::pollfd {
                 fd: input,
@@ -134,17 +174,17 @@ fn read_loop<M>(input: RawFd, wake: RawFd, mut signals: Option<Signals>, tx: &Se
             Ok(n) => n,
             Err(e) => {
                 let _ = tx.send(Input::Failed(e));
-                return;
+                return signals;
             }
         };
         if readable(&fds[1]) {
-            return;
+            return signals;
         }
         if fds.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
             // A closed or invalid descriptor would make `poll` return at
             // once forever, so report it instead of spinning.
             let _ = tx.send(Input::Failed(io::Error::from_raw_os_error(libc::EBADF)));
-            return;
+            return signals;
         }
         if ready == 0 {
             let event = if parser.is_pasting() {
@@ -157,7 +197,7 @@ fn read_loop<M>(input: RawFd, wake: RawFd, mut signals: Option<Signals>, tx: &Se
                 .chain(std::iter::from_fn(|| parser.next_event()))
             {
                 if tx.send(Input::Event(event)).is_err() {
-                    return;
+                    return signals;
                 }
             }
             continue;
@@ -168,13 +208,13 @@ fn read_loop<M>(input: RawFd, wake: RawFd, mut signals: Option<Signals>, tx: &Se
                     Ok(list) => {
                         for signal in list {
                             if tx.send(Input::Signal(signal)).is_err() {
-                                return;
+                                return signals;
                             }
                         }
                     }
                     Err(e) => {
                         let _ = tx.send(Input::Failed(e));
-                        return;
+                        return signals;
                     }
                 }
             }
@@ -183,19 +223,20 @@ fn read_loop<M>(input: RawFd, wake: RawFd, mut signals: Option<Signals>, tx: &Se
             match read_some(input, &mut buf) {
                 Ok(0) => {
                     let _ = tx.send(Input::Failed(io::ErrorKind::UnexpectedEof.into()));
-                    return;
+                    return signals;
                 }
                 Ok(n) => {
+                    last_input = Instant::now();
                     parser.feed(&buf[..n]);
                     while let Some(event) = parser.next_event() {
                         if tx.send(Input::Event(event)).is_err() {
-                            return;
+                            return signals;
                         }
                     }
                 }
                 Err(e) => {
                     let _ = tx.send(Input::Failed(e));
-                    return;
+                    return signals;
                 }
             }
         }
@@ -296,9 +337,11 @@ mod tests {
     fn a_sequence_split_across_reads_is_not_mistaken_for_esc() {
         let feed = Feed::new();
         let (tx, rx) = channel();
-        let _reader = InputReader::spawn(feed.read, None, tx).unwrap();
+        // A timeout far longer than the gap, so a slow machine can't turn
+        // this into an Esc.
+        let _reader = InputReader::spawn_with(feed.read, None, tx, 5_000).unwrap();
         feed.send(b"\x1b");
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(20));
         feed.send(b"[A");
         assert_eq!(next_event(&rx), key(KeyCode::Up));
     }
@@ -366,6 +409,42 @@ mod tests {
         drop(reader);
         assert!(started.elapsed() < Duration::from_secs(1));
         // The thread owned the handlers; they can be installed again.
+        drop(Signals::install().unwrap());
+    }
+
+    #[test]
+    fn a_stream_of_signals_does_not_postpone_a_lone_escape() {
+        let _lock = serial();
+        let feed = Feed::new();
+        let signals = Signals::install().unwrap();
+        let (tx, rx) = channel::<Input<()>>();
+        let _reader = InputReader::spawn(feed.read, Some(signals), tx).unwrap();
+        feed.send(b"\x1b");
+        let started = Instant::now();
+        let mut got_esc = false;
+        while started.elapsed() < Duration::from_secs(2) && !got_esc {
+            // SAFETY: `raise` takes a signal number and has no other preconditions.
+            assert_eq!(unsafe { libc::raise(libc::SIGWINCH) }, 0);
+            std::thread::sleep(Duration::from_millis(5));
+            got_esc = rx
+                .try_iter()
+                .any(|i| matches!(i, Input::Event(e) if e == key(KeyCode::Esc)));
+        }
+        assert!(got_esc, "the Esc never arrived while signals kept coming");
+    }
+
+    #[test]
+    fn finish_hands_the_signal_handlers_back_still_installed() {
+        let _lock = serial();
+        let feed = Feed::new();
+        let signals = Signals::install().unwrap();
+        let (tx, _rx) = channel::<Input<()>>();
+        let reader = InputReader::spawn(feed.read, Some(signals), tx).unwrap();
+        let held = reader.finish();
+        assert!(held.is_some());
+        // Still installed, so a second install is refused until it is dropped.
+        assert!(Signals::install().is_err());
+        drop(held);
         drop(Signals::install().unwrap());
     }
 

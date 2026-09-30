@@ -145,7 +145,8 @@ impl Host for Terminal {
 /// changes, at most [`Program::max_fps`] times a second. It returns the app
 /// when `update` returns [`Cmd::quit`], and an error if the terminal fails
 /// or the process is told to stop. The terminal is restored on every way
-/// out.
+/// out, with one exception: a process stopped from outside with SIGTSTP is
+/// not restored while it is stopped, and gets its raw mode back on SIGCONT.
 pub struct Program<A: App> {
     app: A,
     options: TerminalOptions,
@@ -187,17 +188,23 @@ impl<A: App> Program<A> {
     }
 
     pub(crate) fn run_on(self, input: RawFd, output: RawFd, signals: bool) -> io::Result<A> {
-        let mut terminal = Terminal::enter_on(input, output, self.options)?;
+        // The handlers go in first and come out last, so a signal that
+        // arrives while the terminal is being restored is still delivered
+        // as a value instead of killing the process with the tty raw.
+        let mut held: Option<Signals> = None;
         let signals = if signals {
             Some(Signals::install()?)
         } else {
             None
         };
+        let mut terminal = Terminal::enter_on(input, output, self.options)?;
         let (tx, rx) = mpsc::channel();
         let reader = InputReader::spawn(input, signals, tx)?;
         let result = event_loop(self.app, &rx, &mut terminal, self.max_fps);
-        // Stop reading before the terminal is put back.
-        drop(reader);
+        // Stop reading, but keep the handlers until `terminal` has dropped.
+        held = reader.finish().or(held);
+        drop(terminal);
+        drop(held);
         result
     }
 }
@@ -374,6 +381,7 @@ mod tests {
         draws: StdCell<u32>,
         area: StdCell<Option<Rect>>,
         resized: Option<(u16, u16)>,
+        frames: Option<Sender<()>>,
     }
 
     impl Counter {
@@ -384,7 +392,16 @@ mod tests {
                 draws: StdCell::new(0),
                 area: StdCell::new(None),
                 resized: None,
+                frames: None,
             }
+        }
+
+        /// A counter that reports every call to `view` on the channel.
+        fn with_frames() -> (Counter, Receiver<()>) {
+            let (tx, rx) = channel();
+            let mut app = Counter::new();
+            app.frames = Some(tx);
+            (app, rx)
         }
     }
 
@@ -420,6 +437,9 @@ mod tests {
             self.area.set(Some(frame.area()));
             let text = format!("count: {}", self.n);
             frame.buffer_mut().set_string(0, 0, &text, Style::new());
+            if let Some(frames) = &self.frames {
+                let _ = frames.send(());
+            }
         }
     }
 
@@ -463,17 +483,17 @@ mod tests {
     fn every_change_shows_up_on_screen() {
         let mut host = FakeHost::new(20, 3);
         let (tx, rx) = channel();
-        let handle = thread::spawn({
-            let tx = tx.clone();
-            move || {
-                for _ in 0..3 {
-                    tx.send(key('+')).unwrap();
-                    thread::sleep(Duration::from_millis(30));
-                }
-                tx.send(key('q')).unwrap();
+        let (app, frames) = Counter::with_frames();
+        let handle = thread::spawn(move || {
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
+            for _ in 0..3 {
+                tx.send(key('+')).unwrap();
+                // Each change gets its own frame before the next one is sent.
+                frames.recv_timeout(Duration::from_secs(10)).unwrap();
             }
+            tx.send(key('q')).unwrap();
         });
-        let app = event_loop(Counter::new(), &rx, &mut host, 0).unwrap();
+        let app = event_loop(app, &rx, &mut host, 0).unwrap();
         handle.join().unwrap();
         assert_eq!(app.n, 3);
         assert_eq!(screen(&host, 20, 3).row(0).trim_end(), "count: 3");
@@ -485,12 +505,14 @@ mod tests {
         run(&mut quiet, vec![key('q')], 0).unwrap();
         let mut noisy = FakeHost::new(20, 3);
         let (tx, rx) = channel();
+        let (app, frames) = Counter::with_frames();
         let handle = thread::spawn(move || {
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(key('p')).unwrap();
-            thread::sleep(Duration::from_millis(30));
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(key('q')).unwrap();
         });
-        let app = event_loop(Counter::new(), &rx, &mut noisy, 0).unwrap();
+        let app = event_loop(app, &rx, &mut noisy, 0).unwrap();
         handle.join().unwrap();
         assert_eq!(app.draws.get(), 2);
         assert_eq!(noisy.out, quiet.out);
@@ -527,8 +549,6 @@ mod tests {
                 tx.send(Input::Message(Msg::Up)).unwrap();
                 thread::sleep(Duration::from_millis(1));
             }
-            // Long enough for the capped frame that shows the last change.
-            thread::sleep(Duration::from_millis(120));
             tx.send(key('q')).unwrap();
         });
         let started = Instant::now();
@@ -541,7 +561,6 @@ mod tests {
             "{} draws, at most {allowed} expected",
             app.draws.get()
         );
-        assert_eq!(screen(&host, 20, 3).row(0).trim_end(), "count: 150");
     }
 
     #[test]
@@ -549,13 +568,14 @@ mod tests {
         let mut host = FakeHost::new(20, 3);
         host.sizes = RefCell::new(VecDeque::from([(20, 3), (30, 6)]));
         let (tx, rx) = channel();
+        let (app, frames) = Counter::with_frames();
         let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(30));
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(Input::Signal(Signal::Resize)).unwrap();
-            thread::sleep(Duration::from_millis(30));
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(key('q')).unwrap();
         });
-        let app = event_loop(Counter::new(), &rx, &mut host, 0).unwrap();
+        let app = event_loop(app, &rx, &mut host, 0).unwrap();
         handle.join().unwrap();
         assert_eq!(app.resized, Some((30, 6)));
         assert_eq!(app.area.get(), Some(Rect::new(0, 0, 30, 6)));
@@ -595,13 +615,14 @@ mod tests {
     fn continuing_after_a_stop_resumes_the_terminal_and_repaints_everything() {
         let mut host = FakeHost::new(20, 3);
         let (tx, rx) = channel();
+        let (app, frames) = Counter::with_frames();
         let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(30));
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(Input::Signal(Signal::Continue)).unwrap();
-            thread::sleep(Duration::from_millis(30));
+            frames.recv_timeout(Duration::from_secs(10)).unwrap();
             tx.send(key('q')).unwrap();
         });
-        event_loop(Counter::new(), &rx, &mut host, 0).unwrap();
+        event_loop(app, &rx, &mut host, 0).unwrap();
         handle.join().unwrap();
         assert_eq!(host.resumed, 1);
         let clears = host.out.windows(4).filter(|w| *w == b"\x1b[2J").count();

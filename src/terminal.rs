@@ -180,6 +180,15 @@ impl State {
         Ok(())
     }
 
+    /// Sets raw mode and the requested modes again on a terminal that is
+    /// still registered, in case something else changed them.
+    fn reapply(&self) -> io::Result<()> {
+        let mut raw = self.original;
+        make_raw(&mut raw);
+        set_termios(self.input, libc::TCSAFLUSH, &raw)?;
+        write_all_fd(self.output, &enable_sequence(&self.options))
+    }
+
     /// Undoes everything `activate` did. Only the first call does any work.
     fn restore(self: &Arc<Self>) -> io::Result<()> {
         if self.restored.swap(true, Ordering::SeqCst) {
@@ -307,16 +316,18 @@ impl Terminal {
         self.state.restore()
     }
 
-    /// Goes back to raw mode and the requested screen modes after the
-    /// terminal was restored, for instance by the panic hook when the app
-    /// caught the panic and carries on. Does nothing while the terminal is
-    /// active. The next frame has to repaint everything, so call
-    /// `Renderer::invalidate` too.
+    /// Goes back to raw mode and the requested screen modes. Use it after
+    /// the terminal was restored, for instance by the panic hook when the
+    /// app caught the panic and carries on, and after the process was
+    /// stopped and continued, since a shell may have reset the tty while it
+    /// was stopped. It is safe to call when nothing needs redoing. The next
+    /// frame has to repaint everything, so call `Renderer::invalidate` too.
     pub fn resume(&mut self) -> io::Result<()> {
         if self.state.restored.load(Ordering::SeqCst) {
-            self.state.activate()?;
+            self.state.activate()
+        } else {
+            self.state.reapply()
         }
-        Ok(())
     }
 }
 
@@ -494,8 +505,23 @@ mod tests {
         term.resume().unwrap();
         assert!(pty.is_raw());
         assert_eq!(pty.output(), ALL_ON);
+        drop(term);
+        assert!(same(&pty.termios(), &original));
+        assert_eq!(pty.output(), ALL_OFF);
+    }
+
+    #[test]
+    fn resume_reasserts_raw_mode_when_something_else_undid_it() {
+        // A shell resetting the tty while the process is stopped.
+        let pty = Pty::open();
+        let original = pty.termios();
+        let mut term = enter(&pty, ALL);
+        pty.output();
+        set_termios(pty.slave, libc::TCSANOW, &original).unwrap();
+        assert!(!pty.is_raw());
         term.resume().unwrap();
-        assert!(pty.output().is_empty());
+        assert!(pty.is_raw());
+        assert_eq!(pty.output(), ALL_ON);
         drop(term);
         assert!(same(&pty.termios(), &original));
         assert_eq!(pty.output(), ALL_OFF);
