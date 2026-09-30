@@ -54,7 +54,8 @@ impl Renderer {
     }
 
     /// Draws one frame. `f` receives a [`Frame`] whose buffer is blank and
-    /// covers the whole screen, and must not resize it. The returned bytes
+    /// covers the whole screen, and must not be replaced by a buffer of another
+    /// size. The returned bytes
     /// are what to write to the terminal.
     ///
     /// If the caller can't write them, or only some of them get through, it

@@ -271,6 +271,10 @@ fn install_panic_hook() {
 
 /// A terminal in raw mode. Dropping it restores the terminal.
 ///
+/// [`Program`](crate::Program) enters and restores the terminal for you, and
+/// is what most apps use. `Terminal` is the piece underneath it, for an app
+/// that runs a loop of its own.
+///
 /// Raw mode is what makes key presses arrive one at a time, unechoed and
 /// without signal generation. On top of it, [`TerminalOptions`] picks the
 /// screen and reporting modes. Everything that was turned on is turned off
