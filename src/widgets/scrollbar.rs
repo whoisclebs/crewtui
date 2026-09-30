@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::Widget;
 use crate::{Buffer, Rect, Style};
 
@@ -37,8 +39,8 @@ pub struct Scrollbar {
     content: usize,
     viewport: usize,
     position: usize,
-    track: &'static str,
-    thumb: &'static str,
+    track: Cow<'static, str>,
+    thumb: Cow<'static, str>,
     track_style: Style,
     thumb_style: Style,
 }
@@ -60,8 +62,8 @@ impl Scrollbar {
             content: 0,
             viewport: 0,
             position: 0,
-            track,
-            thumb: "█",
+            track: Cow::Borrowed(track),
+            thumb: Cow::Borrowed("█"),
             track_style: Style::new(),
             thumb_style: Style::new(),
         }
@@ -86,10 +88,16 @@ impl Scrollbar {
         self
     }
 
-    /// The symbols for the track and the thumb.
-    pub fn symbols(mut self, track: &'static str, thumb: &'static str) -> Self {
-        self.track = track;
-        self.thumb = thumb;
+    /// The symbols for the track and the thumb. A `&'static str` costs
+    /// nothing, and a `String`, for symbols that come from a config, works
+    /// too.
+    pub fn symbols(
+        mut self,
+        track: impl Into<Cow<'static, str>>,
+        thumb: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        self.track = track.into();
+        self.thumb = thumb.into();
         self
     }
 
@@ -130,9 +138,9 @@ impl Widget for Scrollbar {
         let (start, len) = thumb(track, self.content, self.viewport, self.position);
         for i in 0..track {
             let (symbol, style) = if i >= start && i < start + len {
-                (self.thumb, self.thumb_style)
+                (&*self.thumb, self.thumb_style)
             } else {
-                (self.track, self.track_style)
+                (&*self.track, self.track_style)
             };
             if vertical {
                 buf.set_string(area.right() - 1, area.y + i, symbol, style);
@@ -239,6 +247,20 @@ mod tests {
         assert_eq!(buf.get(0, 0).unwrap().style().fg, Some(Color::Red));
         assert_eq!(buf.get(0, 3).unwrap().symbol(), "░");
         assert_eq!(buf.get(0, 3).unwrap().style().fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn symbols_can_be_owned_strings() {
+        let area = Rect::new(0, 0, 1, 2);
+        let mut buf = Buffer::new(area);
+        let (track, thumb) = (String::from("."), String::from("#"));
+        Scrollbar::vertical()
+            .content(4)
+            .viewport(2)
+            .symbols(track, thumb)
+            .render(area, &mut buf);
+        assert_eq!(buf.get(0, 0).unwrap().symbol(), "#");
+        assert_eq!(buf.get(0, 1).unwrap().symbol(), ".");
     }
 
     #[test]

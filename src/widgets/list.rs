@@ -158,7 +158,9 @@ impl<'a> List<'a> {
     }
 
     /// What is drawn before the selected item; other items get blank space
-    /// of the same width, so nothing shifts when the selection moves.
+    /// of the same width, so nothing shifts when the selection moves. The
+    /// symbol is borrowed for the frame, so it can be a `&String` from the
+    /// app's state.
     pub fn highlight_symbol(mut self, symbol: &'a str) -> Self {
         self.highlight_symbol = symbol;
         self

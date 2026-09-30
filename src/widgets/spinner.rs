@@ -4,6 +4,10 @@ use crate::{Buffer, Rect, Style};
 
 /// A frame of animation that moves when the app says so.
 ///
+/// A spinner is `Copy`, so it is cheap to keep in the app's state, and that
+/// is why its frames are `'static`. Frames that come from a config can be
+/// leaked once with `Box::leak` when the app starts.
+///
 /// The spinner has no clock. The app keeps it in its state, sends itself a
 /// message from a timer (see `Cmd::after`), and calls [`Spinner::tick`] when
 /// it arrives. The widget draws whichever frame is current, in the first
