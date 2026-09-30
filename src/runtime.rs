@@ -438,7 +438,7 @@ pub(crate) fn event_loop<A: App, H: Host>(
 mod tests {
     use super::*;
     use crate::testing::{Pty, Screen, drain_fd, same, write_fd};
-    use crate::{KeyCode, KeyEvent, Modifiers, Rect, Style};
+    use crate::{KeyCode, KeyEvent, KeyModifiers, Rect, Style};
     use std::cell::{Cell as StdCell, RefCell};
     use std::collections::VecDeque;
     use std::sync::Arc;
@@ -600,7 +600,7 @@ mod tests {
     fn key(c: char) -> Input<Msg> {
         Input::Event(Event::Key(KeyEvent {
             code: KeyCode::Char(c),
-            modifiers: Modifiers::NONE,
+            modifiers: KeyModifiers::NONE,
         }))
     }
 

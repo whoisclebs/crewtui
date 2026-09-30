@@ -10,6 +10,7 @@ use std::ops::{BitOr, BitOrAssign};
 
 /// Something the user or the terminal did.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A key press.
     Key(KeyEvent),
@@ -32,8 +33,8 @@ pub enum Event {
 pub struct KeyEvent {
     /// Which key.
     pub code: KeyCode,
-    /// Modifiers held.
-    pub modifiers: Modifiers,
+    /// Modifier keys held.
+    pub modifiers: KeyModifiers,
 }
 
 /// A key on the keyboard.
@@ -41,6 +42,7 @@ pub struct KeyEvent {
 /// Letters arrive as [`KeyCode::Char`] carrying the case that was typed, so
 /// `A` is `Char('A')` and the shift modifier is not set for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyCode {
     /// A character.
     Char(char),
@@ -80,20 +82,20 @@ pub enum KeyCode {
 
 /// Shift, Ctrl and Alt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Modifiers(u8);
+pub struct KeyModifiers(u8);
 
-impl Modifiers {
+impl KeyModifiers {
     /// No modifiers.
-    pub const NONE: Modifiers = Modifiers(0);
+    pub const NONE: KeyModifiers = KeyModifiers(0);
     /// Shift.
-    pub const SHIFT: Modifiers = Modifiers(1);
+    pub const SHIFT: KeyModifiers = KeyModifiers(1);
     /// Alt, also called Option or Meta.
-    pub const ALT: Modifiers = Modifiers(1 << 1);
+    pub const ALT: KeyModifiers = KeyModifiers(1 << 1);
     /// Ctrl.
-    pub const CTRL: Modifiers = Modifiers(1 << 2);
+    pub const CTRL: KeyModifiers = KeyModifiers(1 << 2);
 
     /// True when every modifier in `other` is set.
-    pub const fn contains(self, other: Modifiers) -> bool {
+    pub const fn contains(self, other: KeyModifiers) -> bool {
         self.0 & other.0 == other.0
     }
 
@@ -103,15 +105,15 @@ impl Modifiers {
     }
 }
 
-impl BitOr for Modifiers {
-    type Output = Modifiers;
-    fn bitor(self, rhs: Modifiers) -> Modifiers {
-        Modifiers(self.0 | rhs.0)
+impl BitOr for KeyModifiers {
+    type Output = KeyModifiers;
+    fn bitor(self, rhs: KeyModifiers) -> KeyModifiers {
+        KeyModifiers(self.0 | rhs.0)
     }
 }
 
-impl BitOrAssign for Modifiers {
-    fn bitor_assign(&mut self, rhs: Modifiers) {
+impl BitOrAssign for KeyModifiers {
+    fn bitor_assign(&mut self, rhs: KeyModifiers) {
         self.0 |= rhs.0;
     }
 }
@@ -125,12 +127,13 @@ pub struct MouseEvent {
     pub column: u16,
     /// Row, counted from 0.
     pub row: u16,
-    /// Modifiers held.
-    pub modifiers: Modifiers,
+    /// Modifier keys held.
+    pub modifiers: KeyModifiers,
 }
 
 /// What a mouse did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MouseKind {
     /// A button went down.
     Down(MouseButton),
@@ -152,6 +155,7 @@ pub enum MouseKind {
 
 /// A mouse button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MouseButton {
     /// The left button.
     Left,
@@ -178,14 +182,14 @@ enum Step {
     NeedMore,
 }
 
-fn key(code: KeyCode, modifiers: Modifiers) -> Event {
+fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
     Event::Key(KeyEvent { code, modifiers })
 }
 
 fn with_alt(step: Step, consumed_extra: usize) -> Step {
     match step {
         Step::Event(Event::Key(mut k), n) => {
-            k.modifiers |= Modifiers::ALT;
+            k.modifiers |= KeyModifiers::ALT;
             Step::Event(Event::Key(k), n + consumed_extra)
         }
         Step::Event(e, n) => Step::Event(e, n + consumed_extra),
@@ -213,7 +217,7 @@ fn parse_escape(buf: &[u8]) -> Step {
         // Three ESCs in a row: the first is a key press of its own. Without
         // this, a long run of ESC bytes would recurse once per byte.
         Some(&ESC) if buf.get(2) == Some(&ESC) => {
-            Step::Event(key(KeyCode::Esc, Modifiers::NONE), 1)
+            Step::Event(key(KeyCode::Esc, KeyModifiers::NONE), 1)
         }
         // ESC before anything else is Alt with that key.
         Some(_) => with_alt(parse_one(&buf[1..]), 1),
@@ -237,7 +241,7 @@ fn parse_ss3(buf: &[u8]) -> Step {
         b'S' => KeyCode::F(4),
         _ => return Step::Skip(3),
     };
-    Step::Event(key(code, Modifiers::NONE), 3)
+    Step::Event(key(code, KeyModifiers::NONE), 3)
 }
 
 fn parse_csi(buf: &[u8]) -> Step {
@@ -286,7 +290,9 @@ fn csi_step(params: &[u8], fin: u8, consumed: usize) -> Step {
         })
         .collect();
     let first = nums.first().copied().unwrap_or(0);
-    let mods = nums.get(1).map_or(Modifiers::NONE, |&m| xterm_modifiers(m));
+    let mods = nums
+        .get(1)
+        .map_or(KeyModifiers::NONE, |&m| xterm_modifiers(m));
 
     let code = match fin {
         b'A' => KeyCode::Up,
@@ -299,7 +305,7 @@ fn csi_step(params: &[u8], fin: u8, consumed: usize) -> Step {
         b'Q' => KeyCode::F(2),
         b'R' => KeyCode::F(3),
         b'S' => KeyCode::F(4),
-        b'Z' => return Step::Event(key(KeyCode::BackTab, Modifiers::SHIFT | mods), consumed),
+        b'Z' => return Step::Event(key(KeyCode::BackTab, KeyModifiers::SHIFT | mods), consumed),
         b'I' if params.is_empty() => return Step::Event(Event::FocusGained, consumed),
         b'O' if params.is_empty() => return Step::Event(Event::FocusLost, consumed),
         b'~' => match first {
@@ -321,17 +327,17 @@ fn csi_step(params: &[u8], fin: u8, consumed: usize) -> Step {
 }
 
 /// xterm sends modifiers as `1 + bitmask`: shift 1, alt 2, ctrl 4, meta 8.
-fn xterm_modifiers(param: u32) -> Modifiers {
+fn xterm_modifiers(param: u32) -> KeyModifiers {
     let bits = param.saturating_sub(1);
-    let mut m = Modifiers::NONE;
+    let mut m = KeyModifiers::NONE;
     if bits & 1 != 0 {
-        m |= Modifiers::SHIFT;
+        m |= KeyModifiers::SHIFT;
     }
     if bits & (2 | 8) != 0 {
-        m |= Modifiers::ALT;
+        m |= KeyModifiers::ALT;
     }
     if bits & 4 != 0 {
-        m |= Modifiers::CTRL;
+        m |= KeyModifiers::CTRL;
     }
     m
 }
@@ -353,15 +359,15 @@ fn mouse_event(params: &[u8], fin: u8) -> Option<MouseEvent> {
         // Buttons 8 to 11 (back, forward) have no `MouseButton`.
         return None;
     }
-    let mut modifiers = Modifiers::NONE;
+    let mut modifiers = KeyModifiers::NONE;
     if b & 4 != 0 {
-        modifiers |= Modifiers::SHIFT;
+        modifiers |= KeyModifiers::SHIFT;
     }
     if b & 8 != 0 {
-        modifiers |= Modifiers::ALT;
+        modifiers |= KeyModifiers::ALT;
     }
     if b & 16 != 0 {
-        modifiers |= Modifiers::CTRL;
+        modifiers |= KeyModifiers::CTRL;
     }
     let button = match b & 3 {
         0 => Some(MouseButton::Left),
@@ -395,13 +401,13 @@ fn mouse_event(params: &[u8], fin: u8) -> Option<MouseEvent> {
 /// A byte that is not part of an escape sequence: a control character or
 /// the start of a UTF-8 character.
 fn parse_plain(buf: &[u8]) -> Step {
-    let ctrl = |c: char| Step::Event(key(KeyCode::Char(c), Modifiers::CTRL), 1);
-    let plain = |code: KeyCode| Step::Event(key(code, Modifiers::NONE), 1);
+    let ctrl = |c: char| Step::Event(key(KeyCode::Char(c), KeyModifiers::CTRL), 1);
+    let plain = |code: KeyCode| Step::Event(key(code, KeyModifiers::NONE), 1);
     match buf[0] {
         b'\r' => plain(KeyCode::Enter),
         b'\t' => plain(KeyCode::Tab),
         0x7f => plain(KeyCode::Backspace),
-        0x08 => Step::Event(key(KeyCode::Backspace, Modifiers::CTRL), 1),
+        0x08 => Step::Event(key(KeyCode::Backspace, KeyModifiers::CTRL), 1),
         0x00 => ctrl(' '),
         b @ 0x01..=0x1a => ctrl((b - 1 + b'a') as char),
         b @ 0x1c..=0x1f => ctrl(['\\', ']', '^', '_'][(b - 0x1c) as usize]),
@@ -424,7 +430,7 @@ fn parse_plain(buf: &[u8]) -> Step {
                 Ok(s) => Step::Event(
                     key(
                         KeyCode::Char(s.chars().next().unwrap_or('\u{fffd}')),
-                        Modifiers::NONE,
+                        KeyModifiers::NONE,
                     ),
                     len,
                 ),
@@ -601,7 +607,7 @@ impl Parser {
         }
         if self.buf[0] == ESC {
             self.buf.remove(0);
-            return Some(key(KeyCode::Esc, Modifiers::NONE));
+            return Some(key(KeyCode::Esc, KeyModifiers::NONE));
         }
         self.buf.clear();
         None
@@ -643,10 +649,10 @@ mod tests {
     }
 
     fn k(code: KeyCode) -> Event {
-        key(code, Modifiers::NONE)
+        key(code, KeyModifiers::NONE)
     }
 
-    fn km(code: KeyCode, m: Modifiers) -> Event {
+    fn km(code: KeyCode, m: KeyModifiers) -> Event {
         key(code, m)
     }
 
@@ -654,9 +660,9 @@ mod tests {
         k(KeyCode::Char(c))
     }
 
-    const CTRL: Modifiers = Modifiers::CTRL;
-    const ALT: Modifiers = Modifiers::ALT;
-    const SHIFT: Modifiers = Modifiers::SHIFT;
+    const CTRL: KeyModifiers = KeyModifiers::CTRL;
+    const ALT: KeyModifiers = KeyModifiers::ALT;
+    const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
 
     #[test]
     fn keys_and_sequences() {
@@ -761,22 +767,22 @@ mod tests {
         use MouseButton::*;
         use MouseKind::*;
         let cases: Vec<(&[u8], Event)> = vec![
-            (b"\x1b[<0;10;5M", m(Down(Left), 9, 4, Modifiers::NONE)),
-            (b"\x1b[<0;10;5m", m(Up(Left), 9, 4, Modifiers::NONE)),
-            (b"\x1b[<1;1;1M", m(Down(Middle), 0, 0, Modifiers::NONE)),
-            (b"\x1b[<2;3;4M", m(Down(Right), 2, 3, Modifiers::NONE)),
-            (b"\x1b[<32;7;8M", m(Drag(Left), 6, 7, Modifiers::NONE)),
-            (b"\x1b[<35;7;8M", m(Moved, 6, 7, Modifiers::NONE)),
-            (b"\x1b[<64;2;2M", m(ScrollUp, 1, 1, Modifiers::NONE)),
-            (b"\x1b[<65;2;2M", m(ScrollDown, 1, 1, Modifiers::NONE)),
-            (b"\x1b[<66;2;2M", m(ScrollLeft, 1, 1, Modifiers::NONE)),
-            (b"\x1b[<67;2;2M", m(ScrollRight, 1, 1, Modifiers::NONE)),
+            (b"\x1b[<0;10;5M", m(Down(Left), 9, 4, KeyModifiers::NONE)),
+            (b"\x1b[<0;10;5m", m(Up(Left), 9, 4, KeyModifiers::NONE)),
+            (b"\x1b[<1;1;1M", m(Down(Middle), 0, 0, KeyModifiers::NONE)),
+            (b"\x1b[<2;3;4M", m(Down(Right), 2, 3, KeyModifiers::NONE)),
+            (b"\x1b[<32;7;8M", m(Drag(Left), 6, 7, KeyModifiers::NONE)),
+            (b"\x1b[<35;7;8M", m(Moved, 6, 7, KeyModifiers::NONE)),
+            (b"\x1b[<64;2;2M", m(ScrollUp, 1, 1, KeyModifiers::NONE)),
+            (b"\x1b[<65;2;2M", m(ScrollDown, 1, 1, KeyModifiers::NONE)),
+            (b"\x1b[<66;2;2M", m(ScrollLeft, 1, 1, KeyModifiers::NONE)),
+            (b"\x1b[<67;2;2M", m(ScrollRight, 1, 1, KeyModifiers::NONE)),
             (b"\x1b[<4;2;2M", m(Down(Left), 1, 1, SHIFT)),
             (b"\x1b[<8;2;2M", m(Down(Left), 1, 1, ALT)),
             (b"\x1b[<16;2;2M", m(Down(Left), 1, 1, CTRL)),
             (
                 b"\x1b[<0;300;70000M",
-                m(Down(Left), 299, 65535, Modifiers::NONE),
+                m(Down(Left), 299, 65535, KeyModifiers::NONE),
             ),
         ];
         for (bytes, want) in cases {

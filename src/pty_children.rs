@@ -10,7 +10,7 @@ use std::io::{self, Write};
 
 use crate::testing::CHILD_MODE;
 use crate::{
-    App, Cmd, Event, Frame, KeyCode, Modifiers, Program, Style, Terminal, TerminalOptions,
+    App, Cmd, Event, Frame, KeyCode, KeyModifiers, Program, Style, Terminal, TerminalOptions,
 };
 
 /// A small app that misbehaves on request.
@@ -32,7 +32,7 @@ impl App for Probe {
     fn update(&mut self, key: Self::Message) -> Cmd<Self::Message> {
         self.keys += 1;
         let quit = key.code == KeyCode::Char('q')
-            || (key.code == KeyCode::Char('c') && key.modifiers.contains(Modifiers::CTRL));
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CTRL));
         if quit {
             return Cmd::quit();
         }

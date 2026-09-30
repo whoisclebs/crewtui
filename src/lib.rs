@@ -50,13 +50,17 @@ pub use buffer::{Buffer, Cell};
 pub use effects::{Closed, Sender};
 pub use frame::Frame;
 pub use geometry::Rect;
-pub use input::{Event, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind, Parser};
-pub use layout::{Alignment, Constraint, Edges, Layout};
+pub use input::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseKind, Parser,
+};
+pub use layout::{Constraint, Edges, Justify, Layout};
 pub use render::Renderer;
 #[cfg(unix)]
 pub use runtime::{App, Cmd, Program};
 #[cfg(unix)]
-pub use signals::{Signal, Signals};
+pub use signals::Signal;
+#[cfg(unix)]
+pub(crate) use signals::Signals;
 pub use style::{Color, Modifier, Style};
 #[cfg(unix)]
 pub use terminal::{Terminal, TerminalOptions};
