@@ -23,6 +23,7 @@ mod terminal;
 #[cfg(test)]
 mod testing;
 pub mod text;
+pub mod widgets;
 
 pub use buffer::{Buffer, Cell};
 #[cfg(unix)]
