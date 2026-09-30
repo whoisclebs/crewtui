@@ -1,6 +1,6 @@
 //! What a view draws into.
 
-use crate::widgets::{StatefulWidget, Widget};
+use crate::widgets::{Input, InputState, StatefulWidget, Widget};
 use crate::{Buffer, Rect};
 
 /// The surface [`App::view`](crate::App::view) draws on for one frame.
@@ -11,11 +11,34 @@ use crate::{Buffer, Rect};
 #[derive(Debug)]
 pub struct Frame<'a> {
     buffer: &'a mut Buffer,
+    cursor: Option<(u16, u16)>,
 }
 
 impl<'a> Frame<'a> {
     pub(crate) fn new(buffer: &'a mut Buffer) -> Self {
-        Frame { buffer }
+        Frame {
+            buffer,
+            cursor: None,
+        }
+    }
+
+    /// Where the terminal's own cursor goes once the frame is drawn. A frame
+    /// that doesn't ask for one has no visible cursor. A position outside the
+    /// frame hides it too.
+    pub fn set_cursor(&mut self, x: u16, y: u16) {
+        self.cursor = Some((x, y));
+    }
+
+    pub(crate) fn cursor(&self) -> Option<(u16, u16)> {
+        self.cursor
+    }
+
+    /// Draws `input` and puts the terminal cursor where its text cursor is.
+    pub fn render_input(&mut self, input: Input<'_>, area: Rect, state: &InputState) {
+        self.render_stateful_widget(input, area, state);
+        if let Some((x, y)) = state.cursor_position() {
+            self.set_cursor(x, y);
+        }
     }
 
     /// The area of the whole terminal.
