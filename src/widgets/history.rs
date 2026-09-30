@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 
-use super::paragraph::{count_rows, draw_text};
+use std::cell::Ref;
+
+use super::paragraph::{draw_lines, line_rows};
 use super::{Block, StatefulWidget, Widget, Wrap};
 use crate::text::{HorizontalAlign, Line, Span, Text};
 use crate::{Buffer, Rect, Style};
@@ -21,18 +23,21 @@ struct Pos {
     row: usize,
 }
 
-/// How many rows an entry took at some width.
-#[derive(Debug, Clone, Copy)]
+/// What an entry took at some width, line by line.
+#[derive(Debug, Clone)]
 struct Measure {
     width: u16,
     wrap: Wrap,
-    rows: usize,
+    /// `ends[i]` is the rows of the lines up to and including line `i`. It
+    /// may be shorter than the entry's lines, when the ones at the end have
+    /// changed and have not been counted again yet.
+    ends: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
 struct Entry {
     text: Text<'static>,
-    measure: Cell<Option<Measure>>,
+    measure: RefCell<Option<Measure>>,
 }
 
 /// Rows before each entry, filled in as far as something asked for.
@@ -45,7 +50,7 @@ struct Prefix {
 
 #[cfg(test)]
 thread_local! {
-    /// How many entries were wrapped to be measured, to check that a frame
+    /// How many times an entry had lines counted, to check that a frame
     /// only measures what it needs.
     static MEASURED: Cell<usize> = const { Cell::new(0) };
 }
@@ -87,7 +92,7 @@ thread_local! {
 pub struct HistoryState {
     entries: Vec<Entry>,
     /// The top of the view, or `None` to follow the end.
-    top: Option<Pos>,
+    top: Cell<Option<Pos>>,
     view: Cell<View>,
     prefix: RefCell<Prefix>,
 }
@@ -103,7 +108,7 @@ impl HistoryState {
     pub fn new() -> Self {
         HistoryState {
             entries: Vec::new(),
-            top: None,
+            top: Cell::new(None),
             view: Cell::new(View {
                 width: 80,
                 height: 24,
@@ -131,7 +136,7 @@ impl HistoryState {
         }
         self.entries.push(Entry {
             text,
-            measure: Cell::new(None),
+            measure: RefCell::new(None),
         });
     }
 
@@ -141,10 +146,11 @@ impl HistoryState {
     }
 
     /// The text of entry `index`, to change. Only this entry has to be
-    /// measured again.
+    /// measured again, all of it, since there is no telling what changed.
+    /// [`HistoryState::append`] is cheaper for adding to the end.
     pub fn entry_mut(&mut self, index: usize) -> Option<&mut Text<'static>> {
         let entry = self.entries.get_mut(index)?;
-        entry.measure.set(None);
+        *entry.measure.get_mut() = None;
         self.prefix.get_mut().sums.truncate(index + 1);
         Some(&mut entry.text)
     }
@@ -152,7 +158,7 @@ impl HistoryState {
     /// Adds `chunk` to the end of the last entry, which is how streamed
     /// tokens arrive. Text after a `\n` starts a new line of the same entry,
     /// and text keeps the style of what it follows. With no entries yet it
-    /// starts one.
+    /// starts one. Only the line being added to is measured again.
     pub fn append(&mut self, chunk: &str) {
         if chunk.is_empty() {
             return;
@@ -161,19 +167,27 @@ impl HistoryState {
             self.push(Text::default());
         }
         let last = self.entries.len() - 1;
-        let text = self.entry_mut(last).expect("the last entry exists");
+        self.prefix.get_mut().sums.truncate(last + 1);
+        let entry = &mut self.entries[last];
+        if entry.text.lines.is_empty() {
+            entry.text.lines.push(Line::default());
+        }
+        // Everything from the current last line on is about to change.
+        let keep = entry.text.lines.len() - 1;
+        if let Some(measure) = entry.measure.get_mut() {
+            measure.ends.truncate(keep);
+        }
+        let text = &mut entry.text;
+        // The style of the last span there is, even when the line it is on
+        // has been left behind by a newline.
         let style = text
             .lines
-            .last()
-            .and_then(|l| l.spans.last())
+            .iter()
+            .rev()
+            .find_map(|l| l.spans.last())
             .map_or_else(Style::new, |s| s.style);
         let parts: Vec<&str> = chunk.split('\n').collect();
         for (i, part) in parts.iter().enumerate() {
-            let part = if i + 1 < parts.len() {
-                part.strip_suffix('\r').unwrap_or(part)
-            } else {
-                part
-            };
             if i > 0 {
                 let previous = text.lines.last().expect("an entry has a line");
                 let line = Line {
@@ -183,13 +197,20 @@ impl HistoryState {
                 };
                 text.lines.push(line);
             }
-            if part.is_empty() {
-                continue;
-            }
             let line = text.lines.last_mut().expect("an entry has a line");
-            match line.spans.last_mut() {
-                Some(span) => span.content.to_mut().push_str(part),
-                None => line.spans.push(Span::styled(part.to_owned(), style)),
+            if !part.is_empty() {
+                match line.spans.last_mut() {
+                    Some(span) => span.content.to_mut().push_str(part),
+                    None => line.spans.push(Span::styled((*part).to_owned(), style)),
+                }
+            }
+            // A `\r` that ended one chunk is dropped when the `\n` after it
+            // arrives, whichever chunk that is in.
+            if i + 1 < parts.len()
+                && let Some(span) = line.spans.last_mut()
+                && span.content.ends_with('\r')
+            {
+                span.content.to_mut().pop();
             }
         }
     }
@@ -197,13 +218,13 @@ impl HistoryState {
     /// Removes everything and goes back to following the end.
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.top = None;
+        self.top.set(None);
         *self.prefix.get_mut() = Prefix::default();
     }
 
     /// Whether the view follows the end of the transcript.
     pub fn is_following(&self) -> bool {
-        self.top.is_none()
+        self.top.get().is_none()
     }
 
     /// Rows the whole transcript takes at the width it was last drawn at.
@@ -241,7 +262,7 @@ impl HistoryState {
 
     /// Moves the view down by `rows`. Reaching the end starts following it.
     pub fn scroll_down(&mut self, rows: usize) {
-        if rows == 0 || self.top.is_none() {
+        if rows == 0 || self.top.get().is_none() {
             return;
         }
         let next = self.step_down(self.resolve_top(), rows);
@@ -267,7 +288,7 @@ impl HistoryState {
 
     /// Goes to the end and follows it from now on.
     pub fn scroll_to_bottom(&mut self) {
-        self.top = None;
+        self.top.set(None);
     }
 
     fn page(&self) -> usize {
@@ -276,32 +297,59 @@ impl HistoryState {
 
     /// Anchors the view at `pos`, unless that is where following would be.
     fn set_top(&mut self, pos: Pos) {
-        self.top = if pos >= self.tail_top() {
+        let top = if pos >= self.tail_top() {
             None
         } else {
             Some(pos)
         };
+        self.top.set(top);
     }
 
-    /// Rows of entry `i` at the current view.
-    fn rows_of(&self, i: usize) -> usize {
+    /// The lines of entry `i` counted at the current view, counting the
+    /// ones that are not yet.
+    fn measured(&self, i: usize) -> Ref<'_, Measure> {
         let view = self.view.get();
         let entry = &self.entries[i];
-        if let Some(m) = entry.measure.get()
-            && m.width == view.width
-            && m.wrap == view.wrap
         {
-            return m.rows;
+            let mut slot = entry.measure.borrow_mut();
+            if slot
+                .as_ref()
+                .is_none_or(|m| m.width != view.width || m.wrap != view.wrap)
+            {
+                *slot = Some(Measure {
+                    width: view.width,
+                    wrap: view.wrap,
+                    ends: Vec::new(),
+                });
+            }
+            let measure = slot.as_mut().expect("it was just set");
+            if measure.ends.len() < entry.text.lines.len() {
+                #[cfg(test)]
+                MEASURED.with(|c| c.set(c.get() + 1));
+                let mut total = measure.ends.last().copied().unwrap_or(0);
+                for line in &entry.text.lines[measure.ends.len()..] {
+                    total += line_rows(line, usize::from(view.width), view.wrap);
+                    measure.ends.push(total);
+                }
+            }
         }
-        #[cfg(test)]
-        MEASURED.with(|c| c.set(c.get() + 1));
-        let rows = count_rows(&entry.text, usize::from(view.width), view.wrap).max(1);
-        entry.measure.set(Some(Measure {
-            width: view.width,
-            wrap: view.wrap,
-            rows,
-        }));
-        rows
+        Ref::map(entry.measure.borrow(), |m| {
+            m.as_ref().expect("it was just measured")
+        })
+    }
+
+    /// Rows of entry `i` at the current view. Never less than one.
+    fn rows_of(&self, i: usize) -> usize {
+        self.measured(i).ends.last().copied().unwrap_or(0).max(1)
+    }
+
+    /// Which line of entry `i` its row `row` is on, and how many rows of that
+    /// line are above it.
+    fn line_at(&self, i: usize, row: usize) -> (usize, usize) {
+        let measure = self.measured(i);
+        let line = measure.ends.partition_point(|&end| end <= row);
+        let above = if line == 0 { 0 } else { measure.ends[line - 1] };
+        (line, row - above)
     }
 
     /// Rows of all entries before entry `i`.
@@ -341,22 +389,26 @@ impl HistoryState {
 
     /// Where the top of the view is right now: the anchor, held inside the
     /// transcript as it is at this width, or the end when following. An
-    /// anchor past what the view can show falls back to the end, so a
-    /// transcript that shrank never leaves blank rows below.
+    /// anchor past what the view can show is pulled back to the end, and
+    /// stays there, so a transcript that shrank never leaves blank rows below
+    /// and content that arrives later does not carry the reader along.
     fn resolve_top(&self) -> Pos {
         let tail = self.tail_top();
-        match self.top {
-            None => tail,
-            Some(p) if p.entry >= self.entries.len() => tail,
-            Some(p) => {
-                let row = p.row.min(self.rows_of(p.entry) - 1);
-                Pos {
-                    entry: p.entry,
-                    row,
-                }
-                .min(tail)
+        let Some(anchor) = self.top.get() else {
+            return tail;
+        };
+        let pos = if anchor.entry >= self.entries.len() {
+            tail
+        } else {
+            let row = anchor.row.min(self.rows_of(anchor.entry) - 1);
+            Pos {
+                entry: anchor.entry,
+                row,
             }
-        }
+            .min(tail)
+        };
+        self.top.set(Some(pos));
+        pos
     }
 
     /// `pos` moved `n` rows toward the start. Stops at the first row.
@@ -386,11 +438,12 @@ impl HistoryState {
                 };
             }
             let rows = self.rows_of(pos.entry);
-            if pos.row + n < rows {
+            let left = rows.saturating_sub(pos.row);
+            if n < left {
                 pos.row += n;
                 return pos;
             }
-            n -= rows - pos.row;
+            n -= left;
             pos = Pos {
                 entry: pos.entry + 1,
                 row: 0,
@@ -493,16 +546,19 @@ impl StatefulWidget for History<'_> {
                 height: (height - used) as u16,
                 ..area
             };
+            let text = &state.entries[pos.entry].text;
+            // Start at the line the row falls on, not at the first one.
+            let (line, skip) = state.line_at(pos.entry, pos.row);
             // An entry someone emptied out through `entry_mut` still takes
             // the one blank row it is counted as.
-            used += draw_text(
+            used += draw_lines(
                 buf,
                 rest,
-                &state.entries[pos.entry].text,
-                self.style,
+                &text.lines[line.min(text.lines.len())..],
+                self.style.patch(text.style),
                 self.wrap,
                 self.align,
-                pos.row,
+                skip,
             )
             .max(1);
             pos = Pos {
@@ -721,9 +777,9 @@ mod tests {
 
     #[test]
     fn a_row_that_no_longer_exists_after_a_resize_is_held_inside_its_entry() {
-        let mut s = wide_entries(12);
+        let s = wide_entries(12);
         draw(&s, 8, 3);
-        s.top = Some(Pos { entry: 5, row: 2 });
+        s.top.set(Some(Pos { entry: 5, row: 2 }));
         assert_eq!(draw(&s, 8, 3), ["cccc    ", "dddd    ", "6: aaaa "]);
         assert!(draw(&s, 30, 3)[0].starts_with("5: aaaa"));
     }
@@ -743,7 +799,7 @@ mod tests {
         s.push("b");
         s.push(Text::raw("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9"));
         draw(&s, 8, 3);
-        s.top = Some(Pos { entry: 2, row: 7 });
+        s.top.set(Some(Pos { entry: 2, row: 7 }));
         assert_eq!(draw(&s, 8, 3), ["l7      ", "l8      ", "l9      "]);
         *s.entry_mut(2).unwrap() = Text::raw("l0\nl1");
         assert_eq!(draw(&s, 8, 3), ["b       ", "l0      ", "l1      "]);
@@ -843,8 +899,10 @@ mod tests {
 
         // A new width makes every count stale, but only what is shown is
         // counted again.
+        // Counted twice at most: the entries the view is anchored at, and the
+        // ones at the end that say where the view can go.
         let (_, n) = measured(|| draw(&s, 30, 20));
-        assert!(n <= 25, "a resize measured {n} entries");
+        assert!(n <= 45, "a resize measured {n} entries");
         s.scroll_to_bottom();
         let (_, n) = measured(|| draw(&s, 25, 20));
         assert!(n <= 25, "a resize while following measured {n} entries");
@@ -908,7 +966,11 @@ mod tests {
             }
             let w = (next(12) + 1) as u16;
             let h = (next(8) + 1) as u16;
-            let total = count_rows(&all, usize::from(w), wrap);
+            let total: usize = all
+                .lines
+                .iter()
+                .map(|l| line_rows(l, usize::from(w), wrap))
+                .sum();
             let render = |s: &HistoryState| draw_with(History::new().wrap(wrap), s, w, h);
             let expect = |position: usize| {
                 let area = Rect::new(0, 0, w, h);
@@ -1074,5 +1136,194 @@ mod tests {
         assert_eq!(s.content_rows(), 3);
         draw_with(History::new().wrap(Wrap::None), &s, 4, 3);
         assert_eq!(s.content_rows(), 2);
+    }
+
+    #[test]
+    fn appending_to_an_entry_that_was_emptied_out_starts_its_first_line() {
+        let mut s = HistoryState::new();
+        s.push("a");
+        *s.entry_mut(0).unwrap() = Text::default();
+        s.append("x");
+        assert_eq!(draw(&s, 4, 1), ["x   "]);
+        *s.entry_mut(0).unwrap() = Text::default();
+        s.append("\ny");
+        assert_eq!(draw(&s, 4, 2), ["    ", "y   "]);
+    }
+
+    #[test]
+    fn scrolling_down_by_an_enormous_amount_goes_to_the_end() {
+        let mut s = HistoryState::new();
+        for i in 0..8 {
+            s.push(format!("{i}a\n{i}b\n{i}c"));
+        }
+        draw(&s, 8, 4);
+        s.scroll_up(13);
+        assert!(!s.is_following());
+        s.scroll_down(usize::MAX);
+        assert!(s.is_following());
+        s.scroll_up(1);
+        s.scroll_down(usize::MAX - 1);
+        assert!(s.is_following());
+        assert_eq!(draw(&s, 8, 4)[3], "7c      ");
+    }
+
+    #[test]
+    fn streamed_text_keeps_the_style_when_the_newline_comes_first() {
+        let red = Style::new().fg(Color::Red);
+        let mut s = HistoryState::new();
+        s.push(Line::from(Span::styled("agent: ", red)));
+        s.append("tok\n");
+        s.append("next");
+        let text = s.entry(0).unwrap();
+        assert_eq!(text.lines.len(), 2);
+        assert_eq!(text.lines[1].spans[0].content, "next");
+        assert_eq!(text.lines[1].spans[0].style, red);
+    }
+
+    #[test]
+    fn a_carriage_return_before_a_newline_is_dropped_across_chunks() {
+        let mut s = HistoryState::new();
+        s.append("a\r");
+        s.append("\nb\r");
+        s.append("\r\nc");
+        let lines: Vec<String> = s
+            .entry(0)
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(lines, ["a", "b\r", "c"]);
+    }
+
+    #[test]
+    fn a_reader_held_at_the_end_by_a_resize_is_not_carried_by_new_content() {
+        let mut s = HistoryState::new();
+        for i in 0..6 {
+            s.push(format!("{i}: aaaa bbbb cccc dddd"));
+        }
+        draw(&s, 8, 3);
+        s.top.set(Some(Pos { entry: 4, row: 0 }));
+        // At this width all of it fits, so the anchor is past what can be
+        // shown and the view is held at the last screenful.
+        let held = draw(&s, 60, 3);
+        assert!(!s.is_following());
+        s.push("new 0");
+        s.push("new 1");
+        assert_eq!(draw(&s, 60, 3), held);
+    }
+
+    #[test]
+    fn a_huge_entry_costs_what_is_visible_not_what_it_holds() {
+        use crate::widgets::paragraph::PIECES;
+        let pieces = |f: &mut dyn FnMut()| {
+            PIECES.with(|c| c.set(0));
+            f();
+            PIECES.with(std::cell::Cell::get)
+        };
+        let mut s = HistoryState::new();
+        s.push("agent:");
+        s.append(&"a line of streamed text\n".repeat(50_000));
+        // Counting it after a change of width is paid once.
+        let first = pieces(&mut || {
+            draw(&s, 40, 20);
+        });
+        assert!(first >= 50_000, "{first}");
+        // Drawing again, following the end or somewhere inside, only looks
+        // at the lines it draws.
+        let again = pieces(&mut || {
+            draw(&s, 40, 20);
+        });
+        assert!(again <= 25, "a repeated frame split {again} lines");
+        s.scroll_up(30_000);
+        let inside = pieces(&mut || {
+            draw(&s, 40, 20);
+        });
+        assert!(inside <= 25, "a frame inside split {inside} lines");
+        s.scroll_to_bottom();
+        // A token: one line is counted again, and the frame draws the end.
+        for _ in 0..50 {
+            s.append("tok ");
+            let n = pieces(&mut || {
+                draw(&s, 40, 20);
+            });
+            assert!(n <= 30, "a streamed token split {n} lines");
+        }
+        // The line that grew wraps, and the 50,000 before it took a row each.
+        let last = s.entry(1 - 1).unwrap().lines.last().unwrap().clone();
+        assert_eq!(s.content_rows(), 50_000 + line_rows(&last, 40, Wrap::Word));
+    }
+
+    /// Streamed chunks, cut anywhere, with the width changing under them,
+    /// give what a paragraph of the same text gives.
+    #[test]
+    fn streaming_gives_what_a_paragraph_of_the_whole_text_gives() {
+        let chunks = [
+            "a",
+            "bb ",
+            "ccc\n",
+            "\n",
+            "dddddddddd",
+            "中文",
+            " ",
+            "x y z\n",
+            "😀",
+            "long words here ",
+        ];
+        let mut seed = 0xfeed_beef_1234_5678u64;
+        let mut next = move |m: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % m as u64) as usize
+        };
+        for round in 0..150 {
+            let wrap = [Wrap::Word, Wrap::Char, Wrap::None][round % 3];
+            let mut s = HistoryState::new();
+            let mut entries: Vec<String> = Vec::new();
+            let mut w = (next(10) + 1) as u16;
+            let h = (next(6) + 1) as u16;
+            for step in 0..40 {
+                match next(8) {
+                    0 => {
+                        let text = chunks[next(chunks.len())].to_string();
+                        s.push(text.as_str());
+                        entries.push(text);
+                    }
+                    1 => w = (next(10) + 1) as u16,
+                    2 => s.scroll_up(next(5) + 1),
+                    3 => s.scroll_down(next(5) + 1),
+                    _ => {
+                        let chunk = chunks[next(chunks.len())];
+                        s.append(chunk);
+                        match entries.last_mut() {
+                            Some(last) => last.push_str(chunk),
+                            None => entries.push(chunk.to_string()),
+                        }
+                    }
+                }
+                let all = Text {
+                    lines: entries
+                        .iter()
+                        .flat_map(|e| Text::raw(e.as_str()).lines)
+                        .collect(),
+                    style: Style::new(),
+                };
+                let shown = draw_with(History::new().wrap(wrap), &s, w, h);
+                let total: usize = all
+                    .lines
+                    .iter()
+                    .map(|l| line_rows(l, usize::from(w), wrap))
+                    .sum();
+                assert_eq!(s.content_rows(), total, "round {round} step {step}");
+                let area = Rect::new(0, 0, w, h);
+                let mut buf = Buffer::new(area);
+                Paragraph::new(all)
+                    .wrap(wrap)
+                    .scroll(s.position())
+                    .render(area, &mut buf);
+                assert_eq!(shown, rows_of(&buf), "round {round} step {step}");
+            }
+        }
     }
 }

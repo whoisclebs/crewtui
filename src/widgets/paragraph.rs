@@ -112,7 +112,16 @@ struct Row {
     width: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many lines were split into pieces, to check that a frame only
+    /// looks at the lines it draws.
+    pub(crate) static PIECES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn pieces<'a>(line: &'a Line<'_>) -> Vec<Piece<'a>> {
+    #[cfg(test)]
+    PIECES.with(|c| c.set(c.get() + 1));
     let mut out = Vec::new();
     for span in &line.spans {
         for g in span.content.graphemes(true) {
@@ -324,15 +333,12 @@ fn draw_pieces(
     }
 }
 
-/// How many screen rows `text` takes at `width` columns.
-pub(crate) fn count_rows(text: &Text<'_>, width: usize, wrap: Wrap) -> usize {
+/// How many screen rows `line` takes at `width` columns.
+pub(crate) fn line_rows(line: &Line<'_>, width: usize, wrap: Wrap) -> usize {
     if wrap == Wrap::None {
-        return text.lines.len();
+        return 1;
     }
-    text.lines
-        .iter()
-        .map(|line| rows(&pieces(line), width, wrap).len())
-        .sum()
+    rows(&pieces(line), width, wrap).len()
 }
 
 /// Draws `text` from its row `skip` down as far as `area` reaches, and says
@@ -346,14 +352,35 @@ pub(crate) fn draw_text(
     align: HorizontalAlign,
     skip: usize,
 ) -> usize {
-    let base = base.patch(text.style);
+    draw_lines(
+        buf,
+        area,
+        &text.lines,
+        base.patch(text.style),
+        wrap,
+        align,
+        skip,
+    )
+}
+
+/// Like `draw_text` for a slice of lines, with `base` already including the
+/// text's style. The lines before the slice are not looked at.
+pub(crate) fn draw_lines(
+    buf: &mut Buffer,
+    area: Rect,
+    lines: &[Line<'_>],
+    base: Style,
+    wrap: Wrap,
+    align: HorizontalAlign,
+    skip: usize,
+) -> usize {
     let width = usize::from(area.width);
     let height = usize::from(area.height);
     let mut drawn = 0;
 
     if wrap == Wrap::None {
         // One row per line, so the scroll offset is a jump, not a walk.
-        for line in text.lines.iter().skip(skip).take(height) {
+        for line in lines.iter().skip(skip).take(height) {
             let pieces = pieces(line);
             let row = rows(&pieces, width, Wrap::None).remove(0);
             draw_pieces(
@@ -372,7 +399,7 @@ pub(crate) fn draw_text(
     }
 
     let mut skip = skip;
-    for line in &text.lines {
+    for line in lines {
         let pieces = pieces(line);
         for row in rows(&pieces, width, wrap) {
             if skip > 0 {
