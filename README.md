@@ -52,6 +52,7 @@ fn main() -> std::io::Result<()> {
 - A renderer with two buffers that writes only what changed, and recovers with a full repaint when the terminal and its idea of the screen stop agreeing.
 - Layout with fixed, fill, percentage, min and max constraints, plus padding, margin, gap and `Justify` for leftover space.
 - Widgets: `Paragraph`, `Block`, `List`, `Table`, `Input`, `Scrollbar`, `Progress`, `Spinner` and `History`, a scrollable transcript that stays cheap with tens of thousands of entries.
+- Hyperlinks: `Span::link` makes text an OSC 8 link, checked so a URL can't inject terminal commands.
 - Keys, mouse, paste, focus and resize as typed events, and Unicode-aware width and wrapping.
 - Cleanup of the terminal on normal exit, on an error, on a panic and on SIGINT, SIGTERM and SIGHUP. Ctrl+C typed in raw mode reaches the app as a key, so it quits when the app says so.
 
