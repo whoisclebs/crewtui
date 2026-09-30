@@ -8,9 +8,15 @@
 
 mod block;
 mod paragraph;
+mod progress;
+mod scrollbar;
+mod spinner;
 
 pub use block::{Block, BorderType, Borders};
 pub use paragraph::{Paragraph, Wrap};
+pub use progress::Progress;
+pub use scrollbar::{Orientation, Scrollbar};
+pub use spinner::Spinner;
 
 use crate::text::{Line, Span, Text};
 use crate::{Buffer, Rect};
