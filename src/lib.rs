@@ -7,6 +7,8 @@ mod effects;
 mod frame;
 mod geometry;
 mod input;
+#[cfg(all(test, unix))]
+mod pty_children;
 #[cfg(unix)]
 mod reader;
 mod render;
