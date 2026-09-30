@@ -49,6 +49,9 @@ impl<'a, T: Into<Text<'a>>> From<T> for ListItem<'a> {
 pub struct ListState {
     selected: Option<usize>,
     offset: Cell<usize>,
+    /// The items the last draw showed at least a row of, and how many the
+    /// list had: `(first, end, total)`.
+    shown: Cell<(usize, usize, usize)>,
 }
 
 impl ListState {
@@ -79,6 +82,28 @@ impl ListState {
     /// The index of the item at the top of the last frame drawn.
     pub fn offset(&self) -> usize {
         self.offset.get()
+    }
+
+    /// The items the last draw showed, at least in part, as a range of item
+    /// indexes. An item cut off at the bottom counts. Empty before the first
+    /// draw, for an empty list and when the list had no room.
+    pub fn visible_range(&self) -> std::ops::Range<usize> {
+        let (first, end, _) = self.shown.get();
+        first..end
+    }
+
+    /// How many items were above the first one shown at the last draw, for
+    /// something like "3 more above". It is the offset, or 0 when nothing
+    /// was shown.
+    pub fn hidden_above(&self) -> usize {
+        self.shown.get().0
+    }
+
+    /// How many items were below the last one shown at the last draw, for
+    /// something like "240 more". An item shown in part is not counted.
+    pub fn hidden_below(&self) -> usize {
+        let (_, end, total) = self.shown.get();
+        total.saturating_sub(end)
     }
 
     /// Selects the next item of `len`, stopping at the last, or the first
@@ -190,6 +215,7 @@ impl StatefulWidget for List<'_> {
     type State = ListState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &ListState) {
+        state.shown.set((0, 0, 0));
         let area = area.intersection(buf.area());
         if area.is_empty() {
             return;
@@ -234,6 +260,7 @@ impl StatefulWidget for List<'_> {
             ..area
         };
         let mut y = area.y;
+        let mut end = offset;
         'items: for (i, item) in self.items.iter().enumerate().skip(offset) {
             let selected = selected == Some(i);
             let style = if selected {
@@ -246,6 +273,7 @@ impl StatefulWidget for List<'_> {
                 if y >= area.bottom() {
                     break 'items;
                 }
+                end = i + 1;
                 let row_area = Rect {
                     y,
                     height: 1,
@@ -272,6 +300,7 @@ impl StatefulWidget for List<'_> {
                 y += 1;
             }
         }
+        state.shown.set((offset, end, self.items.len()));
     }
 }
 
@@ -406,6 +435,71 @@ mod tests {
             offsets.push(state.offset());
         }
         assert_eq!(offsets, [0, 0, 0, 1, 2, 2, 2, 1, 0]);
+    }
+
+    fn shown(state: &ListState) -> (std::ops::Range<usize>, usize, usize) {
+        (
+            state.visible_range(),
+            state.hidden_above(),
+            state.hidden_below(),
+        )
+    }
+
+    fn draw_list(list: List<'_>, state: &ListState, h: u16) {
+        let area = Rect::new(0, 0, 8, h);
+        let mut buf = Buffer::new(area);
+        list.render(area, &mut buf, state);
+    }
+
+    #[test]
+    fn the_state_says_how_many_items_are_hidden_above_and_below() {
+        let state = ListState::with_selected(0);
+        assert_eq!(shown(&state), (0..0, 0, 0));
+        draw_list(List::new((0..10).map(|i| format!("i{i}"))), &state, 4);
+        assert_eq!(shown(&state), (0..4, 0, 6));
+        let mut state = state;
+        state.select(Some(9));
+        draw_list(List::new((0..10).map(|i| format!("i{i}"))), &state, 4);
+        assert_eq!(shown(&state), (6..10, 6, 0));
+        state.select(Some(5));
+        draw_list(List::new((0..10).map(|i| format!("i{i}"))), &state, 4);
+        assert_eq!(shown(&state), (5..9, 5, 1));
+        state.select(Some(2));
+        draw_list(List::new((0..10).map(|i| format!("i{i}"))), &state, 4);
+        assert_eq!(shown(&state), (2..6, 2, 4));
+    }
+
+    #[test]
+    fn everything_fitting_hides_nothing_and_an_empty_list_shows_nothing() {
+        let state = ListState::new();
+        draw_list(List::new(["a", "b"]), &state, 5);
+        assert_eq!(shown(&state), (0..2, 0, 0));
+        draw_list(List::new(Vec::<String>::new()), &state, 5);
+        assert_eq!(shown(&state), (0..0, 0, 0));
+        draw_list(List::new(["a", "b"]), &state, 0);
+        assert_eq!(shown(&state), (0..0, 0, 0));
+    }
+
+    #[test]
+    fn items_of_several_rows_and_a_cut_last_item_are_counted_by_what_is_drawn() {
+        let items = || {
+            vec![
+                ListItem::new("a\nb"),
+                ListItem::new("c\nd"),
+                ListItem::new("e\nf"),
+                ListItem::new("g"),
+            ]
+        };
+        let state = ListState::new();
+        // Five rows: two items whole and the third cut after its first row.
+        draw_list(List::new(items()), &state, 3);
+        assert_eq!(shown(&state), (0..2, 0, 2));
+        draw_list(List::new(items()), &state, 5);
+        assert_eq!(shown(&state), (0..3, 0, 1));
+        let mut state = state;
+        state.select(Some(3));
+        draw_list(List::new(items()), &state, 3);
+        assert_eq!(shown(&state), (2..4, 2, 0));
     }
 
     #[test]
