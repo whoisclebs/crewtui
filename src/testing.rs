@@ -29,6 +29,10 @@ pub(crate) struct Screen {
     y: usize,
     pending_wrap: bool,
     pen: Style,
+    link: Option<std::sync::Arc<str>>,
+    /// The link of each cell, kept apart from the cells like a terminal
+    /// keeps it apart from the text.
+    links: Vec<Option<std::sync::Arc<str>>>,
     pending: Vec<u8>,
     cursor_visible: bool,
 }
@@ -43,6 +47,8 @@ impl Screen {
             y: 0,
             pending_wrap: false,
             pen: Style::new(),
+            link: None,
+            links: vec![None; width as usize * height as usize],
             pending: Vec::new(),
             // The terminal hides it on entering, and that is what the
             // renderer's output is checked against.
@@ -69,6 +75,23 @@ impl Screen {
             for x in 0..self.width {
                 *b.get_mut(x as u16, y as u16).unwrap() = self.cells[y * self.width + x].clone();
             }
+            // Runs of cells with the same link.
+            let row = &self.links[y * self.width..(y + 1) * self.width];
+            let mut x = 0;
+            while x < self.width {
+                let Some(url) = &row[x] else {
+                    x += 1;
+                    continue;
+                };
+                let end = (x..self.width)
+                    .find(|&k| row[k].as_ref() != Some(url))
+                    .unwrap_or(self.width);
+                b.set_link(
+                    Rect::new(x as u16, y as u16, (end - x) as u16, 1),
+                    Some(url),
+                );
+                x = end;
+            }
         }
         b
     }
@@ -84,6 +107,46 @@ impl Screen {
             if data[i] == 0x1b {
                 if i + 1 == data.len() {
                     break;
+                }
+                if data[i + 1] == b']' {
+                    // An OSC sequence runs to BEL or ESC \. Any other ESC
+                    // cancels it and starts a sequence of its own.
+                    let mut j = i + 2;
+                    let mut end = None;
+                    let mut cancelled = None;
+                    let mut incomplete = false;
+                    while j < data.len() {
+                        if data[j] == 0x07 {
+                            end = Some((j, j + 1));
+                            break;
+                        }
+                        if data[j] == 0x1b {
+                            match data.get(j + 1) {
+                                Some(b'\\') => end = Some((j, j + 2)),
+                                Some(_) => cancelled = Some(j),
+                                None => incomplete = true,
+                            }
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if incomplete || (end.is_none() && cancelled.is_none()) {
+                        break;
+                    }
+                    if let Some(at) = cancelled {
+                        i = at;
+                        continue;
+                    }
+                    let (stop, next) = end.expect("checked above");
+                    let payload = std::str::from_utf8(&data[i + 2..stop]).unwrap_or("");
+                    self.osc(payload);
+                    i = next;
+                    continue;
+                }
+                // An ESC right after an ESC starts over from the second one.
+                if data[i + 1] == 0x1b {
+                    i += 1;
+                    continue;
                 }
                 if data[i + 1] != b'[' {
                     i += 2;
@@ -150,6 +213,17 @@ impl Screen {
         }
     }
 
+    fn osc(&mut self, payload: &str) {
+        let mut parts = payload.splitn(3, ';');
+        match (parts.next(), parts.next(), parts.next()) {
+            // Hyperlinks: OSC 8 ; params ; URL.
+            (Some("8"), Some(_params), Some(url)) => {
+                self.link = (!url.is_empty()).then(|| std::sync::Arc::from(url));
+            }
+            _ => panic!("unmodeled OSC {payload:?}"),
+        }
+    }
+
     fn csi(&mut self, params: &str, fin: char) {
         let nums: Vec<usize> = params.split(';').map(|p| p.parse().unwrap_or(0)).collect();
         match fin {
@@ -172,6 +246,7 @@ impl Screen {
             'J' => {
                 assert_eq!(nums[0], 2, "only ED 2 is modeled");
                 self.cells.iter_mut().for_each(Cell::reset);
+                self.links.iter_mut().for_each(|l| *l = None);
             }
             'm' => self.sgr(&nums),
             // Private modes such as alternate screen; not modeled.
@@ -252,10 +327,12 @@ impl Screen {
         let mut head = Cell::blank();
         head.set_symbol(g).set_style(self.pen);
         self.cells[row + self.x] = head;
+        self.links[row + self.x] = self.link.clone();
         if w == 2 {
             let mut tail = Cell::blank();
             tail.set_symbol("").set_style(self.pen);
             self.cells[row + self.x + 1] = tail;
+            self.links[row + self.x + 1] = self.link.clone();
         }
         if self.x + w >= self.width {
             self.x = self.width - 1;
@@ -568,6 +645,20 @@ mod tests {
         wait_timeout(&mut child, Duration::from_secs(10)).expect("still running");
         let out = String::from_utf8_lossy(&pty.output()).into_owned();
         assert!(out.contains("got:hi"), "{out:?}");
+    }
+
+    #[test]
+    fn an_esc_in_a_cut_sequence_starts_the_next_one_instead_of_printing_it() {
+        let mut screen = Screen::new(6, 1);
+        // An OSC 8 cut after its URL began, then a CSI, then text.
+        screen.feed(b"\x1b]8;;http://x");
+        screen.feed(b"\x1b[1mabc");
+        assert_eq!(screen.row(0).trim_end(), "abc");
+        // A CSI cut right after its ESC, then another.
+        let mut screen = Screen::new(6, 1);
+        screen.feed(b"\x1b");
+        screen.feed(b"\x1b[0mxy");
+        assert_eq!(screen.row(0).trim_end(), "xy");
     }
 
     #[test]

@@ -16,7 +16,7 @@ Each case draws two scenes on alternate frames, so the renderer always has somet
 | one cell differs | 202 µs | 131 µs | 20 |
 | one line differs | 200 µs | 138 µs | 221 |
 | every cell differs | 274 µs | 273 µs | 13,551 |
-| first frame, repaint everything | 278 µs | 283 µs | 13,565 |
+| first frame, repaint everything | 278 µs | 283 µs | 13,572 |
 
 "Cell by cell" walks every cell and compares it with the one in the previous buffer. "Rows skipped first" compares each row as a slice before looking at its cells, and moves on when the two rows are equal. The two columns come from separate runs of the same bench, before and after the change.
 
@@ -32,7 +32,7 @@ A header, a bordered list of 80 files beside a wrapped paragraph, an input, a pr
 |---|---|---|---|
 | the selection moves | 440 µs | 386 µs | 127 |
 | nothing changes | 445 µs | 365 µs | 0 |
-| repaint everything | 496 µs | 516 µs | 7,325 |
+| repaint everything | 496 µs | 516 µs | 7,332 |
 
 Most of the time is the widgets drawing into the buffer, not the diff. At 400 µs a frame the app has 40 times more room than a 60 fps cap asks for.
 
@@ -49,7 +49,7 @@ Most of the time is the widgets drawing into the buffer, not the diff. At 400 µ
 | a streamed token, all on one growing line | 608 µs | 241 |
 | scroll by one row, 5,000 rows up | 678 µs | 7,714 |
 | the width changes on every frame | 792 µs | 11,592 |
-| the width changes, and the scrollbar wants the total | 1.5 ms | 12,020 |
+| the width changes, and the scrollbar wants the total | 1.5 ms | 12,027 |
 
 The steady frame costs the same with 200 entries as with 20,000, which is the point of keeping the row count of every line of every entry: a frame wraps what is on screen and nothing else. The frame tests in `src/widgets/history.rs` check the same thing without a clock, by counting how many entries and lines a frame looks at, so a regression fails a test instead of showing up as a number nobody reads.
 
